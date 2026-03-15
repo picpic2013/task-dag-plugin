@@ -1,0 +1,190 @@
+/**
+ * Agent ID 管理模块
+ * 
+ * 生成和管理跨 session/模型的唯一 Agent ID
+ */
+
+import * as fs from 'fs';
+import * as path from 'path';
+import * as os from 'os';
+
+const WORKSPACE = process.env.WORKSPACE_DIR || path.join(os.homedir(), '.openclaw', 'workspace');
+const MAPPINGS_FILE = path.join(WORKSPACE, 'tasks', 'agent-mappings.json');
+
+interface AgentMapping {
+  task_id: string;
+  parent_task_id: string | null;
+  created_at: string;
+  updated_at?: string;
+  status: 'active' | 'completed' | 'failed';
+}
+
+interface AgentMappings {
+  mappings: Record<string, string>;
+  [agentId: string]: AgentMapping | Record<string, string>;
+}
+
+// ============= 辅助函数 =============
+
+function ensureDir(): void {
+  const dir = path.dirname(MAPPINGS_FILE);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+}
+
+function loadMappings(): AgentMappings {
+  try {
+    if (!fs.existsSync(MAPPINGS_FILE)) {
+      return { mappings: {} };
+    }
+    const data = fs.readFileSync(MAPPINGS_FILE, 'utf-8');
+    return JSON.parse(data);
+  } catch {
+    return { mappings: {} };
+  }
+}
+
+function saveMappings(mappings: AgentMappings): void {
+  ensureDir();
+  fs.writeFileSync(MAPPINGS_FILE, JSON.stringify(mappings, null, 2));
+}
+
+// ============= 核心函数 =============
+
+/**
+ * 生成唯一的 Agent ID
+ * 格式: agent-{timestamp}-{random}
+ * 示例: agent-1773576000000-a1b2c3
+ */
+export function generateAgentId(): string {
+  const timestamp = Date.now();
+  const random = Math.random().toString(36).substring(2, 8);
+  return `agent-${timestamp}-${random}`;
+}
+
+/**
+ * 保存 Agent ↔ Task 映射
+ */
+export function saveAgentMapping(
+  agentId: string, 
+  taskId: string, 
+  parentTaskId?: string
+): void {
+  const mappings = loadMappings();
+  
+  mappings[agentId] = {
+    task_id: taskId,
+    parent_task_id: parentTaskId || null,
+    created_at: new Date().toISOString(),
+    status: 'active'
+  };
+  
+  // 反向映射：taskId -> agentId
+  mappings.mappings[taskId] = agentId;
+  
+  saveMappings(mappings);
+}
+
+/**
+ * 通过 Task ID 获取 Agent ID
+ */
+export function getAgentByTask(taskId: string): string | null {
+  const mappings = loadMappings();
+  return mappings.mappings[taskId] || null;
+}
+
+/**
+ * 通过 Agent ID 获取 Task ID
+ */
+export function getTaskByAgent(agentId: string): string | null {
+  const mappings = loadMappings();
+  return mappings[agentId]?.task_id || null;
+}
+
+/**
+ * 获取 Agent 映射信息
+ */
+export function getAgentInfo(agentId: string): AgentMapping | null {
+  const mappings = loadMappings();
+  const info = mappings[agentId];
+  if (!info || 'mappings' in info) {
+    return null;
+  }
+  return info as AgentMapping;
+}
+
+/**
+ * 更新 Agent 状态
+ */
+export function updateAgentStatus(
+  agentId: string, 
+  status: 'active' | 'completed' | 'failed'
+): void {
+  const mappings = loadMappings();
+  
+  if (mappings[agentId]) {
+    mappings[agentId].status = status;
+    mappings[agentId].updated_at = new Date().toISOString();
+    saveMappings(mappings);
+  }
+}
+
+/**
+ * 删除 Agent 映射
+ */
+export function removeAgentMapping(agentId: string): boolean {
+  const mappings = loadMappings();
+  
+  if (!mappings[agentId]) {
+    return false;
+  }
+  
+  const taskId = mappings[agentId].task_id;
+  
+  // 删除 agent -> task 映射
+  delete mappings[agentId];
+  
+  // 删除 task -> agent 映射
+  delete mappings.mappings[taskId];
+  
+  saveMappings(mappings);
+  return true;
+}
+
+/**
+ * 获取所有活跃的 Agent
+ */
+export function getActiveAgents(): string[] {
+  const mappings = loadMappings();
+  return Object.entries(mappings)
+    .filter(([key, value]) => 
+      key !== 'mappings' && value.status === 'active'
+    )
+    .map(([key]) => key);
+}
+
+/**
+ * 清理已完成/失败的 Agent 映射
+ */
+export function cleanupAgents(): number {
+  const mappings = loadMappings();
+  let count = 0;
+  
+  for (const agentId of Object.keys(mappings)) {
+    if (agentId === 'mappings') continue;
+    
+    const agent = mappings[agentId];
+    if (agent.status === 'completed' || agent.status === 'failed') {
+      delete mappings.mappings[agent.task_id];
+      delete mappings[agentId];
+      count++;
+    }
+  }
+  
+  if (count > 0) {
+    saveMappings(mappings);
+  }
+  
+  return count;
+}
