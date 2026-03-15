@@ -7,6 +7,29 @@
 import type { OpenClawPluginApi } from "./plugin-sdk.js";
 import * as dag from './dag.js';
 
+/**
+ * 从上下文获取 agent ID
+ */
+function getAgentIdFromContext(context: any): string {
+  // 尝试从多个可能的字段获取 agent ID
+  return context?.agent?.id 
+    || context?.agentId 
+    || context?.session?.agentId 
+    || context?.runtime?.agentId
+    || 'main';
+}
+
+/**
+ * 执行工具并自动设置 Agent 上下文
+ */
+function executeWithAgent(executeFn: (params: any) => Promise<any>) {
+  return async (params: any, context?: any) => {
+    const agentId = getAgentIdFromContext(context);
+    dag.setCurrentAgentId(agentId);
+    return executeFn(params);
+  };
+}
+
 export function registerTaskDagTools(api: OpenClawPluginApi) {
   api.logger.info('[task-dag] Registering tools...');
 
@@ -36,7 +59,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
       },
       required: ["name", "tasks"]
     },
-    execute: async (params: { name: string; tasks: any[] }) => {
+    execute: async (params, context: { name: string; tasks: any[] }) => {
       try {
         const result = dag.createDAG(params.name, params.tasks);
         return {
@@ -59,6 +82,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
       properties: {}
     },
     execute: async () => {
+      dag.setCurrentAgentId("main");
       const mermaid = dag.showProgress();
       const stats = dag.getStats();
       return { mermaid, stats };
@@ -74,6 +98,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
       properties: {}
     },
     execute: async () => {
+      dag.setCurrentAgentId("main");
       const tasks = dag.getReadyTasks();
       return {
         tasks: tasks.map(t => ({
@@ -96,7 +121,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
       },
       required: ["task_id"]
     },
-    execute: async (params: { task_id: string }) => {
+    execute: async (params, context: any) => {
       const task = dag.getTask(params.task_id);
       if (!task) {
         return { error: `Task ${params.task_id} not found` };
@@ -136,7 +161,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
       },
       required: ["task_id"]
     },
-    execute: async (params: { 
+    execute: async (params, context: { 
       task_id: string; 
       status?: string; 
       progress?: number; 
@@ -181,7 +206,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
       },
       required: ["action"]
     },
-    execute: async (params: { 
+    execute: async (params, context: { 
       action: "add" | "remove" | "update"; 
       task_id?: string; 
       task?: any;
@@ -234,7 +259,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
       },
       required: ["parent_id", "task"]
     },
-    execute: async (params: { parent_id: string; task: any }) => {
+    execute: async (params, context: { parent_id: string; task: any }) => {
       const subtask = dag.addSubtask(params.parent_id, params.task);
       if (!subtask) {
         return { error: `Parent task ${params.parent_id} not found` };
@@ -258,7 +283,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
       },
       required: ["task_id"]
     },
-    execute: async (params: { task_id: string }) => {
+    execute: async (params, context: any) => {
       const subtasks = dag.getSubtasks(params.task_id);
       return {
         subtasks: subtasks.map(t => ({
@@ -282,8 +307,8 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
       },
       required: ["task_id"]
     },
-    execute: async (params: { task_id: string }) => {
-      const context = dag.getContext(params.task_id);
+    execute: async (params, context: any) => {
+      const taskCtx = dag.getContext(params.task_id);
       if (!context) {
         return { error: `Task ${params.task_id} not found` };
       }
@@ -312,7 +337,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
       },
       required: ["task_id"]
     },
-    execute: async (params: { task_id: string }) => {
+    execute: async (params, context: any) => {
       const reset = dag.resumeFrom(params.task_id);
       return {
         success: true,
@@ -334,7 +359,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
       },
       required: ["task_id"]
     },
-    execute: async (params: { task_id: string; since?: string }) => {
+    execute: async (params, context: { task_id: string; since?: string }) => {
       const logs = dag.getLogs(params.task_id, params.since);
       return { logs };
     }
@@ -352,7 +377,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
       },
       required: ["task_id", "content"]
     },
-    execute: async (params: { task_id: string; content: string }) => {
+    execute: async (params, context: { task_id: string; content: string }) => {
       const docPath = dag.setTaskDoc(params.task_id, params.content);
       if (!docPath) {
         return { error: `Task ${params.task_id} not found` };
@@ -372,7 +397,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
       },
       required: ["task_id"]
     },
-    execute: async (params: { task_id: string }) => {
+    execute: async (params, context: any) => {
       const content = dag.getTaskDoc(params.task_id);
       const task = dag.getTask(params.task_id);
       if (!task) {

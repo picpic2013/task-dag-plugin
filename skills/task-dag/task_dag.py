@@ -9,22 +9,37 @@ from pathlib import Path
 from datetime import datetime
 
 WORKSPACE = os.path.expanduser("~/.openclaw/workspace")
-DAG_DIR = os.path.join(WORKSPACE, "tasks")
-DAG_FILE = os.path.join(DAG_DIR, "dag.json")
+DAG_DIR = "tasks"
+
+# 获取当前 Agent ID（从环境变量或参数）
+def get_agent_id():
+    return os.environ.get('AGENT_ID') or os.environ.get('OPENCLAW_AGENT_ID') or 'main'
+
+def get_dag_dir():
+    agent_id = get_agent_id()
+    return os.path.join(WORKSPACE, DAG_DIR, agent_id)
+
+def get_dag_file():
+    return os.path.join(get_dag_dir(), "dag.json")
+
+def get_task_doc_dir():
+    agent_id = get_agent_id()
+    return os.path.join(WORKSPACE, "tasks", agent_id, "docs")
 
 def ensure_dir():
-    Path(DAG_DIR).mkdir(parents=True, exist_ok=True)
+    Path(get_dag_dir()).mkdir(parents=True, exist_ok=True)
 
 def load_dag():
     ensure_dir()
-    if not os.path.exists(DAG_FILE):
+    dag_file = get_dag_file()
+    if not os.path.exists(dag_file):
         return None
-    with open(DAG_FILE) as f:
+    with open(get_dag_file()) as f:
         return json.load(f)
 
 def save_dag(dag):
     ensure_dir()
-    with open(DAG_FILE, 'w') as f:
+    with open(get_dag_file(), 'w') as f:
         json.dump(dag, f, indent=2)
 
 def create_task_id(dag):

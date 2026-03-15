@@ -25,11 +25,30 @@ const DEFAULT_WORKSPACE = path.join(os.homedir(), '.openclaw', 'workspace');
 const DAG_DIR = 'tasks';
 const DAG_FILE = 'dag.json';
 
+// ============= Agent 上下文 =============
+
+let currentAgentId = 'main';
+
+/**
+ * 设置当前 Agent ID
+ * 由 tools.ts 在执行时调用
+ */
+export function setCurrentAgentId(agentId: string): void {
+  currentAgentId = agentId;
+}
+
+/**
+ * 获取当前 Agent ID
+ */
+export function getCurrentAgentId(): string {
+  return currentAgentId;
+}
+
 // ============= 存储路径 =============
 
 function getDAGDir(): string {
   const workspace = process.env.WORKSPACE_DIR || DEFAULT_WORKSPACE;
-  return path.join(workspace, DAG_DIR);
+  return path.join(workspace, DAG_DIR, currentAgentId);
 }
 
 function getDAGFile(): string {
