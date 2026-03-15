@@ -5,7 +5,7 @@
  */
 
 import type { OpenClawPluginApi } from "./plugin-sdk.js";
-import { getAgentByTask, saveAgentMapping, updateAgentStatus, saveSessionMapping, getTaskBySession, removeSessionMapping } from './agent.js';
+import { getAgentByTask, saveAgentMapping, updateAgentStatus, saveSessionMapping, getTaskBySession, removeSessionMapping, saveSessionHierarchy, getParentAgentId } from './agent.js';
 import { getWaitingAgent, registerWaiting } from './waiter.js';
 import { addNotification, Notification } from './notification.js';
 import * as dag from './dag.js';
@@ -211,9 +211,14 @@ export function registerTaskDagHooks(api: OpenClawPluginApi): void {
   // 注册 subagent_spawned 钩子
   api.registerHook('subagent_spawned', async (event: any) => {
     try {
-      const { childSessionKey, agentId, label } = event;
+      const { childSessionKey, agentId, label, requesterSessionKey } = event;
       
       if (!childSessionKey) return;
+      
+      // 保存父子关系（用于 DAG 路径查找）
+      const parentAgentId = getParentAgentId(requesterSessionKey) || 'main';
+      saveSessionHierarchy(childSessionKey, requesterSessionKey, parentAgentId);
+      api.logger.info(`[task-dag] Session hierarchy: ${childSessionKey} → parent ${parentAgentId}`);
       
       // 解析 label 获取 taskId
       const taskId = parseTaskLabel(label);

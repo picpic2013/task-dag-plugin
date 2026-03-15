@@ -288,3 +288,82 @@ export function getSessionInfo(sessionKey: string): SessionMapping | null {
   const mappings = loadSessionMappings();
   return mappings.sessions[sessionKey] || null;
 }
+
+// ============= Session 层级管理 =============
+// 用于子 Agent 找到父级的 DAG 路径
+
+interface SessionHierarchy {
+  childSessionKey: string;
+  parentSessionKey: string;
+  parentAgentId: string;
+  createdAt: string;
+}
+
+interface SessionHierarchyData {
+  hierarchy: Record<string, SessionHierarchy>;
+}
+
+const HIERARCHY_FILE = path.join(WORKSPACE, 'tasks', 'session-hierarchy.json');
+
+function loadHierarchy(): SessionHierarchyData {
+  try {
+    if (!fs.existsSync(HIERARCHY_FILE)) {
+      return { hierarchy: {} };
+    }
+    const data = fs.readFileSync(HIERARCHY_FILE, 'utf-8');
+    return JSON.parse(data);
+  } catch {
+    return { hierarchy: {} };
+  }
+}
+
+function saveHierarchy(data: SessionHierarchyData): void {
+  const dir = path.dirname(HIERARCHY_FILE);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+  fs.writeFileSync(HIERARCHY_FILE, JSON.stringify(data, null, 2));
+}
+
+/**
+ * 保存父子 session 关系
+ */
+export function saveSessionHierarchy(
+  childSessionKey: string,
+  parentSessionKey: string,
+  parentAgentId: string
+): void {
+  const data = loadHierarchy();
+  data.hierarchy[childSessionKey] = {
+    childSessionKey,
+    parentSessionKey,
+    parentAgentId,
+    createdAt: new Date().toISOString()
+  };
+  saveHierarchy(data);
+}
+
+/**
+ * 获取父级 session key
+ */
+export function getParentSessionKey(childSessionKey: string): string | null {
+  const data = loadHierarchy();
+  return data.hierarchy[childSessionKey]?.parentSessionKey || null;
+}
+
+/**
+ * 获取父级 agent ID
+ */
+export function getParentAgentId(childSessionKey: string): string | null {
+  const data = loadHierarchy();
+  return data.hierarchy[childSessionKey]?.parentAgentId || null;
+}
+
+/**
+ * 删除 session 层级关系
+ */
+export function removeSessionHierarchy(childSessionKey: string): void {
+  const data = loadHierarchy();
+  delete data.hierarchy[childSessionKey];
+  saveHierarchy(data);
+}

@@ -6,12 +6,26 @@
 
 import type { OpenClawPluginApi } from "./plugin-sdk.js";
 import * as dag from './dag.js';
+import { getParentAgentId, getParentSessionKey } from './agent.js';
 
 /**
  * 从上下文获取 agent ID
  */
 function getAgentIdFromContext(context: any): string {
-  // 尝试从多个可能的字段获取 agent ID
+  // 1. 尝试获取当前 session key
+  const sessionKey = context?.session?.key 
+    || context?.sessionKey 
+    || context?.session?.sessionKey;
+  
+  // 2. 如果是子 agent，查找父级的 agent ID
+  if (sessionKey) {
+    const parentAgentId = getParentAgentId(sessionKey);
+    if (parentAgentId) {
+      return parentAgentId;
+    }
+  }
+  
+  // 3. 尝试从多个可能的字段获取 agent ID
   return context?.agent?.id 
     || context?.agentId 
     || context?.session?.agentId 
