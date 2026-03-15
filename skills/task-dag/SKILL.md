@@ -210,6 +210,46 @@ When using `sessions_spawn`, use the `label` parameter to associate with a task.
 
 ---
 
+## Sub-agent Getting Context
+
+Sub-agents can access task context using `task_dag_context`:
+
+```bash
+# In sub-agent session, get context for current task
+task_dag_context t1
+```
+
+This returns:
+- Task description
+- Parent task info
+- **Dependency task outputs** (from completed upstream tasks)
+- Task status
+
+### Example Flow
+
+```
+Main Agent:
+1. task_dag_create(name="项目", tasks=[{id:"t1",name:"任务1"},{id:"t2",name:"任务2",dependencies:["t1"]}])
+2. sessions_spawn(task="执行任务1", label="task:t1")
+3. task_dag_wait task_id="t1"
+
+Sub-agent (for t1):
+4. task_dag_context t1  ← Gets t1 info
+5. task_dag_update t1 done "结果..."
+
+Main Agent (after wait returns):
+6. task_dag_ready  ← Shows t2 is ready
+7. sessions_spawn(task="执行任务2", label="task:t2")
+
+Sub-agent (for t2):
+8. task_dag_context t2  ← Gets t2 info including t1's output!
+9. task_dag_update t2 done "结果..."
+```
+
+The sub-agent automatically uses the parent agent's DAG, so `task_dag_context` works correctly.
+
+---
+
 ## Event Logging (Automatic)
 
 All events are automatically recorded to the **parent agent's** workspace:
