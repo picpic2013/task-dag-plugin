@@ -204,14 +204,10 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
       },
       required: ["task_id"]
     },
-    execute: async (params, context: { 
-      task_id: string; 
-      status?: string; 
-      progress?: number; 
-      output_summary?: string;
-      log?: { level?: string; message: string; progress?: number };
-    }) => {
-      const { task_id, ...updates } = params;
+    execute: async (params, context: any) => {
+      const args = context || params;
+      dag.setCurrentAgentId(args?.agent?.id || args?.agentId || 'main');
+      const { task_id, ...updates } = args;
       const task = dag.updateTask(task_id, updates as any);
       if (!task) {
         return { error: `Task ${task_id} not found` };
