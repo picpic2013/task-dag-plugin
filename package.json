@@ -1,6 +1,6 @@
 {
   "name": "@openclaw/task-dag",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Dynamic task DAG orchestration system for OpenClaw",
   "main": "index.ts",
   "type": "module",
