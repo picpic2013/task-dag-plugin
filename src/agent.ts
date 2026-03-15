@@ -188,3 +188,103 @@ export function cleanupAgents(): number {
   
   return count;
 }
+
+// ============= Session 映射管理 =============
+// 用于 subagent_spawned → subagent_ended 时自动关联 task
+
+const SESSION_MAPPINGS_FILE = path.join(WORKSPACE, 'tasks', 'session-mappings.json');
+
+interface SessionMapping {
+  taskId: string;
+  agentId: string;
+  createdAt: string;
+}
+
+interface SessionMappingsData {
+  sessions: Record<string, SessionMapping>;
+  reverse: Record<string, string>;  // taskId → sessionKey
+}
+
+function ensureSessionDir(): void {
+  const dir = path.dirname(SESSION_MAPPINGS_FILE);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+}
+
+function loadSessionMappings(): SessionMappingsData {
+  try {
+    ensureSessionDir();
+    if (!fs.existsSync(SESSION_MAPPINGS_FILE)) {
+      return { sessions: {}, reverse: {} };
+    }
+    const data = fs.readFileSync(SESSION_MAPPINGS_FILE, 'utf-8');
+    return JSON.parse(data);
+  } catch {
+    return { sessions: {}, reverse: {} };
+  }
+}
+
+function saveSessionMappings(data: SessionMappingsData): void {
+  ensureSessionDir();
+  fs.writeFileSync(SESSION_MAPPINGS_FILE, JSON.stringify(data, null, 2));
+}
+
+/**
+ * 保存 session ↔ task 映射
+ */
+export function saveSessionMapping(
+  sessionKey: string,
+  taskId: string,
+  agentId: string
+): void {
+  const mappings = loadSessionMappings();
+  
+  mappings.sessions[sessionKey] = {
+    taskId,
+    agentId,
+    createdAt: new Date().toISOString()
+  };
+  mappings.reverse[taskId] = sessionKey;
+  
+  saveSessionMappings(mappings);
+}
+
+/**
+ * 通过 sessionKey 获取 taskId
+ */
+export function getTaskBySession(sessionKey: string): string | null {
+  const mappings = loadSessionMappings();
+  return mappings.sessions[sessionKey]?.taskId || null;
+}
+
+/**
+ * 通过 taskId 获取 sessionKey
+ */
+export function getSessionByTask(taskId: string): string | null {
+  const mappings = loadSessionMappings();
+  return mappings.reverse[taskId] || null;
+}
+
+/**
+ * 删除 session 映射
+ */
+export function removeSessionMapping(sessionKey: string): void {
+  const mappings = loadSessionMappings();
+  const taskId = mappings.sessions[sessionKey]?.taskId;
+  
+  delete mappings.sessions[sessionKey];
+  if (taskId) {
+    delete mappings.reverse[taskId];
+  }
+  
+  saveSessionMappings(mappings);
+}
+
+/**
+ * 获取 session 映射信息
+ */
+export function getSessionInfo(sessionKey: string): SessionMapping | null {
+  const mappings = loadSessionMappings();
+  return mappings.sessions[sessionKey] || null;
+}
