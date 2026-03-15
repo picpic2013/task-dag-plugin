@@ -9,7 +9,10 @@ description: "Task DAG for complex multi-step tasks with dependency management, 
 
 **When to use:** Complex multi-step tasks, parallel execution, dependency management.
 
-**Quick Start:**
+---
+
+## Quick Start
+
 ```bash
 # Create tasks with dependencies
 task_dag_create name="项目" tasks=[{id:"t1",name:"任务1"},{id:"t2",dependencies:["t1"]}]
@@ -24,13 +27,19 @@ task_dag_wait task_id="t1"
 task_dag_show
 ```
 
-**Key Features:**
+---
+
+## Key Features
+
 - DAG dependency management
 - Auto sub-agent lifecycle tracking  
 - Automatic status updates (as fallback)
 - Event logging
 
-**Important Rules:**
+---
+
+## Important Rules
+
 1. Always use `label="task:TASK_ID"` when spawning
 2. Always call `task_dag_wait` after spawning
 3. **ALWAYS update task status proactively** - do NOT rely on auto-end as primary mechanism
@@ -38,7 +47,62 @@ task_dag_show
 
 ---
 
-For detailed docs, see below.
+## Task Status Update Rules (IMPORTANT)
+
+**Always proactively update task status - don't rely on auto-end as primary mechanism!**
+
+### When to Update
+
+| Stage | Action | Example |
+|-------|--------|---------|
+| **Start** | Set status to `running` | `task_dag_update task_id="t1" status="running"` |
+| **Progress** | Update progress & log | `task_dag_update task_id="t1" progress=50 log={"message": "完成50%"}` |
+| **Complete** | Set status to `done` | `task_dag_update task_id="t1" status="done" output_summary="最终结果"` |
+| **Error** | Set status to `failed` | `task_dag_update task_id="t1" status="failed" output_summary="错误原因"` |
+
+### Why Proactive Updates?
+
+1. **Accuracy**: You know exactly when a milestone is reached
+2. **Visibility**: Progress is visible to the main agent immediately
+3. **Fallback**: The `subagent_ended` hook auto-marks as `done` only as a safety net
+
+### Auto-End Fallback
+
+The system will automatically mark the task as `done` when the sub-agent ends (via `subagent_ended` hook). **This is only a fallback** - always update status proactively for accuracy.
+
+### Example Flow
+
+```bash
+# 1. Start - mark as running
+task_dag_update task_id="t1" status="running"
+
+# 2. Progress - update milestones
+task_dag_update task_id="t1" progress=25 log={"message": "完成数据收集"}
+task_dag_update task_id="t1" progress=50 log={"message": "完成数据分析"}
+task_dag_update task_id="t1" progress=75 log={"message": "完成报告撰写"}
+
+# 3. Complete - mark as done with output
+task_dag_update task_id="t1" status="done" output_summary="报告已生成: report.pdf"
+```
+
+---
+
+## Wait Function Principle
+
+**Required:** After spawning a sub-agent, you MUST call `task_dag_wait`.
+
+**Flow:**
+```
+sessions_spawn(task="...", label="task:t1")
+         ↓
+task_dag_wait(task_id="t1")
+         ↓
+[Polling loop: check notification queue → check task status → timeout]
+         ↓
+Return: completed | failed | notified | timeout
+```
+
+---
 
 ## Commands
 
@@ -122,63 +186,6 @@ Returns: completed/failed/notified/timeout. After timeout, check sub-agent statu
 ### notify
 ```
 task_dag_notify task_id="t1" message="进度50%" type="progress"
-```
-
----
-
-## Wait Function Principle
-
-**Required:** After spawning a sub-agent, you MUST call `task_dag_wait`.
-
-**Flow:**
-```
-sessions_spawn(task="...", label="task:t1")
-         ↓
-task_dag_wait(task_id="t1")
-         ↓
-[Polling loop: check notification queue → check task status → timeout]
-         ↓
-Return: completed | failed | notified | timeout
-```
-
----
-
-## Task Status Update Rules (IMPORTANT)
-
-**Always proactively update task status - don't rely on auto-end as primary mechanism!**
-
-### When to Update
-
-| Stage | Action | Example |
-|-------|--------|---------|
-| **Start** | Set status to `running` | `task_dag_update task_id="t1" status="running"` |
-| **Progress** | Update progress & log | `task_dag_update task_id="t1" progress=50 log={"message": "完成50%"}` |
-| **Complete** | Set status to `done` | `task_dag_update task_id="t1" status="done" output_summary="最终结果"` |
-| **Error** | Set status to `failed` | `task_dag_update task_id="t1" status="failed" output_summary="错误原因"` |
-
-### Why Proactive Updates?
-
-1. **Accuracy**: You know exactly when a milestone is reached
-2. **Visibility**: Progress is visible to the main agent immediately
-3. **Fallback**: The `subagent_ended` hook auto-marks as `done` only as a safety net
-
-### Auto-End Fallback
-
-The system will automatically mark the task as `done` when the sub-agent ends (via `subagent_ended` hook). **This is only a fallback** - always update status proactively for accuracy.
-
-### Example Flow
-
-```bash
-# 1. Start - mark as running
-task_dag_update task_id="t1" status="running"
-
-# 2. Progress - update milestones
-task_dag_update task_id="t1" progress=25 log={"message": "完成数据收集"}
-task_dag_update task_id="t1" progress=50 log={"message": "完成数据分析"}
-task_dag_update task_id="t1" progress=75 log={"message": "完成报告撰写"}
-
-# 3. Complete - mark as done with output
-task_dag_update task_id="t1" status="done" output_summary="报告已生成: report.pdf"
 ```
 
 ---
