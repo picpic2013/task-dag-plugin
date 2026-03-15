@@ -411,4 +411,89 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
   }, { optional: false });
 
   api.logger.info('[task-dag] All tools registered');
+
+  // ========== task_dag_wait ==========
+  api.registerTool({
+    name: "task_dag_wait",
+    description: "Wait for a task to complete. Returns when task is done, failed, or notified.",
+    parameters: {
+      type: "object",
+      properties: {
+        task_id: { type: "string", description: "Task ID to wait for" },
+        timeout: { type: "number", description: "Max wait time in seconds (default 3600)", default: 3600 },
+        check_interval: { type: "number", description: "Check interval in seconds (default 5)", default: 5 }
+      },
+      required: ["task_id"]
+    },
+    execute: async (params: any, context: any) => {
+      const agentId = context?.agent?.id || context?.agentId || "main";
+      dag.setCurrentAgentId(agentId);
+      
+      const { task_id, timeout = 3600, check_interval = 5 } = params;
+      
+      const waiter = await import("./waiter.js");
+      const notificationModule = await import("./notification.js");
+      
+      waiter.registerWaiting(agentId, task_id, timeout);
+      
+      const startTime = Date.now();
+      
+      while (Date.now() - startTime < timeout * 1000) {
+        const notification = notificationModule.getAndClearNotification(task_id);
+        if (notification) {
+          waiter.unregisterWaiting(agentId);
+          return { status: "notified", notification, mermaid: dag.showProgress() };
+        }
+        
+        const task = dag.getTask(task_id);
+        if (task) {
+          if (task.status === "done") {
+            waiter.unregisterWaiting(agentId);
+            return { status: "completed", output: task.output_summary, mermaid: dag.showProgress() };
+          }
+          if (task.status === "failed") {
+            waiter.unregisterWaiting(agentId);
+            return { status: "failed", output: task.output_summary, mermaid: dag.showProgress() };
+          }
+        }
+        
+        await new Promise(resolve => setTimeout(resolve, check_interval * 1000));
+      }
+      
+      waiter.unregisterWaiting(agentId);
+      return { status: "timeout", continue: true };
+    }
+  }, { optional: false });
+
+  // ========== task_dag_notify ==========
+  api.registerTool({
+    name: "task_dag_notify",
+    description: "Notify the waiting agent about task progress, issues, or completion",
+    parameters: {
+      type: "object",
+      properties: {
+        task_id: { type: "string", description: "Task ID" },
+        message: { type: "string", description: "Notification message" },
+        type: { type: "string", enum: ["progress", "issue", "complete", "failed"], description: "Notification type" },
+        progress: { type: "number", description: "Progress percentage (0-100)" }
+      },
+      required: ["task_id", "message", "type"]
+    },
+    execute: async (params: any, context: any) => {
+      const agentId = context?.agent?.id || context?.agentId || "main";
+      dag.setCurrentAgentId(agentId);
+      
+      const { task_id, message, type, progress } = params;
+      
+      const waiter = await import("./waiter.js");
+      const notificationModule = await import("./notification.js");
+      
+      notificationModule.addNotification(task_id, { type, message, timestamp: new Date().toISOString(), agent_id: agentId, progress });
+      
+      const waitingAgent = waiter.getWaitingAgent(task_id);
+      
+      return { success: true, delivered: !!waitingAgent, waiting_agent: waitingAgent };
+    }
+  }, { optional: false });
+
 }
