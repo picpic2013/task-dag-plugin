@@ -243,6 +243,9 @@ export function registerTaskDagHooks(api: OpenClawPluginApi): void {
     } catch (error) {
       api.logger.error(`[task-dag] Error in subagent_spawned: ${error}`);
     }
+  }, {
+    name: 'task-dag.subagent-spawned',
+    description: '子 agent 启动时自动关联任务'
   });
   
   // 注册 subagent_ended 钩子
@@ -285,6 +288,9 @@ export function registerTaskDagHooks(api: OpenClawPluginApi): void {
     } catch (error) {
       api.logger.error(`[task-dag] Error in subagent_ended: ${error}`);
     }
+  }, {
+    name: 'task-dag.subagent-ended',
+    description: '子 agent 结束时自动更新任务状态'
   });
   
   api.logger.info('[task-dag] Hooks + subagent hooks registered');
