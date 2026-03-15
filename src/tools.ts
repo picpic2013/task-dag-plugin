@@ -346,19 +346,19 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
     },
     execute: async (params, context: any) => {
       const taskCtx = dag.getContext(params.task_id);
-      if (!context) {
+      if (!taskCtx) {
         return { error: `Task ${params.task_id} not found` };
       }
       return {
-        task_id: context.task.id,
-        task_name: context.task.name,
-        task_description: context.task.description,
-        task_doc_path: context.task.doc_path,
-        task_status: context.task.status,
-        task_progress: context.task.progress,
-        parent_task: context.parent,
-        dependency_outputs: context.dependency_outputs,
-        dag_name: context.dag_name
+        task_id: taskCtx.task.id,
+        task_name: taskCtx.task.name,
+        task_description: taskCtx.task.description,
+        task_doc_path: taskCtx.task.doc_path,
+        task_status: taskCtx.task.status,
+        task_progress: taskCtx.task.progress,
+        parent_task: taskCtx.parent,
+        dependency_outputs: taskCtx.dependency_outputs,
+        dag_name: taskCtx.dag_name
       };
     }
   }, { optional: false });
