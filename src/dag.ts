@@ -7,7 +7,8 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { addEvent } from './events.js';
+import { addEvent, setCurrentAgentId as setAgentId } from './events.js';
+export { setCurrentAgentId } from './events.js';
 import { 
   Task, 
   TaskDAG, 
@@ -34,9 +35,7 @@ let currentAgentId = 'main';
  * 设置当前 Agent ID
  * 由 tools.ts 在执行时调用
  */
-export function setCurrentAgentId(agentId: string): void {
-  currentAgentId = agentId;
-}
+
 
 /**
  * 获取当前 Agent ID
@@ -49,7 +48,10 @@ export function getCurrentAgentId(): string {
 
 function getDAGDir(): string {
   const workspace = process.env.WORKSPACE_DIR || DEFAULT_WORKSPACE;
-  return path.join(workspace, DAG_DIR, currentAgentId);
+  const dir = path.join(workspace, DAG_DIR, currentAgentId);
+  // 同步设置 events 模块的 agent ID
+  setAgentId(currentAgentId);
+  return dir;
 }
 
 function getDAGFile(): string {

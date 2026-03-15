@@ -62,6 +62,11 @@ task-dag update t1 running 50
 task-dag update t1 done 100 "output summary"
 ```
 
+**Parameters:**
+- `running/done/failed`: Task status
+- `50/100`: Progress percentage (0-100). 50 means 50% complete.
+- `"output summary"`: Optional completion message
+
 ### modify
 
 Modify task graph.
@@ -158,7 +163,13 @@ After spawning a sub-agent, you **MUST** call `task_dag_wait` to wait for comple
 | `completed` | Task finished successfully |
 | `failed` | Task failed |
 | `notified` | Received progress/issue notification |
-| `timeout` | Wait timed out (continue=true) |
+| `timeout` | Wait timed out |
+
+**After Timeout:**
+If timeout occurs, you MUST check the sub-agent status:
+1. Check if sub-agent is still running
+2. If still running, call `task_dag_wait` again to continue waiting
+3. If sub-agent has issues, handle accordingly
 
 ### Example
 
@@ -205,7 +216,11 @@ When using `sessions_spawn`, use the `label` parameter to associate with a task.
 
 ## Event Logging (Automatic)
 
-All events are automatically recorded to `~/.openclaw/workspace/tasks/events.jsonl`.
+All events are automatically recorded to the **parent agent's** workspace:
+- Main agent events → `tasks/main/events.jsonl`
+- Sub-agent events → `tasks/main/events.jsonl` (inherits from parent)
+
+Events are automatically stored in the parent agent's directory, not in `main` specifically.
 
 ### Automatic Events
 
@@ -247,22 +262,13 @@ All events are automatically recorded to `~/.openclaw/workspace/tasks/events.jso
 
 ## Model Selection Strategy
 
-### By Complexity
+### Model Selection
 
-| Complexity | Example | Recommended Model |
-|------------|---------|-------------------|
-| Simple | Format output, simple query | MiniMax High Speed |
-| Medium | Script writing, data processing | GPT-5.2 Codex |
-| Complex | Architecture design, complex debugging | GPT-5.3 Codex |
-
-### Usage
+You can use different models based on task complexity. The specific model should be specified by the user in the task description.
 
 ```bash
-# Simple task
-sessions_spawn(task="Format this JSON", label="task:t1", model="minimax/MiniMax-M2.5-highspeed")
-
-# Complex task
-sessions_spawn(task="Design system architecture", label="task:t2", model="openai-codex/gpt-5.3-codex")
+# User specifies model in task description
+sessions_spawn(task="[Use GPT-5.3 Codex] Design system architecture", label="task:t2")
 ```
 
 ---
