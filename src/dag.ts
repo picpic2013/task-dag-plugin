@@ -7,6 +7,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import { addEvent } from './events.js';
 import { 
   Task, 
   TaskDAG, 
@@ -123,6 +124,12 @@ export function createDAG(name: string, tasks: CreateTaskInput[]): TaskDAG {
   // 重新计算状态
   recalculateAllStatuses(dag);
   saveDAG(dag);
+  
+  addEvent({
+    event: 'dag_created',
+    details: `DAG "${name}" created with ${tasks.length} tasks`
+  });
+  
   return dag;
 }
 
@@ -161,6 +168,13 @@ export function addTask(input: CreateTaskInput): Task {
 
   recalculateAllStatuses(dag);
   saveDAG(dag);
+  
+  addEvent({
+    event: 'task_created',
+    task_id: task.id,
+    details: `Task "${task.name}" created`
+  });
+  
   return task;
 }
 
@@ -205,6 +219,15 @@ export function updateTask(taskId: string, updates: UpdateTaskInput): Task | nul
   if (updates.status === 'done' && !task.completed_at) {
     task.completed_at = new Date().toISOString();
     task.progress = 100;
+  }
+
+  // 记录状态变更事件
+  if (updates.status) {
+    addEvent({
+      event: 'task_updated',
+      task_id: taskId,
+      details: `Status changed to ${updates.status}`
+    });
   }
 
   recalculateAllStatuses(dag);

@@ -6,6 +6,7 @@
 
 import type { OpenClawPluginApi } from "./plugin-sdk.js";
 import { getAgentByTask, saveAgentMapping, updateAgentStatus, saveSessionMapping, getTaskBySession, removeSessionMapping, saveSessionHierarchy, getParentAgentId } from './agent.js';
+import { addEvent } from './events.js';
 import { getWaitingAgent, registerWaiting } from './waiter.js';
 import { addNotification, Notification } from './notification.js';
 import * as dag from './dag.js';
@@ -229,6 +230,15 @@ export function registerTaskDagHooks(api: OpenClawPluginApi): void {
       
       // 保存 session ↔ task 映射
       saveSessionMapping(childSessionKey, taskId, agentId);
+      
+      addEvent({
+        event: 'subtask_spawned',
+        task_id: taskId,
+        session_key: childSessionKey,
+        agent_id: agentId,
+        details: `Sub-agent started for task ${taskId}`
+      });
+      
       api.logger.info(`[task-dag] Mapped session ${childSessionKey} → task ${taskId}`);
     } catch (error) {
       api.logger.error(`[task-dag] Error in subagent_spawned: ${error}`);
@@ -262,6 +272,13 @@ export function registerTaskDagHooks(api: OpenClawPluginApi): void {
       if (agentId) {
         updateAgentStatus(agentId, outcome === 'ok' ? 'completed' : 'failed');
       }
+      
+      addEvent({
+        event: 'subtask_ended',
+        task_id: taskId,
+        outcome: outcome,
+        details: `Sub-agent ended with outcome: ${outcome}`
+      });
       
       // 清理映射
       removeSessionMapping(targetSessionKey);
