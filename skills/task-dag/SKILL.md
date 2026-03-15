@@ -132,6 +132,38 @@ task-dag notify t1 "完成" complete
 - message: Notification message
 - type: progress, issue, complete, or failed
 
+## Subagent Automatic Association (Recommended)
+
+When using `sessions_spawn` to launch a subagent, you can automatically associate the subagent's session with a task by using the `label` parameter. When the subagent finishes, the task will automatically be marked as done.
+
+### Label Format
+
+| Format | Example | Description |
+|--------|---------|-------------|
+| `task:ID` | `task:t1` | Recommended |
+| `task_id=ID` | `task_id=t1` | Alternative |
+| Pure ID | `t1` | Shorthand |
+
+### Example
+
+```
+# Main agent creates a task
+task-dag create "项目" '[{"id":"t1","name":"收集信息"}]'
+
+# Main agent spawns a subagent with label "task:t1"
+sessions_spawn(task="分析这个", label="task:t1")
+
+# When subagent finishes, task t1 is automatically marked as done!
+# No need to manually send TASK_COMPLETE message
+```
+
+### How It Works
+
+1. When you call `sessions_spawn` with `label="task:t1"`, the system automatically saves the mapping
+2. When the subagent ends (completes or fails), the system automatically updates the task status
+3. If the subagent completes successfully → task status = done
+4. If the subagent fails → task status = failed
+
 ## Examples
 
 ### Example 1: Create and manage a project
