@@ -152,6 +152,30 @@ Returns: task info + dependency outputs.
 
 ---
 
+## Splitting Tasks (Subtasks)
+
+For complex tasks, sub-agents can create subtasks under a parent task:
+
+```bash
+# Sub-agent creates subtasks under t1
+task_dag_subtask_create parent_id="t1" task={"name":"竞品分析"}
+task_dag_subtask_create parent_id="t1" task={"name":"用户访谈"}
+
+# View subtasks
+task_dag_subtask_list t1
+```
+
+Result:
+```
+t1 (parent)
+├── t1_1 (竞品分析)
+└── t1_2 (用户访谈)
+```
+
+**Note:** Subtasks automatically belong to the parent task's DAG. No need to create a new DAG.
+
+---
+
 ## Event Logging
 
 Automatic. Events stored in parent agent's workspace.
