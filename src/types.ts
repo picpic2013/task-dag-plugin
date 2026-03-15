@@ -122,6 +122,9 @@ export function validateTask(task: Task): boolean {
 /**
  * 检测循环依赖
  * 使用 DFS 检测从指定任务是否能回到自身
+ * 
+ * 注意：task.dependencies 表示"依赖"关系，即 dep -> task
+ * 我们需要检测的是：是否存在一条路径从 task 出发又回到 task
  */
 export function detectCycle(dag: TaskDAG, startTaskId: string): boolean {
   const visited = new Set<string>();
@@ -137,12 +140,17 @@ export function detectCycle(dag: TaskDAG, startTaskId: string): boolean {
       return false;
     }
     
-    for (const depId of task.dependencies) {
-      if (!visited.has(depId)) {
-        if (dfs(depId)) {
+    // 找到所有依赖当前任务的任务（即下游任务）
+    const downstreamTasks = Object.values(dag.tasks)
+      .filter(t => t.dependencies.includes(taskId))
+      .map(t => t.id);
+    
+    for (const downstreamId of downstreamTasks) {
+      if (!visited.has(downstreamId)) {
+        if (dfs(downstreamId)) {
           return true;
         }
-      } else if (recursionStack.has(depId)) {
+      } else if (recursionStack.has(downstreamId)) {
         // 发现循环
         return true;
       }
