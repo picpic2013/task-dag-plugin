@@ -66,6 +66,7 @@ task_dag_get t1
 task_dag_update t1 running 50
 task_dag_update t1 done 100 "完成"
 ```
+**Note:** Just use task ID (e.g., "t1"), NOT "dag-xxx_t1".
 Parameters: status (running/done/failed), progress (0-100), output summary
 
 ### wait
