@@ -1,9 +1,11 @@
 ---
 name: task-dag
-description: "Task DAG - DAG-based task orchestration with automatic sub-agent tracking"
+description: "Task DAG for complex multi-step tasks with dependency management, automatic sub-agent tracking. Use when: parallel execution, dependency chains, task orchestration."
 ---
 
 # Task DAG
+
+> Use when: complex multi-step tasks, parallel execution, dependency management.
 
 **When to use:** Complex multi-step tasks, parallel execution, dependency management.
 
