@@ -391,3 +391,19 @@ task_dag_wait task_id="t2"
 - Progress: 0-100
 - Dependencies: Task IDs (e.g., ["t1", "t2"])
 - **Always use `task_dag_wait` after spawning sub-agents!**
+
+### Markdown Documents
+
+Tasks can reference local markdown documents via `doc_path`:
+
+```bash
+# Get task context including doc_path
+task_dag_context t1
+# Returns: { doc_path: "/path/to/document.md", ... }
+
+# Use read/write tools to edit markdown directly:
+read /path/to/document.md
+write content=... to /path/to/document.md
+```
+
+The agent should directly use `read` and `write` tools to edit markdown files - no special task_dag tools needed.
