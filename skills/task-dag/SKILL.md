@@ -1,10 +1,6 @@
 ---
 name: task-dag
 description: "Task DAG management - create, show, modify, and monitor tasks"
-metadata:
-  openclaw:
-    requires:
-      bins: ["python3"]
 ---
 
 # Task DAG Management
