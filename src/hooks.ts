@@ -5,10 +5,37 @@
  */
 
 import type { OpenClawPluginApi } from "./plugin-sdk.js";
-import { getAgentByTask, saveAgentMapping, updateAgentStatus } from './agent.js';
+import { getAgentByTask, saveAgentMapping, updateAgentStatus, saveSessionMapping, getTaskBySession, removeSessionMapping } from './agent.js';
 import { getWaitingAgent, registerWaiting } from './waiter.js';
 import { addNotification, Notification } from './notification.js';
 import * as dag from './dag.js';
+
+/**
+ * 解析 sessions_spawn 的 label 获取 taskId
+ * 
+ * 支持格式：
+ * - task:t1      → t1
+ * - task_id=t1   → t1
+ * - t1           → t1
+ * - my-agent     → null (普通 label)
+ */
+export function parseTaskLabel(label: string): string | null {
+  if (!label) return null;
+  
+  // 匹配 task:t1 格式 (处理逗号分隔的额外内容)
+  const match1 = label.match(/^task:([^,]+)/i);
+  if (match1) return match1[1].trim();
+  
+  // 匹配 task_id=t1 或 task-id=t1 格式
+  const match2 = label.match(/^task[_-]?id[=:]([^,]+)/i);
+  if (match2) return match2[1].trim();
+  
+  // 匹配纯 task ID 格式 (t1, task-1 等)
+  const match3 = label.match(/^(t\d+|[a-z]+-\d+)$/i);
+  if (match3) return match3[1];
+  
+  return null;
+}
 
 /**
  * 解析 TASK_COMPLETE 格式的消息
@@ -181,7 +208,64 @@ export function registerTaskDagHooks(api: OpenClawPluginApi): void {
     }
   );
   
-  api.logger.info('[task-dag] Hooks registered');
+  // 注册 subagent_spawned 钩子
+  api.registerHook('subagent_spawned', async (event: any) => {
+    try {
+      const { childSessionKey, agentId, label } = event;
+      
+      if (!childSessionKey) return;
+      
+      // 解析 label 获取 taskId
+      const taskId = parseTaskLabel(label);
+      if (!taskId) {
+        api.logger.info(`[task-dag] No taskId in label: ${label}`);
+        return;
+      }
+      
+      // 保存 session ↔ task 映射
+      saveSessionMapping(childSessionKey, taskId, agentId);
+      api.logger.info(`[task-dag] Mapped session ${childSessionKey} → task ${taskId}`);
+    } catch (error) {
+      api.logger.error(`[task-dag] Error in subagent_spawned: ${error}`);
+    }
+  });
+  
+  // 注册 subagent_ended 钩子
+  api.registerHook('subagent_ended', async (event: any) => {
+    try {
+      const { targetSessionKey, outcome } = event;
+      
+      if (!targetSessionKey) return;
+      
+      // 获取 taskId
+      const taskId = getTaskBySession(targetSessionKey);
+      if (!taskId) {
+        return;
+      }
+      
+      // 根据结果更新任务状态
+      if (outcome === 'ok') {
+        dag.updateTask(taskId, { status: 'done' });
+        api.logger.info(`[task-dag] Task ${taskId} marked as done`);
+      } else if (outcome === 'error' || outcome === 'timeout') {
+        dag.updateTask(taskId, { status: 'failed' });
+        api.logger.info(`[task-dag] Task ${taskId} marked as failed (${outcome})`);
+      }
+      
+      // 更新 agent 状态
+      const agentId = getAgentByTask(taskId);
+      if (agentId) {
+        updateAgentStatus(agentId, outcome === 'ok' ? 'completed' : 'failed');
+      }
+      
+      // 清理映射
+      removeSessionMapping(targetSessionKey);
+    } catch (error) {
+      api.logger.error(`[task-dag] Error in subagent_ended: ${error}`);
+    }
+  });
+  
+  api.logger.info('[task-dag] Hooks + subagent hooks registered');
 }
 
 /**
