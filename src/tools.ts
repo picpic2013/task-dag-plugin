@@ -75,15 +75,17 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
     },
     execute: async (params, context: any) => {
       try {
+        // 解析 name 参数
+        const dagName = params.name || params.project_name || params.title || 'Untitled';
+        
         // 解析 tasks 参数（可能是字符串、数组或其他）
-        let tasks = params.tasks;
+        let tasks = params.tasks || params.task_list || params.items || [];
         
         // 如果是字符串，尝试解析为 JSON
         if (typeof tasks === 'string') {
           try {
             tasks = JSON.parse(tasks);
           } catch {
-            // 字符串不是 JSON，尝试作为单个任务处理
             tasks = [];
           }
         }
@@ -96,7 +98,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
         // 确保是数组
         tasks = Array.isArray(tasks) ? tasks : [];
         
-        const result = dag.createDAG(params.name, tasks);
+        const result = dag.createDAG(dagName, tasks);
         return {
           success: true,
           dag_id: result.id,
