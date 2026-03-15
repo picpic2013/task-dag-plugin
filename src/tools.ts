@@ -9,28 +9,95 @@ import * as dag from './dag.js';
 import { getParentAgentId, getParentSessionKey } from './agent.js';
 
 /**
- * 从上下文获取 agent ID
+ * 从上下文和参数获取 agent ID
+ * 优先级：
+ * 1. 显式的 parent_agent_id 参数 (子 agent 继承父 agent)
+ * 2. 显式的 agent_id 参数 (工具调用时传递)
+ * 3. 显式的 agent.id / agentId (context)
+ * 4. session key (基于 session key 生成唯一 ID)
+ * 5. runtime.model (区分不同模型)
+ * 6. 默认值 'main'
  */
-function getAgentIdFromContext(context: any): string {
-  // 1. 尝试获取当前 session key
-  const sessionKey = context?.session?.key 
-    || context?.sessionKey 
-    || context?.session?.sessionKey;
+function getAgentIdFromContext(context: any, params?: any): string {
+  // 调试日志
+  console.log('[task-dag] getAgentIdFromContext:');
+  console.log('  context keys:', context ? Object.keys(context) : 'null');
+  console.log('  params keys:', params ? Object.keys(params) : 'null');
+  console.log('  context.agent:', context?.agent);
+  console.log('  params.agent_id:', params?.agent_id);
   
-  // 2. 如果是子 agent，查找父级的 agent ID
-  if (sessionKey) {
-    const parentAgentId = getParentAgentId(sessionKey);
-    if (parentAgentId) {
-      return parentAgentId;
-    }
+  // 合并 context 和 params，params 优先
+  const args = { ...context, ...params };
+  
+  // 1. 优先使用 parent_agent_id (子 agent 继承父 agent 目录)
+  const parentAgentId = args?.parent_agent_id;
+  if (parentAgentId && parentAgentId !== 'main') {
+    return parentAgentId;
   }
   
-  // 3. 尝试从多个可能的字段获取 agent ID
-  return context?.agent?.id 
-    || context?.agentId 
-    || context?.session?.agentId 
-    || context?.runtime?.agentId
-    || 'main';
+  // 2. 尝试从 agent_id 参数获取
+  const agentIdParam = args?.agent_id;
+  console.log('  agentIdParam:', agentIdParam);
+  if (agentIdParam) {
+    return agentIdParam;
+  }
+  
+  // 3. 尝试从显式字段获取
+  const explicitAgentId = args?.agent?.id 
+    || args?.agentId 
+    || args?.session?.agentId 
+    || args?.runtime?.agentId;
+  
+  console.log('  explicitAgentId:', explicitAgentId);
+  if (explicitAgentId) {
+    return explicitAgentId;
+  }
+  
+  // 4. 尝试从 session key 获取唯一标识
+  const sessionKey = args?.session?.key 
+    || args?.sessionKey 
+    || args?.session?.sessionKey;
+  
+  console.log('  sessionKey:', sessionKey);
+  if (sessionKey) {
+    // 检查 session key 是否包含父 agent 信息
+    // 格式: parentSessionKey:currentSessionKey 或类似
+    const parts = sessionKey.split(':');
+    if (parts.length >= 2) {
+      // 尝试用第一部分作为父 agent
+      const parentPart = parts[0];
+      // 如果父 part 看起来像一个有效的 agent 标识
+      if (parentPart && parentPart.length > 5) {
+        return `session-${hashString(parentPart)}`;
+      }
+    }
+    // 使用整个 sessionKey 的 hash
+    const hash = hashString(sessionKey);
+    return `session-${hash}`;
+  }
+  
+  // 5. 尝试从 runtime.model 获取 (区分不同模型)
+  const model = args?.runtime?.model;
+  if (model) {
+    const modelHash = hashString(model);
+    return `model-${modelHash}`;
+  }
+  
+  // 6. 默认值
+  return 'main';
+}
+
+/**
+ * 简单字符串 hash 函数
+ */
+function hashString(str: string): string {
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    const char = str.charCodeAt(i);
+    hash = ((hash << 5) - hash) + char;
+    hash = hash & hash; // Convert to 32bit integer
+  }
+  return Math.abs(hash).toString(36);
 }
 
 /**
@@ -38,7 +105,7 @@ function getAgentIdFromContext(context: any): string {
  */
 function executeWithAgent(executeFn: (params: any) => Promise<any>) {
   return async (params: any, context?: any) => {
-    const agentId = getAgentIdFromContext(context);
+    const agentId = getAgentIdFromContext(context, params);
     dag.setCurrentAgentId(agentId);
     return executeFn(params);
   };
@@ -55,6 +122,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
       type: "object",
       properties: {
         name: { type: "string", description: "Project name" },
+        agent_id: { type: "string", description: "指定 agent ID（子 agent 可继承父 agent 的目录）" },
         tasks: {
           type: "array",
           description: "Array of tasks to create",
@@ -75,7 +143,12 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
     },
     execute: async (params, context: any) => {
       try {
-        const args = context || params;
+        // 同时检查 context 和 params，params 优先
+        const args = { ...(context || {}), ...(params || {}) };
+        
+        // 获取 agent ID（支持继承父 agent）
+        const agentId = getAgentIdFromContext(context, params);
+        dag.setCurrentAgentId(agentId);
         
         // 解析 name 参数
         const dagName = args.name || args.project_name || args.title || 'Untitled';
@@ -104,6 +177,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
         return {
           success: true,
           dag_id: result.id,
+          agent_id: agentId,
           mermaid: dag.showProgress()
         };
       } catch (error: any) {
@@ -118,14 +192,17 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
     description: "Show current DAG progress with Mermaid diagram",
     parameters: {
       type: "object",
-      properties: {}
+      properties: {
+        agent_id: { type: "string", description: "指定 agent ID 查看其任务（可选）" }
+      }
     },
     execute: async (params, context: any) => {
       const args = context || params;
-      dag.setCurrentAgentId(args?.agent?.id || args?.agentId || 'main');
+      const agentId = getAgentIdFromContext(args);
+      dag.setCurrentAgentId(agentId);
       const mermaid = dag.showProgress();
       const stats = dag.getStats();
-      return { mermaid, stats };
+      return { mermaid, stats, agent_id: agentId };
     }
   }, { optional: false });
 
@@ -135,13 +212,17 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
     description: "Get tasks that are ready to run (dependencies completed)",
     parameters: {
       type: "object",
-      properties: {}
+      properties: {
+        agent_id: { type: "string", description: "指定 agent ID（可选）" }
+      }
     },
     execute: async (params, context: any) => {
       const args = context || params;
-      dag.setCurrentAgentId(args?.agent?.id || args?.agentId || 'main');
+      const agentId = getAgentIdFromContext(args);
+      dag.setCurrentAgentId(agentId);
       const tasks = dag.getReadyTasks();
       return {
+        agent_id: agentId,
         tasks: tasks.map(t => ({
           id: t.id,
           name: t.name,
@@ -158,18 +239,73 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
     parameters: {
       type: "object",
       properties: {
-        task_id: { type: "string", description: "Task ID" }
+        task_id: { type: "string", description: "Task ID" },
+        agent_id: { type: "string", description: "指定 agent ID（可选）" }
       },
       required: ["task_id"]
     },
     execute: async (params, context: any) => {
       const args = context || params;
-      dag.setCurrentAgentId(args?.agent?.id || args?.agentId || 'main');
+      const agentId = getAgentIdFromContext(args);
+      dag.setCurrentAgentId(agentId);
       const task = dag.getTask(args.task_id);
       if (!task) {
         return { error: `Task ${params.task_id} not found` };
       }
-      return { task };
+      return { task, agent_id: agentId };
+    }
+  }, { optional: false });
+
+  // ========== task_dag_get_parent ==========
+  // 跨 Agent 查看父 Agent 的任务状态
+  api.registerTool({
+    name: "task_dag_get_parent",
+    description: "获取父 Agent 的任务状态（子 Agent 查看父任务）",
+    parameters: {
+      type: "object",
+      properties: {
+        parent_agent_id: { type: "string", description: "父 Agent ID" },
+        dag_id: { type: "string", description: "父 Agent 的 DAG ID（可选，默认最新）" }
+      }
+    },
+    execute: async (params, context: any) => {
+      const args = context || params;
+      const parentAgentId = args.parent_agent_id;
+      
+      if (!parentAgentId) {
+        return { error: "parent_agent_id is required" };
+      }
+      
+      // 加载父 Agent 的 DAG
+      const parentDag = (dag as any).loadDAGForAgent(parentAgentId, args.dag_id);
+      
+      if (!parentDag) {
+        return { error: `Parent DAG not found for agent ${parentAgentId}` };
+      }
+      
+      // 返回所有任务的状态摘要
+      const tasks = Object.values(parentDag.tasks).map((t: any) => ({
+        id: t.id,
+        name: t.name,
+        status: t.status,
+        progress: t.progress,
+        output_summary: t.output_summary
+      }));
+      
+      return {
+        parent_agent_id: parentAgentId,
+        dag_id: parentDag.id,
+        dag_name: parentDag.name,
+        created_at: parentDag.created_at,
+        tasks,
+        stats: {
+          total: tasks.length,
+          done: tasks.filter((t: any) => t.status === 'done').length,
+          running: tasks.filter((t: any) => t.status === 'running').length,
+          pending: tasks.filter((t: any) => t.status === 'pending').length,
+          failed: tasks.filter((t: any) => t.status === 'failed').length
+        }
+      };
     }
   }, { optional: false });
 
@@ -181,6 +317,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
       type: "object",
       properties: {
         task_id: { type: "string", description: "Task ID" },
+        agent_id: { type: "string", description: "指定 agent ID（可选）" },
         status: { 
           type: "string", 
           enum: ["pending", "running", "done", "failed", "cancelled"],
@@ -206,7 +343,8 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
     },
     execute: async (params, context: any) => {
       const args = context || params;
-      dag.setCurrentAgentId(args?.agent?.id || args?.agentId || 'main');
+      const agentId = getAgentIdFromContext(args);
+      dag.setCurrentAgentId(agentId);
       const { task_id, ...updates } = args;
       const task = dag.updateTask(task_id, updates as any);
       if (!task) {
@@ -214,6 +352,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
       }
       return {
         success: true,
+        agent_id: agentId,
         mermaid: dag.showProgress()
       };
     }

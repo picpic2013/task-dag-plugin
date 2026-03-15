@@ -9,11 +9,15 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 
-const DEFAULT_WORKSPACE = process.env.WORKSPACE_DIR || path.join(os.homedir(), '.openclaw', 'workspace');
+const DEFAULT_WORKSPACE = process.env.WORKSPACE_DIR || path.join(os.homedir(), '.openclaw');
+const WORKSPACE_PREFIX = 'workspace-';
 const DAG_DIR = 'tasks';
 
 // 当前 agent ID（由 dag.ts 设置）
 let currentAgentId = 'main';
+
+// 当前 DAG ID（用于区分同一 agent 的不同 DAG）
+let currentDagId: string | null = null;
 
 /**
  * 设置当前 Agent ID
@@ -29,9 +33,32 @@ export function getCurrentAgentId(): string {
   return currentAgentId;
 }
 
+/**
+ * 设置当前 DAG ID
+ */
+export function setCurrentDagId(dagId: string): void {
+  currentDagId = dagId;
+}
+
+/**
+ * 获取当前 DAG ID
+ */
+export function getCurrentDagId(): string | null {
+  return currentDagId;
+}
+
 function getEventsFile(): string {
-  const workspace = process.env.WORKSPACE_DIR || DEFAULT_WORKSPACE;
-  return path.join(workspace, DAG_DIR, currentAgentId, 'events.jsonl');
+  const baseDir = process.env.WORKSPACE_DIR || DEFAULT_WORKSPACE;
+  const agentId = currentAgentId;
+  const dagId = currentDagId || 'default';
+  
+  if (agentId === 'main') {
+    // main 走旧路径: workspace/tasks/{dag_id}/events.jsonl
+    return path.join(baseDir, 'workspace', DAG_DIR, dagId, 'events.jsonl');
+  }
+  
+  // 其他 agent 走新路径: workspace-{agent_id}/tasks/{dag_id}/events.jsonl
+  return path.join(baseDir, `${WORKSPACE_PREFIX}${agentId}`, DAG_DIR, dagId, 'events.jsonl');
 }
 
 function ensureDir(): void {

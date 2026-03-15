@@ -7,8 +7,8 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { addEvent, setCurrentAgentId as setAgentId } from './events.js';
-export { setCurrentAgentId } from './events.js';
+import { addEvent, setCurrentAgentId, getCurrentAgentId, setCurrentDagId, getCurrentDagId } from './events.js';
+export { setCurrentAgentId, getCurrentAgentId, setCurrentDagId, getCurrentDagId } from './events.js';
 import { 
   Task, 
   TaskDAG, 
@@ -23,35 +23,39 @@ import {
 
 // ============= 常量 =============
 
-const DEFAULT_WORKSPACE = path.join(os.homedir(), '.openclaw', 'workspace');
+const DEFAULT_WORKSPACE = path.join(os.homedir(), '.openclaw');
+const WORKSPACE_PREFIX = 'workspace-';
 const DAG_DIR = 'tasks';
 const DAG_FILE = 'dag.json';
 
 // ============= Agent 上下文 =============
 
-let currentAgentId = 'main';
-
-/**
- * 设置当前 Agent ID
- * 由 tools.ts 在执行时调用
- */
-
-
-/**
- * 获取当前 Agent ID
- */
-export function getCurrentAgentId(): string {
-  return currentAgentId;
-}
+// currentAgentId 和 currentDagId 现在从 events.ts 导入
+// 每个 DAG 保存在独立的子目录：tasks/{agent_id}/{dag_id}/
 
 // ============= 存储路径 =============
 
+/**
+ * 为指定 Agent 和 DAG 获取目录
+ * 格式：
+ *   - main: ~/.openclaw/workspace/tasks/{dag_id}/
+ *   - 其他: ~/.openclaw/workspace-{agent_id}/tasks/{dag_id}/
+ */
+export function getDAGDirForAgent(agentId: string, dagId?: string): string {
+  const baseDir = process.env.WORKSPACE_DIR || DEFAULT_WORKSPACE;
+  const dagDir = dagId || getCurrentDagId() || 'default';
+  
+  if (agentId === 'main') {
+    // main 走旧路径
+    return path.join(baseDir, 'workspace', DAG_DIR, dagDir);
+  }
+  
+  // 其他 agent 走新路径
+  return path.join(baseDir, `${WORKSPACE_PREFIX}${agentId}`, DAG_DIR, dagDir);
+}
+
 function getDAGDir(): string {
-  const workspace = process.env.WORKSPACE_DIR || DEFAULT_WORKSPACE;
-  const dir = path.join(workspace, DAG_DIR, currentAgentId);
-  // 同步设置 events 模块的 agent ID
-  setAgentId(currentAgentId);
-  return dir;
+  return getDAGDirForAgent(getCurrentAgentId());
 }
 
 function getDAGFile(): string {
@@ -88,6 +92,51 @@ export function loadDAG(): TaskDAG | null {
 }
 
 /**
+ * 跨 Agent 加载 DAG
+ * 用于子 agent 访问父 agent 的任务
+ */
+export function loadDAGForAgent(agentId: string, dagId?: string): TaskDAG | null {
+  try {
+    const baseDir = process.env.WORKSPACE_DIR || DEFAULT_WORKSPACE;
+    const targetDagId = dagId || getCurrentDagId();
+    
+    // 确定路径
+    let agentTasksDir: string;
+    if (agentId === 'main') {
+      agentTasksDir = path.join(baseDir, 'workspace', DAG_DIR);
+    } else {
+      agentTasksDir = path.join(baseDir, `${WORKSPACE_PREFIX}${agentId}`, DAG_DIR);
+    }
+    
+    if (!targetDagId) {
+      // 没有指定 dagId，返回该 agent 的最新 DAG
+      if (!fs.existsSync(agentTasksDir)) {
+        return null;
+      }
+      // 查找最新的 DAG 子目录
+      const subDirs = fs.readdirSync(agentTasksDir).filter(d => d.startsWith('dag-'));
+      if (subDirs.length === 0) return null;
+      subDirs.sort().reverse();
+      const latestDagId = subDirs[0];
+      const file = path.join(agentTasksDir, latestDagId, DAG_FILE);
+      if (!fs.existsSync(file)) return null;
+      const data = fs.readFileSync(file, 'utf-8');
+      return JSON.parse(data);
+    }
+    
+    const file = path.join(agentTasksDir, targetDagId, DAG_FILE);
+    if (!fs.existsSync(file)) {
+      return null;
+    }
+    const data = fs.readFileSync(file, 'utf-8');
+    return JSON.parse(data);
+  } catch (error) {
+    console.error('[dag] Failed to load DAG for agent:', error);
+    return null;
+  }
+}
+
+/**
  * 保存 DAG 到文件
  */
 export function saveDAG(dag: TaskDAG): void {
@@ -102,12 +151,16 @@ export function saveDAG(dag: TaskDAG): void {
  * 创建新 DAG
  */
 export function createDAG(name: string, tasks: CreateTaskInput[]): TaskDAG {
+  const dagId = `dag-${Date.now()}`;
   const dag: TaskDAG = {
-    id: `dag-${Date.now()}`,
+    id: dagId,
     name,
     created_at: new Date().toISOString(),
     tasks: {}
   };
+
+  // 设置当前 DAG ID，使后续操作使用正确的子目录
+  setCurrentDagId(dagId);
 
   // 添加所有任务
   tasks.forEach((t, i) => {
@@ -483,8 +536,9 @@ export function getLogs(taskId: string, since?: string): Array<{
  * 获取任务文档目录
  */
 function getTaskDocDir(): string {
-  const workspace = process.env.WORKSPACE_DIR || path.join(os.homedir(), '.openclaw', 'workspace');
-  const docDir = path.join(workspace, 'tasks', 'docs');
+  const baseDir = process.env.WORKSPACE_DIR || path.join(os.homedir(), '.openclaw');
+  // 格式：~/.openclaw/workspace-{agent_id}/tasks/docs
+  const docDir = path.join(baseDir, `${WORKSPACE_PREFIX}${getCurrentAgentId()}`, DAG_DIR, 'docs');
   if (!fs.existsSync(docDir)) {
     fs.mkdirSync(docDir, { recursive: true });
   }
