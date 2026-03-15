@@ -108,6 +108,30 @@ Resume from a specific task.
 task-dag resume t3
 ```
 
+### wait
+
+Wait for a task to complete. Returns when task is done, failed, or notified.
+
+```
+task-dag wait t1
+task-dag wait t1 3600
+```
+- task_id: Task ID to wait for
+- timeout: Max wait time in seconds (default 3600)
+
+### notify
+
+Notify about task progress, issues, or completion.
+
+```
+task-dag notify t1 "进度50%" progress
+task-dag notify t1 "遇到问题" issue
+task-dag notify t1 "完成" complete
+```
+- task_id: Task ID
+- message: Notification message
+- type: progress, issue, complete, or failed
+
 ## Examples
 
 ### Example 1: Create and manage a project
