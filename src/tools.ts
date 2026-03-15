@@ -73,9 +73,22 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
       },
       required: ["name", "tasks"]
     },
-    execute: async (params, context: { name: string; tasks: any[] }) => {
+    execute: async (params, context: any) => {
       try {
-        const result = dag.createDAG(params.name, params.tasks);
+        // 解析 tasks 参数（可能是字符串或数组）
+        let tasks = params.tasks;
+        if (typeof tasks === 'string') {
+          try {
+            tasks = JSON.parse(tasks);
+          } catch {
+            return { error: 'Invalid tasks format: expected JSON array' };
+          }
+        }
+        if (!Array.isArray(tasks)) {
+          return { error: 'tasks must be an array' };
+        }
+        
+        const result = dag.createDAG(params.name, tasks);
         return {
           success: true,
           dag_id: result.id,
