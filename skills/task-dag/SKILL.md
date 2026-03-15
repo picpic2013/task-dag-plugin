@@ -63,22 +63,64 @@ task_dag_get t1
 
 ### update
 ```
-task_dag_update t1 running 50
-task_dag_update t1 done 100 "完成"
+task_dag_update task_id="t1" status="running" progress=50
+task_dag_update task_id="t1" status="done" progress=100 output_summary="完成"
 ```
-**Note:** Just use task ID (e.g., "t1"), NOT "dag-xxx_t1".
-Parameters: status (running/done/failed), progress (0-100), output summary
+Parameters: task_id, status (pending/running/done/failed/cancelled), progress (0-100), output_summary
+
+### modify (add/remove)
+```
+# Add new task
+task_dag_modify action="add" task={"name":"新任务","assigned_agent":"scout"}
+
+# Remove task
+task_dag_modify action="remove" task_id="t1"
+```
+
+### subtask_create
+```
+task_dag_subtask_create parent_id="t1" task={"name":"子任务","assigned_agent":"writer"}
+```
+
+### subtask_list
+```
+task_dag_subtask_list t1
+```
+
+### context
+```
+task_dag_context t1
+```
+Returns: task info + dependency outputs.
+
+### resume
+```
+task_dag_resume t1
+```
+Reset task and downstream tasks to pending.
+
+### logs
+```
+task_dag_logs t1
+task_dag_logs t1 "2026-01-01T00:00:00Z"
+```
+
+### set_doc / get_doc
+```
+task_dag_set_doc task_id="t1" content="# 文档内容"
+task_dag_get_doc t1
+```
 
 ### wait
 ```
 task_dag_wait t1
-task_dag_wait t1 3600
+task_dag_wait task_id="t1" timeout=3600
 ```
 Returns: completed/failed/notified/timeout. After timeout, check sub-agent status and wait again if needed.
 
 ### notify
 ```
-task_dag_notify t1 "进度50%" progress
+task_dag_notify task_id="t1" message="进度50%" type="progress"
 ```
 
 ---
