@@ -22,7 +22,7 @@ export interface TaskLog {
 export interface Task {
   id: string;
   name: string;
-  description: string;
+  description: string;        // 简短描述
   status: TaskStatus;
   progress: number;           // 0-100
   parent_id?: string;       // 父任务 ID
@@ -30,6 +30,7 @@ export interface Task {
   assigned_agent: string;
   dependencies: string[];    // 依赖任务 ID
   output_summary?: string;
+  doc_path?: string;        // 本地 Markdown 文档路径（可选）
   logs: TaskLog[];
   checkpoint?: Record<string, unknown>;
   created_at: string;
@@ -53,6 +54,7 @@ export interface CreateTaskInput {
   assigned_agent?: string;
   dependencies?: string[];
   parent_id?: string;
+  doc_path?: string;
 }
 
 export interface UpdateTaskInput {
@@ -61,6 +63,7 @@ export interface UpdateTaskInput {
   status?: TaskStatus;
   progress?: number;
   output_summary?: string;
+  doc_path?: string;
   log?: {
     level?: LogLevel;
     message: string;

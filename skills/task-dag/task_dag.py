@@ -279,21 +279,34 @@ def get_context(task_id):
         if dep:
             dep_outputs.append({
                 "id": dep_id,
-                "name": dep["name"],
+                "name": dep.get("name", ""),
+                "description": dep.get("description", ""),
+                "doc_path": dep.get("doc_path"),
                 "output_summary": dep.get("output_summary"),
-                "status": dep["status"]
+                "status": dep.get("status", "pending")
             })
     
     # 父任务
     parent = None
     if task.get("parent_id") and task["parent_id"] in dag["tasks"]:
-        parent = {"id": task["parent_id"], "name": dag["tasks"][task["parent_id"]]["name"]}
+        parent_task = dag["tasks"][task["parent_id"]]
+        parent = {
+            "id": task["parent_id"], 
+            "name": parent_task.get("name", ""),
+            "description": parent_task.get("description", ""),
+            "doc_path": parent_task.get("doc_path")
+        }
     
     return {
-        "task_name": task["name"],
+        "task_id": task_id,
+        "task_name": task.get("name", ""),
+        "task_description": task.get("description", ""),
+        "task_doc_path": task.get("doc_path"),
+        "task_status": task.get("status", "pending"),
+        "task_progress": task.get("progress", 0),
         "parent_task": parent,
         "dependency_outputs": dep_outputs,
-        "dag_name": dag["name"]
+        "dag_name": dag.get("name", "")
     }
 
 def resume_from(task_id):
@@ -334,6 +347,45 @@ def get_logs(task_id):
     if not dag or task_id not in dag["tasks"]:
         return []
     return dag["tasks"][task_id].get("logs", [])
+
+# ============= 文档操作 =============
+
+def get_task_doc_dir():
+    """Get task documents directory"""
+    doc_dir = os.path.join(WORKSPACE, "tasks", "docs")
+    Path(doc_dir).mkdir(parents=True, exist_ok=True)
+    return doc_dir
+
+def set_task_doc(task_id, content):
+    """Create or update task markdown document"""
+    dag = load_dag()
+    if not dag or task_id not in dag["tasks"]:
+        return None
+    
+    doc_dir = get_task_doc_dir()
+    doc_path = os.path.join(doc_dir, f"{task_id}.md")
+    
+    with open(doc_path, 'w', encoding='utf-8') as f:
+        f.write(content)
+    
+    # 更新任务的 doc_path
+    dag["tasks"][task_id]["doc_path"] = doc_path
+    save_dag(dag)
+    
+    return doc_path
+
+def get_task_doc(task_id):
+    """Get task document content"""
+    dag = load_dag()
+    if not dag or task_id not in dag["tasks"]:
+        return None
+    
+    doc_path = dag["tasks"][task_id].get("doc_path")
+    if not doc_path or not os.path.exists(doc_path):
+        return None
+    
+    with open(doc_path, 'r', encoding='utf-8') as f:
+        return f.read()
 
 # CLI 分发
 if __name__ == "__main__":
@@ -442,6 +494,36 @@ if __name__ == "__main__":
             sys.exit(1)
         print(json.dumps(get_logs(args[1])))
     
+    elif cmd == "doc":
+        if len(args) < 3:
+            print("Usage: task_dag.py doc <set|get> <task_id> [content]")
+            sys.exit(1)
+        action = args[1]
+        task_id = args[2]
+        if action == "set":
+            if len(args) < 4:
+                print("Usage: task_dag.py doc set <task_id> <content>")
+                sys.exit(1)
+            content = args[3]
+            # 支持多行内容
+            if len(args) > 4:
+                content = " ".join(args[3:])
+            result = set_task_doc(task_id, content)
+            if result:
+                print(json.dumps({"success": True, "doc_path": result}))
+            else:
+                print(json.dumps({"error": "Task not found"}))
+        elif action == "get":
+            content = get_task_doc(task_id)
+            if content is None:
+                task = get_task(task_id)
+                print(json.dumps({"doc_path": task.get("doc_path") if task else None, "content": None}))
+            else:
+                task = get_task(task_id)
+                print(json.dumps({"doc_path": task.get("doc_path") if task else None, "content": content}))
+        else:
+            print(f"Unknown doc action: {action}")
+    
     else:
         print(f"Unknown command: {cmd}")
-        print("Available commands: create, show, ready, get, update, modify, subtask, context, resume, logs")
+        print("Available commands: create, show, ready, get, update, modify, subtask, context, resume, logs, doc")

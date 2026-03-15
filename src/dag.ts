@@ -162,6 +162,7 @@ export function updateTask(taskId: string, updates: UpdateTaskInput): Task | nul
   if (updates.status !== undefined) task.status = updates.status;
   if (updates.progress !== undefined) task.progress = updates.progress;
   if (updates.output_summary !== undefined) task.output_summary = updates.output_summary;
+  if (updates.doc_path !== undefined) task.doc_path = updates.doc_path;
   if (updates.checkpoint !== undefined) task.checkpoint = updates.checkpoint;
 
   // 添加日志
@@ -271,8 +272,8 @@ export function getSubtasks(taskId: string): Task[] {
  */
 export function getContext(taskId: string): {
   task: Task;
-  dependency_outputs: Array<{ id: string; name: string; output_summary: string | undefined; status: TaskStatus }>;
-  parent: { id: string; name: string } | null;
+  dependency_outputs: Array<{ id: string; name: string; description: string; doc_path: string | undefined; output_summary: string | undefined; status: TaskStatus }>;
+  parent: { id: string; name: string; description: string; doc_path: string | undefined } | null;
   dag_name: string;
   dag_id: string;
 } | null {
@@ -289,6 +290,8 @@ export function getContext(taskId: string): {
     return {
       id: depId,
       name: dep?.name || '',
+      description: dep?.description || '',
+      doc_path: dep?.doc_path,
       output_summary: dep?.output_summary,
       status: dep?.status || 'pending' as TaskStatus
     };
@@ -300,7 +303,12 @@ export function getContext(taskId: string): {
   return {
     task,
     dependency_outputs: dependencyOutputs,
-    parent: parentTask ? { id: parentTask.id, name: parentTask.name } : null,
+    parent: parentTask ? { 
+      id: parentTask.id, 
+      name: parentTask.name,
+      description: parentTask.description,
+      doc_path: parentTask.doc_path
+    } : null,
     dag_name: dag.name,
     dag_id: dag.id
   };
@@ -423,6 +431,78 @@ export function getLogs(taskId: string, since?: string): Array<{
   }
 
   return task.logs.filter(log => log.timestamp >= since);
+}
+
+// ============= 文档操作 =============
+
+/**
+ * 获取任务文档目录
+ */
+function getTaskDocDir(): string {
+  const workspace = process.env.WORKSPACE_DIR || path.join(os.homedir(), '.openclaw', 'workspace');
+  const docDir = path.join(workspace, 'tasks', 'docs');
+  if (!fs.existsSync(docDir)) {
+    fs.mkdirSync(docDir, { recursive: true });
+  }
+  return docDir;
+}
+
+/**
+ * 为任务创建或更新文档
+ */
+export function setTaskDoc(taskId: string, content: string): string | null {
+  const dag = loadDAG();
+  if (!dag || !dag.tasks[taskId]) {
+    return null;
+  }
+
+  const docDir = getTaskDocDir();
+  const docPath = path.join(docDir, `${taskId}.md`);
+  
+  fs.writeFileSync(docPath, content, 'utf-8');
+  
+  // 更新任务的 doc_path
+  dag.tasks[taskId].doc_path = docPath;
+  saveDAG(dag);
+  
+  return docPath;
+}
+
+/**
+ * 读取任务文档内容
+ */
+export function getTaskDoc(taskId: string): string | null {
+  const dag = loadDAG();
+  if (!dag || !dag.tasks[taskId]) {
+    return null;
+  }
+
+  const docPath = dag.tasks[taskId].doc_path;
+  if (!docPath || !fs.existsSync(docPath)) {
+    return null;
+  }
+
+  return fs.readFileSync(docPath, 'utf-8');
+}
+
+/**
+ * 删除任务文档
+ */
+export function deleteTaskDoc(taskId: string): boolean {
+  const dag = loadDAG();
+  if (!dag || !dag.tasks[taskId]) {
+    return false;
+  }
+
+  const docPath = dag.tasks[taskId].doc_path;
+  if (docPath && fs.existsSync(docPath)) {
+    fs.unlinkSync(docPath);
+  }
+
+  dag.tasks[taskId].doc_path = undefined;
+  saveDAG(dag);
+  
+  return true;
 }
 
 // ============= 可视化 =============

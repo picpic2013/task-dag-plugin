@@ -274,7 +274,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
   // ========== task_dag_context ==========
   api.registerTool({
     name: "task_dag_context",
-    description: "Get task context including dependency outputs. Useful for subtasks to understand what upstream tasks have completed.",
+    description: "Get task context including dependency outputs, description, and doc path. Useful for subtasks to understand what upstream tasks have completed.",
     parameters: {
       type: "object",
       properties: {
@@ -288,7 +288,12 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
         return { error: `Task ${params.task_id} not found` };
       }
       return {
+        task_id: context.task.id,
         task_name: context.task.name,
+        task_description: context.task.description,
+        task_doc_path: context.task.doc_path,
+        task_status: context.task.status,
+        task_progress: context.task.progress,
         parent_task: context.parent,
         dependency_outputs: context.dependency_outputs,
         dag_name: context.dag_name
@@ -332,6 +337,51 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
     execute: async (params: { task_id: string; since?: string }) => {
       const logs = dag.getLogs(params.task_id, params.since);
       return { logs };
+    }
+  }, { optional: false });
+
+  // ========== task_dag_set_doc ==========
+  api.registerTool({
+    name: "task_dag_set_doc",
+    description: "Create or update a markdown document for a task. Returns the document path.",
+    parameters: {
+      type: "object",
+      properties: {
+        task_id: { type: "string", description: "Task ID" },
+        content: { type: "string", description: "Markdown content" }
+      },
+      required: ["task_id", "content"]
+    },
+    execute: async (params: { task_id: string; content: string }) => {
+      const docPath = dag.setTaskDoc(params.task_id, params.content);
+      if (!docPath) {
+        return { error: `Task ${params.task_id} not found` };
+      }
+      return { success: true, doc_path: docPath };
+    }
+  }, { optional: false });
+
+  // ========== task_dag_get_doc ==========
+  api.registerTool({
+    name: "task_dag_get_doc",
+    description: "Get the markdown document content for a task",
+    parameters: {
+      type: "object",
+      properties: {
+        task_id: { type: "string", description: "Task ID" }
+      },
+      required: ["task_id"]
+    },
+    execute: async (params: { task_id: string }) => {
+      const content = dag.getTaskDoc(params.task_id);
+      const task = dag.getTask(params.task_id);
+      if (!task) {
+        return { error: `Task ${params.task_id} not found` };
+      }
+      return { 
+        doc_path: task.doc_path,
+        content 
+      };
     }
   }, { optional: false });
 
