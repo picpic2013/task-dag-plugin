@@ -1,0 +1,20 @@
+{
+  "id": "task-dag",
+  "name": "Task DAG",
+  "description": "Dynamic task DAG orchestration system with sub-agent execution",
+  "skills": ["./skills"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "heartbeatInterval": {
+        "type": "string",
+        "default": "30s"
+      },
+      "autoProceed": {
+        "type": "boolean",
+        "default": false
+      }
+    }
+  }
+}
