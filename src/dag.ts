@@ -252,6 +252,8 @@ export function updateTask(taskId: string, updates: UpdateTaskInput): Task | nul
   if (updates.output_summary !== undefined) task.output_summary = updates.output_summary;
   if (updates.doc_path !== undefined) task.doc_path = updates.doc_path;
   if (updates.checkpoint !== undefined) task.checkpoint = updates.checkpoint;
+  if (updates.executor !== undefined) task.executor = updates.executor;
+  if (updates.waiting_for !== undefined) task.waiting_for = updates.waiting_for;
 
   // 添加日志
   if (updates.log) {
@@ -271,9 +273,14 @@ export function updateTask(taskId: string, updates: UpdateTaskInput): Task | nul
   if (updates.status === 'running' && !task.started_at) {
     task.started_at = new Date().toISOString();
   }
-  if (updates.status === 'done' && !task.completed_at) {
+  if (
+    (updates.status === 'done' || updates.status === 'failed' || updates.status === 'cancelled') &&
+    !task.completed_at
+  ) {
     task.completed_at = new Date().toISOString();
-    task.progress = 100;
+    if (updates.status === 'done') {
+      task.progress = 100;
+    }
   }
 
   // 记录状态变更事件
@@ -414,28 +421,13 @@ export function getContext(taskId: string): {
 // ============= 状态管理 =============
 
 /**
- * 获取就绪任务（依赖都已完成且状态为 pending/blocked）
+ * 获取就绪任务（依赖都已完成且状态为 ready）
  */
 export function getReadyTasks(): Task[] {
   const dag = loadDAG();
   if (!dag) return [];
 
-  const ready: Task[] = [];
-  for (const task of Object.values(dag.tasks)) {
-    // blocked 或 pending 状态都可以被激活
-    if (task.status !== 'pending' && task.status !== 'blocked') continue;
-
-    // 检查依赖是否都完成
-    const allDepsDone = task.dependencies.every(depId => {
-      const dep = dag.tasks[depId];
-      return dep && dep.status === 'done';
-    });
-
-    if (allDepsDone) {
-      ready.push(task);
-    }
-  }
-  return ready;
+  return Object.values(dag.tasks).filter(task => task.status === 'ready');
 }
 
 /**
@@ -443,26 +435,7 @@ export function getReadyTasks(): Task[] {
  */
 function recalculateAllStatuses(dag: TaskDAG): void {
   for (const task of Object.values(dag.tasks)) {
-    // blocked 任务在依赖完成后变成 pending
-    if (task.status === 'blocked') {
-      const hasPendingDeps = task.dependencies.some(depId => {
-        const dep = dag.tasks[depId];
-        return !dep || dep.status !== 'done';
-      });
-      if (!hasPendingDeps) {
-        task.status = 'pending';
-      }
-    }
-    // pending 任务在依赖未完成时变成 blocked
-    else if (task.status === 'pending') {
-      const hasPendingDeps = task.dependencies.some(depId => {
-        const dep = dag.tasks[depId];
-        return !dep || dep.status !== 'done';
-      });
-      if (hasPendingDeps) {
-        task.status = 'blocked';
-      }
-    }
+    task.status = recalculateTaskStatus(task, dag.tasks);
   }
 }
 
@@ -490,6 +463,10 @@ export function resumeFrom(taskId: string): string[] {
     task.progress = 0;
     task.output_summary = undefined;
     task.checkpoint = undefined;
+    task.executor = undefined;
+    task.waiting_for = undefined;
+    task.started_at = undefined;
+    task.completed_at = undefined;
 
     // 重置所有下游任务
     for (const [otherId, otherTask] of Object.entries(dag.tasks)) {
@@ -618,7 +595,10 @@ export function showProgress(): string {
   
   const statusEmoji: Record<TaskStatus, string> = {
     pending: '⚪',
+    ready: '🟣',
     running: '🔵',
+    waiting_subagent: '🟠',
+    waiting_children: '🟤',
     done: '🟢',
     failed: '🔴',
     cancelled: '⚫',
@@ -643,7 +623,10 @@ export function showProgress(): string {
   // 添加样式
   lines.push('');
   lines.push('  classDef pending fill:#D3D3D3');
+  lines.push('  classDef ready fill:#E6E6FA');
   lines.push('  classDef running fill:#87CEEB');
+  lines.push('  classDef waiting_subagent fill:#FFDAB9');
+  lines.push('  classDef waiting_children fill:#F5DEB3');
   lines.push('  classDef done fill:#90EE90');
   lines.push('  classDef failed fill:#FFB6C1');
   lines.push('  classDef cancelled fill:#808080');

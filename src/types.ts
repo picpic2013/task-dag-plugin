@@ -6,7 +6,16 @@
 
 // ============= 枚举 =============
 
-export type TaskStatus = 'pending' | 'running' | 'done' | 'failed' | 'cancelled' | 'blocked';
+export type TaskStatus =
+  | 'pending'
+  | 'ready'
+  | 'running'
+  | 'waiting_subagent'
+  | 'waiting_children'
+  | 'done'
+  | 'failed'
+  | 'cancelled'
+  | 'blocked';
 
 export type LogLevel = 'info' | 'warn' | 'error';
 
@@ -17,6 +26,21 @@ export interface TaskLog {
   level: LogLevel;
   message: string;
   progress?: number;  // 可选：进度更新
+}
+
+export interface TaskExecutor {
+  type: 'parent' | 'subagent';
+  agent_id?: string;
+  session_key?: string;
+  run_id?: string;
+  claimed_at?: string;
+}
+
+export interface TaskWaitingFor {
+  kind: 'subagent' | 'children';
+  session_key?: string;
+  run_id?: string;
+  child_task_ids?: string[];
 }
 
 export interface Task {
@@ -33,6 +57,8 @@ export interface Task {
   doc_path?: string;        // 本地 Markdown 文档路径（可选）
   logs: TaskLog[];
   checkpoint?: Record<string, unknown>;
+  executor?: TaskExecutor;
+  waiting_for?: TaskWaitingFor;
   created_at: string;
   started_at?: string;
   completed_at?: string;
@@ -70,6 +96,8 @@ export interface UpdateTaskInput {
     progress?: number;
   };
   checkpoint?: Record<string, unknown>;
+  executor?: TaskExecutor;
+  waiting_for?: TaskWaitingFor;
 }
 
 export interface ModifyAction {
@@ -100,6 +128,8 @@ export function createTask(input: CreateTaskInput): Task {
     output_summary: undefined,
     logs: [],
     checkpoint: undefined,
+    executor: undefined,
+    waiting_for: undefined,
     created_at: now,
     started_at: undefined,
     completed_at: undefined,
@@ -110,14 +140,39 @@ export function createTask(input: CreateTaskInput): Task {
  * 验证任务是否有效
  */
 export function validateTask(task: Task): boolean {
+  const validStatuses: TaskStatus[] = [
+    'pending',
+    'ready',
+    'running',
+    'waiting_subagent',
+    'waiting_children',
+    'done',
+    'failed',
+    'cancelled',
+    'blocked',
+  ];
+
   if (!task.id || !task.name) {
     return false;
   }
-  if (!['pending', 'running', 'done', 'failed', 'cancelled'].includes(task.status)) {
+  if (!validStatuses.includes(task.status)) {
     return false;
   }
   if (task.progress < 0 || task.progress > 100) {
     return false;
+  }
+  if (task.executor) {
+    if (!['parent', 'subagent'].includes(task.executor.type)) {
+      return false;
+    }
+  }
+  if (task.waiting_for) {
+    if (!['subagent', 'children'].includes(task.waiting_for.kind)) {
+      return false;
+    }
+    if (task.waiting_for.child_task_ids && !Array.isArray(task.waiting_for.child_task_ids)) {
+      return false;
+    }
   }
   return true;
 }
@@ -187,21 +242,38 @@ export function detectCycleInDAG(dag: TaskDAG): string[] {
 /**
  * 重新计算任务状态（处理 blocked）
  */
-export function recalculateTaskStatus(task: Task, allTasks: Record<string, Task>): TaskStatus {
-  if (task.status === 'done' || task.status === 'failed' || task.status === 'cancelled') {
-    return task.status;
-  }
-  
-  // 检查是否有未完成的依赖
-  const hasPendingDeps = task.dependencies.some(depId => {
+export function isTerminalStatus(status: TaskStatus): boolean {
+  return status === 'done' || status === 'failed' || status === 'cancelled';
+}
+
+export function hasPendingDependencies(task: Task, allTasks: Record<string, Task>): boolean {
+  return task.dependencies.some(depId => {
     const dep = allTasks[depId];
     return !dep || dep.status !== 'done';
   });
-  
-  if (hasPendingDeps && task.status === 'pending') {
+}
+
+export function recalculateTaskStatus(task: Task, allTasks: Record<string, Task>): TaskStatus {
+  if (isTerminalStatus(task.status)) {
+    return task.status;
+  }
+
+  if (
+    task.status === 'running' ||
+    task.status === 'waiting_subagent' ||
+    task.status === 'waiting_children'
+  ) {
+    return task.status;
+  }
+
+  if (hasPendingDependencies(task, allTasks)) {
     return 'blocked';
   }
-  
+
+  if (task.status === 'pending' || task.status === 'blocked') {
+    return 'ready';
+  }
+
   return task.status;
 }
 
@@ -211,7 +283,10 @@ export function recalculateTaskStatus(task: Task, allTasks: Record<string, Task>
 export function formatTaskNode(task: Task): string {
   const statusEmoji: Record<TaskStatus, string> = {
     pending: '⚪',
+    ready: '🟣',
     running: '🔵',
+    waiting_subagent: '🟠',
+    waiting_children: '🟤',
     done: '🟢',
     failed: '🔴',
     cancelled: '⚫',
@@ -231,7 +306,10 @@ export function getTaskStats(dag: TaskDAG): Record<string, number> {
   const stats: Record<string, number> = {
     total: 0,
     pending: 0,
+    ready: 0,
     running: 0,
+    waiting_subagent: 0,
+    waiting_children: 0,
     done: 0,
     failed: 0,
     cancelled: 0,
@@ -240,19 +318,8 @@ export function getTaskStats(dag: TaskDAG): Record<string, number> {
   
   for (const task of Object.values(dag.tasks)) {
     stats.total++;
-    
-    // 计算 blocked（pending 但有未完成依赖）
-    if (task.status === 'pending') {
-      const hasPendingDeps = task.dependencies.some(depId => {
-        const dep = dag.tasks[depId];
-        return !dep || dep.status !== 'done';
-      });
-      if (hasPendingDeps) {
-        stats.blocked++;
-      } else {
-        stats.pending++;
-      }
-    } else {
+
+    if (stats[task.status] !== undefined) {
       stats[task.status]++;
     }
   }

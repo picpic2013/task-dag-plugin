@@ -3,8 +3,19 @@
  * 直接运行模块函数验证功能
  */
 
-import * as waiter from './dist/src/waiter.js';
-import * as notification from './dist/src/notification.js';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+
+const testWorkspaceDir = path.join(os.tmpdir(), `task-dag-plugin-tests-${Date.now()}`);
+fs.rmSync(testWorkspaceDir, { recursive: true, force: true });
+fs.mkdirSync(testWorkspaceDir, { recursive: true });
+process.env.WORKSPACE_DIR = testWorkspaceDir;
+
+const waiter = await import('./dist/src/waiter.js');
+const notification = await import('./dist/src/notification.js');
+const dag = await import('./dist/src/dag.js');
+const types = await import('./dist/src/types.js');
 
 let passed = 0;
 let failed = 0;
@@ -22,6 +33,15 @@ function test(name, fn) {
 
 function assert(condition, message) {
   if (!condition) throw new Error(message || 'Assertion failed');
+}
+
+function withTempWorkspace(name, fn) {
+  const workspaceDir = path.join(os.tmpdir(), `task-dag-plugin-${name}-${Date.now()}`);
+  fs.rmSync(workspaceDir, { recursive: true, force: true });
+  fs.mkdirSync(workspaceDir, { recursive: true });
+  process.env.WORKSPACE_DIR = workspaceDir;
+  dag.setCurrentAgentId('main');
+  return fn(workspaceDir);
 }
 
 console.log('=== Waiter Module ===\n');
@@ -124,6 +144,109 @@ test('complete flow', () => {
   // Unregister
   waiter.unregisterWaiting('main');
   assert(waiter.getWaitingTask('main') === null, 'Should unregister');
+});
+
+console.log('\n=== Task State Machine ===\n');
+
+test('createDAG marks root tasks as ready and dependent tasks as blocked', () => {
+  withTempWorkspace('state-create', () => {
+    const created = dag.createDAG('state-machine', [
+      { id: 't1', name: 'Root task' },
+      { id: 't2', name: 'Dependent task', dependencies: ['t1'] }
+    ]);
+
+    assert(created.tasks.t1.status === 'ready', 'Root task should be ready');
+    assert(created.tasks.t2.status === 'blocked', 'Dependent task should be blocked');
+  });
+});
+
+test('getReadyTasks only returns ready tasks', () => {
+  withTempWorkspace('state-ready-list', () => {
+    dag.createDAG('ready-list', [
+      { id: 't1', name: 'Root task' },
+      { id: 't2', name: 'Dependent task', dependencies: ['t1'] }
+    ]);
+
+    const readyTasks = dag.getReadyTasks();
+    assert(readyTasks.length === 1, 'Should only have one ready task');
+    assert(readyTasks[0].id === 't1', 'Ready task should be t1');
+  });
+});
+
+test('downstream task becomes ready after dependency completes', () => {
+  withTempWorkspace('state-transition', () => {
+    dag.createDAG('transition', [
+      { id: 't1', name: 'Root task' },
+      { id: 't2', name: 'Dependent task', dependencies: ['t1'] }
+    ]);
+
+    dag.updateTask('t1', { status: 'done' });
+
+    const downstream = dag.getTask('t2');
+    assert(downstream?.status === 'ready', 'Dependent task should become ready');
+  });
+});
+
+test('waiting states are preserved during dependency recalculation', () => {
+  withTempWorkspace('state-waiting', () => {
+    dag.createDAG('waiting', [{ id: 't1', name: 'Root task' }]);
+
+    dag.updateTask('t1', {
+      status: 'waiting_subagent',
+      executor: {
+        type: 'subagent',
+        agent_id: 'worker-1',
+        session_key: 'agent:worker-1:subagent:1',
+        run_id: 'run-1',
+      },
+      waiting_for: {
+        kind: 'subagent',
+        session_key: 'agent:worker-1:subagent:1',
+        run_id: 'run-1',
+      },
+    });
+
+    const task = dag.getTask('t1');
+    assert(task?.status === 'waiting_subagent', 'Waiting status should be preserved');
+    assert(task?.executor?.type === 'subagent', 'Executor metadata should be stored');
+  });
+});
+
+test('resumeFrom resets runtime fields and recalculates readiness', () => {
+  withTempWorkspace('state-resume', () => {
+    dag.createDAG('resume', [
+      { id: 't1', name: 'Root task' },
+      { id: 't2', name: 'Dependent task', dependencies: ['t1'] }
+    ]);
+
+    dag.updateTask('t1', {
+      status: 'waiting_children',
+      executor: { type: 'parent', agent_id: 'main' },
+      waiting_for: { kind: 'children', child_task_ids: ['t2'] },
+      progress: 50,
+      checkpoint: { cursor: 1 },
+    });
+
+    const resetTasks = dag.resumeFrom('t1');
+    const root = dag.getTask('t1');
+    const child = dag.getTask('t2');
+
+    assert(resetTasks.includes('t1') && resetTasks.includes('t2'), 'Should reset root and downstream tasks');
+    assert(root?.status === 'ready', 'Root task should become ready after resume');
+    assert(root?.progress === 0, 'Root progress should reset');
+    assert(root?.executor === undefined, 'Executor should be cleared');
+    assert(root?.waiting_for === undefined, 'Waiting metadata should be cleared');
+    assert(child?.status === 'blocked', 'Downstream task should be blocked until dependency is done again');
+  });
+});
+
+test('validateTask accepts milestone 01 runtime metadata', () => {
+  const task = types.createTask({ id: 't-runtime', name: 'Runtime task' });
+  task.status = 'waiting_children';
+  task.executor = { type: 'parent', agent_id: 'main' };
+  task.waiting_for = { kind: 'children', child_task_ids: ['t-child'] };
+
+  assert(types.validateTask(task) === true, 'Task should validate with waiting metadata');
 });
 
 console.log(`\n=== Results: ${passed} passed, ${failed} failed ===`);
