@@ -17,19 +17,14 @@ const notification = await import('./dist/src/notification.js');
 const dag = await import('./dist/src/dag.js');
 const types = await import('./dist/src/types.js');
 const bindings = await import('./dist/src/bindings.js');
+const tools = await import('./dist/src/tools.js');
 
 let passed = 0;
 let failed = 0;
+const tests = [];
 
 function test(name, fn) {
-  try {
-    fn();
-    console.log(`✅ ${name}`);
-    passed++;
-  } catch (e) {
-    console.log(`❌ ${name}: ${e.message}`);
-    failed++;
-  }
+  tests.push({ name, fn });
 }
 
 function assert(condition, message) {
@@ -422,6 +417,147 @@ test('bindings and runs survive reload from disk', () => {
     assert(bindings.getSessionRunByRunId('run-5', context)?.child_session_key === 'agent:worker:subagent:5', 'Session run should be recoverable from disk');
   });
 });
+
+console.log('\n=== Tool Protocol ===\n');
+
+test('task_dag_claim marks a task running with executor metadata', async () => {
+  await withTempWorkspace('tool-claim', async () => {
+    dag.createDAG('tool-claim', [{ id: 't1', name: 'Claim me' }]);
+    const result = await tools.claimTaskExecution({
+      task_id: 't1',
+      executor_type: 'parent',
+      executor_agent_id: 'main',
+      message: 'started work',
+    }, {});
+
+    assert(result.success === true, 'Claim should succeed');
+    assert(dag.getTask('t1')?.status === 'running', 'Task should be running');
+    assert(dag.getTask('t1')?.executor?.type === 'parent', 'Executor metadata should be set');
+  });
+});
+
+test('task_dag_spawn creates binding and moves task into waiting_subagent', async () => {
+  await withTempWorkspace('tool-spawn', async () => {
+    dag.createDAG('tool-spawn', [{ id: 't1', name: 'Spawn me' }]);
+
+    const runtime = {
+      sessions_spawn: async () => ({
+        sessionKey: 'agent:worker:subagent:spawn-1',
+        runId: 'run-spawn-1',
+      }),
+    };
+
+    const result = await tools.spawnTaskExecution(runtime, {
+      task_id: 't1',
+      task: 'Do sub work',
+      agentId: 'worker',
+    }, { session: { key: 'agent:main' } });
+
+    assert(result.success === true, 'Spawn should succeed');
+    assert(dag.getTask('t1')?.status === 'waiting_subagent', 'Task should wait on subagent');
+    assert(bindings.listTaskBindings({ task_id: 't1' }, { dagId: result.dag_id }).length === 1, 'Binding should exist');
+    assert(bindings.getSessionRunByRunId('run-spawn-1', { dagId: result.dag_id })?.child_session_key === 'agent:worker:subagent:spawn-1', 'Session run should persist');
+  });
+});
+
+test('task_dag_assign binds multiple tasks to the same session run', async () => {
+  await withTempWorkspace('tool-assign', async () => {
+    dag.createDAG('tool-assign', [
+      { id: 't1', name: 'Task 1' },
+      { id: 't2', name: 'Task 2' },
+    ]);
+
+    bindings.saveSessionRun({
+      run_id: 'run-assign-1',
+      child_session_key: 'agent:worker:subagent:assign-1',
+      parent_agent_id: 'main',
+      dag_id: dag.getCurrentDagId(),
+      spawn_mode: 'shared_worker',
+      active_task_ids: ['t1'],
+    }, { dagId: dag.getCurrentDagId() });
+
+    const result = await tools.assignTasksToSession({
+      task_ids: ['t1', 't2'],
+      run_id: 'run-assign-1',
+      executor_agent_id: 'worker',
+    }, {});
+
+    assert(result.success === true, 'Assign should succeed');
+    assert(result.assigned_task_ids.length === 2, 'Two tasks should be assigned');
+    assert(bindings.getSessionRunByRunId('run-assign-1', { dagId: dag.getCurrentDagId() })?.active_task_ids.length === 2, 'Run should track both tasks');
+  });
+});
+
+test('task_dag_wait is non-blocking and reports notifications', async () => {
+  await withTempWorkspace('tool-wait', async () => {
+    dag.createDAG('tool-wait', [{ id: 't1', name: 'Wait me' }]);
+    notification.addNotification('t1', {
+      type: 'progress',
+      message: 'halfway',
+      timestamp: new Date().toISOString(),
+      agent_id: 'worker',
+    });
+
+    const result = await tools.checkTaskWaitStatus({ task_id: 't1' }, {});
+    assert(result.status === 'notified', 'Wait should return notified immediately');
+  });
+});
+
+test('task_dag_poll_events and ack_event expose deterministic event consumption', async () => {
+  await withTempWorkspace('tool-events', async () => {
+    dag.createDAG('tool-events', [{ id: 't1', name: 'Events task' }]);
+    const dagId = dag.getCurrentDagId();
+    const event = bindings.appendPendingEvent({
+      type: 'task_progress',
+      dag_id: dagId,
+      task_id: 't1',
+      payload: { progress: 25 },
+    }, { dagId });
+
+    const polled = await tools.pollTaskEvents({ task_id: 't1' }, {});
+    assert(polled.events.length === 1, 'Poll should return one event');
+
+    const acked = await tools.ackTaskEvent({ event_id: event.event_id }, {});
+    assert(acked.success === true, 'Ack should succeed');
+
+    const afterAck = await tools.pollTaskEvents({ task_id: 't1' }, {});
+    assert(afterAck.events.length === 0, 'Consumed event should no longer appear by default');
+  });
+});
+
+test('task_dag_reconcile closes terminal task bindings', async () => {
+  await withTempWorkspace('tool-reconcile', async () => {
+    dag.createDAG('tool-reconcile', [{ id: 't1', name: 'Reconcile me' }]);
+    const dagId = dag.getCurrentDagId();
+
+    bindings.upsertTaskBinding({
+      dag_id: dagId,
+      task_id: 't1',
+      executor_type: 'subagent',
+      executor_agent_id: 'worker',
+      session_key: 'agent:worker:subagent:reconcile',
+      run_id: 'run-reconcile',
+      binding_status: 'active',
+    }, { dagId });
+    dag.updateTask('t1', { status: 'done', output_summary: 'finished' });
+
+    const result = await tools.reconcileTaskDagState({}, {});
+    assert(result.success === true, 'Reconcile should succeed');
+    assert(result.reconciled.length === 1, 'Reconcile should fix one task');
+    assert(bindings.listTaskBindings({ task_id: 't1', binding_status: 'active' }, { dagId }).length === 0, 'Active binding should be closed');
+  });
+});
+
+for (const { name, fn } of tests) {
+  try {
+    await fn();
+    console.log(`✅ ${name}`);
+    passed++;
+  } catch (e) {
+    console.log(`❌ ${name}: ${e.message}`);
+    failed++;
+  }
+}
 
 console.log(`\n=== Results: ${passed} passed, ${failed} failed ===`);
 process.exit(failed > 0 ? 1 : 0);

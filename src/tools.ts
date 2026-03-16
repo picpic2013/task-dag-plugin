@@ -7,6 +7,24 @@
 import type { OpenClawPluginApi } from "./plugin-sdk.js";
 import * as dag from './dag.js';
 import { getParentAgentId, getParentSessionKey } from './agent.js';
+import {
+  appendPendingEvent,
+  attachTaskToSessionRun,
+  completeSessionRun,
+  completeTaskBinding,
+  getSessionRunByRunId,
+  getSessionRunBySessionKey,
+  listPendingEvents,
+  listTaskBindings,
+  saveSessionRun,
+  upsertTaskBinding,
+} from './bindings.js';
+import * as waiter from './waiter.js';
+import * as notificationModule from './notification.js';
+
+type RuntimeFacade = {
+  sessions_spawn?: (params: any) => Promise<any>;
+};
 
 /**
  * 从上下文和参数获取 agent ID
@@ -108,6 +126,439 @@ function executeWithAgent(executeFn: (params: any) => Promise<any>) {
     const agentId = getAgentIdFromContext(context, params);
     dag.setCurrentAgentId(agentId);
     return executeFn(params);
+  };
+}
+
+function setExecutionContext(context: any, params?: any): { agentId: string; dagId?: string } {
+  const dagId = params?.dag_id || context?.dag_id || context?.dagId;
+  const hasExplicitAgent =
+    params?.parent_agent_id ||
+    params?.agent_id ||
+    context?.agent?.id ||
+    context?.agentId ||
+    context?.session?.agentId ||
+    context?.runtime?.agentId;
+  const agentId =
+    !hasExplicitAgent && (dagId || dag.getCurrentDagId())
+      ? dag.getCurrentAgentId()
+      : getAgentIdFromContext(context, params);
+  dag.setCurrentAgentId(agentId);
+  if (dagId) {
+    dag.setCurrentDagId(dagId);
+  }
+  return { agentId, dagId };
+}
+
+function getTaskOrError(taskId: string) {
+  const task = dag.getTask(taskId);
+  if (!task) {
+    return { error: `Task ${taskId} not found` };
+  }
+  return { task };
+}
+
+function extractSpawnResult(spawnResult: any): { sessionKey?: string; runId?: string } {
+  return {
+    sessionKey:
+      spawnResult?.sessionKey ||
+      spawnResult?.session_key ||
+      spawnResult?.targetSessionKey ||
+      spawnResult?.childSessionKey,
+    runId:
+      spawnResult?.runId ||
+      spawnResult?.run_id ||
+      spawnResult?.id,
+  };
+}
+
+export async function claimTaskExecution(params: any, context?: any) {
+  const { agentId, dagId } = setExecutionContext(context, params);
+  const { task_id, executor_type = 'parent', session_key, run_id } = params;
+  const taskResult = getTaskOrError(task_id);
+  if ('error' in taskResult) {
+    return taskResult;
+  }
+
+  const task = dag.updateTask(task_id, {
+    status: 'running',
+    executor: {
+      type: executor_type,
+      agent_id: params.executor_agent_id || agentId,
+      session_key,
+      run_id,
+      claimed_at: new Date().toISOString(),
+    },
+    waiting_for: undefined,
+    log: params.message ? { level: 'info', message: params.message } : undefined,
+  } as any);
+
+  upsertTaskBinding({
+    dag_id: dagId || dag.getCurrentDagId() || 'default',
+    task_id,
+    executor_type,
+    executor_agent_id: params.executor_agent_id || agentId,
+    session_key,
+    run_id,
+    binding_status: 'active',
+  }, { agentId, dagId });
+
+  return { success: true, task, agent_id: agentId, dag_id: dagId || dag.getCurrentDagId() };
+}
+
+export async function reportTaskProgress(params: any, context?: any) {
+  const { agentId, dagId } = setExecutionContext(context, params);
+  const { task_id, progress, message } = params;
+  const taskResult = getTaskOrError(task_id);
+  if ('error' in taskResult) {
+    return taskResult;
+  }
+
+  const current = taskResult.task;
+  const task = dag.updateTask(task_id, {
+    status: current.status === 'ready' || current.status === 'pending' ? 'running' : current.status,
+    progress,
+    log: message ? { level: 'info', message, progress } : undefined,
+  } as any);
+
+  appendPendingEvent({
+    type: 'task_progress',
+    dag_id: dagId || dag.getCurrentDagId() || 'default',
+    task_id,
+    session_key: params.session_key,
+    run_id: params.run_id,
+    payload: { progress, message },
+  }, { agentId, dagId });
+
+  return { success: true, task, agent_id: agentId };
+}
+
+function completeBindingsForTask(
+  taskId: string,
+  finalStatus: 'completed' | 'failed',
+  context: { agentId: string; dagId?: string }
+): void {
+  const bindings = listTaskBindings({ task_id: taskId, binding_status: 'active' }, context);
+  for (const binding of bindings) {
+    completeTaskBinding(binding.binding_id, finalStatus, context);
+    if (binding.run_id) {
+      const remaining = listTaskBindings({ run_id: binding.run_id, binding_status: 'active' }, context);
+      if (remaining.length === 0) {
+        completeSessionRun(binding.run_id, context);
+      }
+    }
+  }
+}
+
+export async function completeTaskExecution(params: any, context?: any) {
+  const { agentId, dagId } = setExecutionContext(context, params);
+  const { task_id, output_summary, session_key, run_id } = params;
+  const taskResult = getTaskOrError(task_id);
+  if ('error' in taskResult) {
+    return taskResult;
+  }
+
+  const task = dag.updateTask(task_id, {
+    status: 'done',
+    output_summary,
+    waiting_for: undefined,
+    log: params.message ? { level: 'info', message: params.message } : undefined,
+  });
+
+  completeBindingsForTask(task_id, 'completed', { agentId, dagId });
+  appendPendingEvent({
+    type: 'task_completed',
+    dag_id: dagId || dag.getCurrentDagId() || 'default',
+    task_id,
+    session_key,
+    run_id,
+    payload: { output_summary },
+  }, { agentId, dagId });
+
+  waiter.unregisterWaiting(agentId);
+  return { success: true, task, agent_id: agentId };
+}
+
+export async function failTaskExecution(params: any, context?: any) {
+  const { agentId, dagId } = setExecutionContext(context, params);
+  const { task_id, message, session_key, run_id } = params;
+  const taskResult = getTaskOrError(task_id);
+  if ('error' in taskResult) {
+    return taskResult;
+  }
+
+  const task = dag.updateTask(task_id, {
+    status: 'failed',
+    output_summary: message,
+    waiting_for: undefined,
+    log: message ? { level: 'error', message } : undefined,
+  });
+
+  completeBindingsForTask(task_id, 'failed', { agentId, dagId });
+  appendPendingEvent({
+    type: 'task_failed',
+    dag_id: dagId || dag.getCurrentDagId() || 'default',
+    task_id,
+    session_key,
+    run_id,
+    payload: { message },
+  }, { agentId, dagId });
+
+  waiter.unregisterWaiting(agentId);
+  return { success: true, task, agent_id: agentId };
+}
+
+export async function spawnTaskExecution(runtime: RuntimeFacade, params: any, context?: any) {
+  const targetAgentId = params.target_agent_id || params.agentId;
+  const contextParams = { ...params };
+  delete contextParams.agentId;
+  delete contextParams.target_agent_id;
+  const { agentId, dagId } = setExecutionContext(context, contextParams);
+  const { task_id, task, prompt, model, label, thread, mode, runtime: runtimeMode } = params;
+  const taskResult = getTaskOrError(task_id);
+  if ('error' in taskResult) {
+    return taskResult;
+  }
+  if (!runtime.sessions_spawn) {
+    return { error: 'sessions_spawn is not available' };
+  }
+
+  const dagIdToUse = dagId || dag.getCurrentDagId() || 'default';
+  const spawnLabel = label || `task:${task_id}`;
+  const spawnTaskText = task || prompt;
+  if (!spawnTaskText) {
+    return { error: 'task or prompt is required' };
+  }
+
+  const spawnResult = await runtime.sessions_spawn({
+    task: spawnTaskText,
+    agentId: targetAgentId,
+    model,
+    label: spawnLabel,
+    thread,
+    mode,
+    runtime: runtimeMode,
+  });
+
+  const { sessionKey, runId } = extractSpawnResult(spawnResult);
+  if (!sessionKey && !runId) {
+    return { error: 'sessions_spawn did not return session or run identifiers', raw: spawnResult };
+  }
+
+  const effectiveRunId = runId || `run-${task_id}-${Date.now()}`;
+  if (sessionKey) {
+    saveSessionRun({
+      run_id: effectiveRunId,
+      child_session_key: sessionKey,
+      requester_session_key: params.requester_session_key || context?.session?.key || context?.sessionKey,
+      parent_agent_id: agentId,
+      dag_id: dagIdToUse,
+      spawn_mode: 'single_task',
+      label: spawnLabel,
+      active_task_ids: [task_id],
+    }, { agentId, dagId: dagIdToUse });
+  }
+
+  upsertTaskBinding({
+    dag_id: dagIdToUse,
+    task_id,
+    executor_type: 'subagent',
+    executor_agent_id: targetAgentId,
+    session_key: sessionKey,
+    run_id: effectiveRunId,
+    binding_status: 'active',
+  }, { agentId, dagId: dagIdToUse });
+
+  const updatedTask = dag.updateTask(task_id, {
+    status: 'waiting_subagent',
+    executor: {
+      type: 'subagent',
+      agent_id: targetAgentId,
+      session_key: sessionKey,
+      run_id: effectiveRunId,
+      claimed_at: new Date().toISOString(),
+    },
+    waiting_for: {
+      kind: 'subagent',
+      session_key: sessionKey,
+      run_id: effectiveRunId,
+    },
+    log: { level: 'info', message: `Spawned subagent for ${task_id}` },
+  } as any);
+
+  appendPendingEvent({
+    type: 'subagent_spawned',
+    dag_id: dagIdToUse,
+    task_id,
+    session_key: sessionKey,
+    run_id: effectiveRunId,
+    payload: { label: spawnLabel, agent_id: targetAgentId },
+  }, { agentId, dagId: dagIdToUse });
+
+  waiter.registerWaiting(agentId, task_id, params.timeout || 3600);
+
+  return {
+    success: true,
+    status: 'waiting',
+    task: updatedTask,
+    dag_id: dagIdToUse,
+    agent_id: agentId,
+    session_key: sessionKey,
+    run_id: effectiveRunId,
+    spawn: spawnResult,
+  };
+}
+
+export async function assignTasksToSession(params: any, context?: any) {
+  const { agentId, dagId } = setExecutionContext(context, params);
+  const dagIdToUse = dagId || dag.getCurrentDagId() || 'default';
+  const { task_ids, session_key, run_id, executor_agent_id } = params;
+  if (!Array.isArray(task_ids) || task_ids.length === 0) {
+    return { error: 'task_ids must be a non-empty array' };
+  }
+
+  const sessionRun =
+    (run_id ? getSessionRunByRunId(run_id, { agentId, dagId: dagIdToUse }) : null) ||
+    (session_key ? getSessionRunBySessionKey(session_key, { agentId, dagId: dagIdToUse }) : null);
+  if (!sessionRun) {
+    return { error: 'session run not found for the provided session_key or run_id' };
+  }
+
+  const assigned: string[] = [];
+  for (const taskId of task_ids) {
+    const taskResult = getTaskOrError(taskId);
+    if ('error' in taskResult) {
+      return taskResult;
+    }
+
+    attachTaskToSessionRun(sessionRun.run_id, taskId, { agentId, dagId: dagIdToUse });
+    upsertTaskBinding({
+      dag_id: dagIdToUse,
+      task_id: taskId,
+      executor_type: 'subagent',
+      executor_agent_id: executor_agent_id || sessionRun.parent_agent_id,
+      session_key: sessionRun.child_session_key,
+      run_id: sessionRun.run_id,
+      binding_status: 'active',
+    }, { agentId, dagId: dagIdToUse });
+    dag.updateTask(taskId, {
+      status: 'waiting_subagent',
+      executor: {
+        type: 'subagent',
+        agent_id: executor_agent_id || sessionRun.parent_agent_id,
+        session_key: sessionRun.child_session_key,
+        run_id: sessionRun.run_id,
+        claimed_at: new Date().toISOString(),
+      },
+      waiting_for: {
+        kind: 'subagent',
+        session_key: sessionRun.child_session_key,
+        run_id: sessionRun.run_id,
+      },
+      log: { level: 'info', message: `Assigned to session ${sessionRun.child_session_key}` },
+    } as any);
+    assigned.push(taskId);
+  }
+
+  return {
+    success: true,
+    session_key: sessionRun.child_session_key,
+    run_id: sessionRun.run_id,
+    assigned_task_ids: assigned,
+  };
+}
+
+export async function checkTaskWaitStatus(params: any, context?: any) {
+  const { agentId, dagId } = setExecutionContext(context, params);
+  const { task_id, timeout = 3600, register_waiter = true } = params;
+  const taskResult = getTaskOrError(task_id);
+  if ('error' in taskResult) {
+    return taskResult;
+  }
+
+  if (register_waiter) {
+    waiter.registerWaiting(agentId, task_id, timeout);
+  }
+
+  const notification = notificationModule.getAndClearNotification(task_id);
+  if (notification) {
+    waiter.unregisterWaiting(agentId);
+    return { status: 'notified', notification, agent_id: agentId };
+  }
+
+  const task = taskResult.task;
+  if (task.status === 'done') {
+    waiter.unregisterWaiting(agentId);
+    return { status: 'completed', output: task.output_summary, task, agent_id: agentId };
+  }
+  if (task.status === 'failed' || task.status === 'cancelled') {
+    waiter.unregisterWaiting(agentId);
+    return { status: 'failed', output: task.output_summary, task, agent_id: agentId };
+  }
+
+  const events = listPendingEvents({ task_id }, { agentId, dagId });
+  if (events.length > 0) {
+    return { status: 'notified', pending_events: events, task, agent_id: agentId };
+  }
+
+  return {
+    status: 'waiting',
+    block_reason: task.waiting_for?.kind || 'task_in_progress',
+    pending_children: task.waiting_for?.child_task_ids || [],
+    task,
+    agent_id: agentId,
+  };
+}
+
+export async function pollTaskEvents(params: any, context?: any) {
+  const { agentId, dagId } = setExecutionContext(context, params);
+  const events = listPendingEvents({
+    type: params.type,
+    task_id: params.task_id,
+    session_key: params.session_key,
+    run_id: params.run_id,
+    includeConsumed: !!params.include_consumed,
+  }, { agentId, dagId });
+
+  return {
+    events: params.limit ? events.slice(0, params.limit) : events,
+    agent_id: agentId,
+    dag_id: dagId || dag.getCurrentDagId(),
+  };
+}
+
+export async function ackTaskEvent(params: any, context?: any) {
+  const { agentId, dagId } = setExecutionContext(context, params);
+  const event = (await import('./bindings.js')).consumePendingEvent(params.event_id, { agentId, dagId });
+  if (!event) {
+    return { error: `Event ${params.event_id} not found` };
+  }
+  return { success: true, event };
+}
+
+export async function reconcileTaskDagState(params: any, context?: any) {
+  const { agentId, dagId } = setExecutionContext(context, params);
+  const dagData = dag.loadDAG();
+  if (!dagData) {
+    return { error: 'No DAG exists. Use createDAG first.' };
+  }
+
+  const reconciled: Array<{ task_id: string; action: string }> = [];
+  for (const task of Object.values(dagData.tasks)) {
+    const activeBindings = listTaskBindings({ task_id: task.id, binding_status: 'active' }, { agentId, dagId });
+    if ((task.status === 'done' || task.status === 'failed' || task.status === 'cancelled') && activeBindings.length > 0) {
+      completeBindingsForTask(task.id, task.status === 'done' ? 'completed' : 'failed', { agentId, dagId });
+      reconciled.push({ task_id: task.id, action: 'completed_active_bindings' });
+    }
+    if (task.status === 'waiting_subagent' && activeBindings.length === 0) {
+      dag.updateTask(task.id, { status: 'ready', waiting_for: undefined } as any);
+      reconciled.push({ task_id: task.id, action: 'reset_waiting_without_binding' });
+    }
+  }
+
+  return {
+    success: true,
+    reconciled,
+    stats: dag.getStats(),
   };
 }
 
@@ -600,60 +1051,181 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
     }
   }, { optional: false });
 
+  api.registerTool({
+    name: "task_dag_claim",
+    description: "Claim a task for execution by the current agent or a subagent session.",
+    parameters: {
+      type: "object",
+      properties: {
+        task_id: { type: "string", description: "Task ID" },
+        dag_id: { type: "string", description: "DAG ID (optional)" },
+        executor_type: { type: "string", enum: ["parent", "subagent"], description: "Executor type", default: "parent" },
+        executor_agent_id: { type: "string", description: "Executor agent ID" },
+        session_key: { type: "string", description: "Bound subagent session key" },
+        run_id: { type: "string", description: "Bound run ID" },
+        message: { type: "string", description: "Optional log message" }
+      },
+      required: ["task_id"]
+    },
+    execute: async (params, context: any) => claimTaskExecution(params, context)
+  }, { optional: false });
+
+  api.registerTool({
+    name: "task_dag_progress",
+    description: "Report deterministic task progress and emit a pending progress event.",
+    parameters: {
+      type: "object",
+      properties: {
+        task_id: { type: "string", description: "Task ID" },
+        dag_id: { type: "string", description: "DAG ID (optional)" },
+        progress: { type: "number", minimum: 0, maximum: 100, description: "Progress percentage" },
+        message: { type: "string", description: "Progress message" },
+        session_key: { type: "string", description: "Session key (optional)" },
+        run_id: { type: "string", description: "Run ID (optional)" }
+      },
+      required: ["task_id"]
+    },
+    execute: async (params, context: any) => reportTaskProgress(params, context)
+  }, { optional: false });
+
+  api.registerTool({
+    name: "task_dag_complete",
+    description: "Mark a task complete and close its active bindings.",
+    parameters: {
+      type: "object",
+      properties: {
+        task_id: { type: "string", description: "Task ID" },
+        dag_id: { type: "string", description: "DAG ID (optional)" },
+        output_summary: { type: "string", description: "Task output summary" },
+        message: { type: "string", description: "Completion log message" },
+        session_key: { type: "string", description: "Session key (optional)" },
+        run_id: { type: "string", description: "Run ID (optional)" }
+      },
+      required: ["task_id"]
+    },
+    execute: async (params, context: any) => completeTaskExecution(params, context)
+  }, { optional: false });
+
+  api.registerTool({
+    name: "task_dag_fail",
+    description: "Mark a task failed and close its active bindings.",
+    parameters: {
+      type: "object",
+      properties: {
+        task_id: { type: "string", description: "Task ID" },
+        dag_id: { type: "string", description: "DAG ID (optional)" },
+        message: { type: "string", description: "Failure reason" },
+        session_key: { type: "string", description: "Session key (optional)" },
+        run_id: { type: "string", description: "Run ID (optional)" }
+      },
+      required: ["task_id", "message"]
+    },
+    execute: async (params, context: any) => failTaskExecution(params, context)
+  }, { optional: false });
+
+  api.registerTool({
+    name: "task_dag_spawn",
+    description: "Spawn a subagent for a task, create bindings, and move the task into waiting_subagent.",
+    parameters: {
+      type: "object",
+      properties: {
+        task_id: { type: "string", description: "Task ID" },
+        dag_id: { type: "string", description: "DAG ID (optional)" },
+        task: { type: "string", description: "Subagent task prompt" },
+        prompt: { type: "string", description: "Alias of task prompt" },
+        agentId: { type: "string", description: "Target subagent agent ID (legacy alias)" },
+        target_agent_id: { type: "string", description: "Target subagent agent ID" },
+        model: { type: "string", description: "Target model" },
+        label: { type: "string", description: "Spawn label" },
+        thread: { type: "boolean", description: "Thread mode" },
+        mode: { type: "string", enum: ["run", "session"], description: "Spawn mode" },
+        runtime: { type: "string", enum: ["subagent", "acp"], description: "Runtime kind" },
+        requester_session_key: { type: "string", description: "Requester session key override" },
+        timeout: { type: "number", description: "Wait registration timeout", default: 3600 }
+      },
+      required: ["task_id"]
+    },
+    execute: async (params, context: any) => spawnTaskExecution(api.runtime, params, context)
+  }, { optional: false });
+
+  api.registerTool({
+    name: "task_dag_assign",
+    description: "Assign one or more tasks to an existing subagent session or run.",
+    parameters: {
+      type: "object",
+      properties: {
+        task_ids: { type: "array", items: { type: "string" }, description: "Task IDs to assign" },
+        dag_id: { type: "string", description: "DAG ID (optional)" },
+        session_key: { type: "string", description: "Existing session key" },
+        run_id: { type: "string", description: "Existing run ID" },
+        executor_agent_id: { type: "string", description: "Executor agent ID override" }
+      },
+      required: ["task_ids"]
+    },
+    execute: async (params, context: any) => assignTasksToSession(params, context)
+  }, { optional: false });
+
   api.logger.info('[task-dag] All tools registered');
 
   // ========== task_dag_wait ==========
   api.registerTool({
     name: "task_dag_wait",
-    description: "Wait for a task to complete. Returns when task is done, failed, or notified.",
+    description: "Non-blocking task wait check. Returns waiting, completed, failed, or notified.",
     parameters: {
       type: "object",
       properties: {
         task_id: { type: "string", description: "Task ID to wait for" },
-        timeout: { type: "number", description: "Max wait time in seconds (default 3600)", default: 3600 },
-        check_interval: { type: "number", description: "Check interval in seconds (default 5)", default: 5 }
+        dag_id: { type: "string", description: "DAG ID (optional)" },
+        timeout: { type: "number", description: "Wait registration timeout in seconds", default: 3600 },
+        register_waiter: { type: "boolean", description: "Whether to refresh waiter registration", default: true }
       },
       required: ["task_id"]
     },
-    execute: async (params: any, context: any) => {
-      const args = context || params;
-      const agentId = args?.agent?.id || args?.agentId || "main";
-      dag.setCurrentAgentId(agentId);
-      
-      const { task_id, timeout = 3600, check_interval = 5 } = params;
-      
-      const waiter = await import("./waiter.js");
-      const notificationModule = await import("./notification.js");
-      
-      waiter.registerWaiting(agentId, task_id, timeout);
-      
-      const startTime = Date.now();
-      
-      while (Date.now() - startTime < timeout * 1000) {
-        const notification = notificationModule.getAndClearNotification(task_id);
-        if (notification) {
-          waiter.unregisterWaiting(agentId);
-          return { status: "notified", notification, mermaid: dag.showProgress() };
-        }
-        
-        const task = dag.getTask(task_id);
-        if (task) {
-          if (task.status === "done") {
-            waiter.unregisterWaiting(agentId);
-            return { status: "completed", output: task.output_summary, mermaid: dag.showProgress() };
-          }
-          if (task.status === "failed") {
-            waiter.unregisterWaiting(agentId);
-            return { status: "failed", output: task.output_summary, mermaid: dag.showProgress() };
-          }
-        }
-        
-        await new Promise(resolve => setTimeout(resolve, check_interval * 1000));
+    execute: async (params: any, context: any) => checkTaskWaitStatus(params, context)
+  }, { optional: false });
+
+  api.registerTool({
+    name: "task_dag_poll_events",
+    description: "Read pending task-dag events without relying on model memory.",
+    parameters: {
+      type: "object",
+      properties: {
+        dag_id: { type: "string", description: "DAG ID (optional)" },
+        type: { type: "string", description: "Filter by event type" },
+        task_id: { type: "string", description: "Filter by task ID" },
+        session_key: { type: "string", description: "Filter by session key" },
+        run_id: { type: "string", description: "Filter by run ID" },
+        include_consumed: { type: "boolean", description: "Include consumed events", default: false },
+        limit: { type: "number", description: "Max events to return" }
       }
-      
-      waiter.unregisterWaiting(agentId);
-      return { status: "timeout", continue: true };
-    }
+    },
+    execute: async (params: any, context: any) => pollTaskEvents(params, context)
+  }, { optional: false });
+
+  api.registerTool({
+    name: "task_dag_ack_event",
+    description: "Acknowledge a pending task-dag event.",
+    parameters: {
+      type: "object",
+      properties: {
+        event_id: { type: "string", description: "Event ID" },
+        dag_id: { type: "string", description: "DAG ID (optional)" }
+      },
+      required: ["event_id"]
+    },
+    execute: async (params: any, context: any) => ackTaskEvent(params, context)
+  }, { optional: false });
+
+  api.registerTool({
+    name: "task_dag_reconcile",
+    description: "Reconcile task state with persisted bindings and session runs.",
+    parameters: {
+      type: "object",
+      properties: {
+        dag_id: { type: "string", description: "DAG ID (optional)" }
+      }
+    },
+    execute: async (params: any, context: any) => reconcileTaskDagState(params, context)
   }, { optional: false });
 
   // ========== task_dag_notify ==========
