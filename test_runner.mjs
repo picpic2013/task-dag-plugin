@@ -854,6 +854,79 @@ test('execution and continuation tools expose a consistent agent_id contract', a
   });
 });
 
+test('chexie agent can create and execute parent-owned tasks in its own workspace', async () => {
+  await withTempWorkspace('tool-chexie-parent-flow', async (workspaceDir) => {
+    const registeredTools = {};
+    tools.registerTaskDagTools({
+      logger: { info() {}, warn() {}, error() {} },
+      registerTool(tool) { registeredTools[tool.name] = tool; },
+      registerHook() {},
+      runtime: {},
+      config: {},
+    });
+
+    const created = await registeredTools.task_dag_create.execute('call-chexie-create', {
+      agent_id: 'chexie',
+      name: 'Chexie README Flow',
+      tasks: [
+        { id: 't1', name: 'Read frontend README', assigned_agent: 'parent' },
+        { id: 't2', name: 'Read backend README', assigned_agent: 'parent' },
+      ],
+    }, undefined, undefined);
+
+    assert(created.success === true, `Chexie DAG should be created: ${JSON.stringify(created)}`);
+    assert(fs.existsSync(path.join(workspaceDir, 'workspace-chexie', 'tasks', created.dag_id, 'dag.json')), 'Chexie DAG should live under workspace-chexie');
+
+    const ready = await registeredTools.task_dag_ready.execute('call-chexie-ready', {
+      agent_id: 'chexie',
+      dag_id: created.dag_id,
+    }, undefined, undefined);
+    assert(Array.isArray(ready.tasks) && ready.tasks.length === 2, 'Both chexie tasks should start ready');
+
+    const claim = await registeredTools.task_dag_claim.execute('call-chexie-claim', {
+      agent_id: 'chexie',
+      dag_id: created.dag_id,
+      task_id: 't1',
+      executor_type: 'parent',
+      executor_agent_id: 'chexie',
+    }, undefined, undefined);
+    assert(claim.success === true, `Chexie should be able to claim t1: ${JSON.stringify(claim)}`);
+
+    const progress = await registeredTools.task_dag_progress.execute('call-chexie-progress', {
+      agent_id: 'chexie',
+      dag_id: created.dag_id,
+      task_id: 't1',
+      progress: 50,
+      message: 'reading frontend readme',
+    }, undefined, undefined);
+    assert(progress.success === true, `Chexie should be able to report progress: ${JSON.stringify(progress)}`);
+
+    const complete = await registeredTools.task_dag_complete.execute('call-chexie-complete', {
+      agent_id: 'chexie',
+      dag_id: created.dag_id,
+      task_id: 't1',
+      output_summary: 'frontend readme summarized',
+    }, undefined, undefined);
+    assert(complete.success === true, `Chexie should be able to complete t1: ${JSON.stringify(complete)}`);
+
+    const task = await registeredTools.task_dag_get.execute('call-chexie-get', {
+      agent_id: 'chexie',
+      dag_id: created.dag_id,
+      task_id: 't1',
+    }, undefined, undefined);
+    assert(task.task?.status === 'done', 'Completed chexie task should be done');
+
+    const continuation = await registeredTools.task_dag_continue.execute('call-chexie-continue', {
+      agent_id: 'chexie',
+      dag_id: created.dag_id,
+      task_ids: ['t1', 't2'],
+      consume: false,
+    }, undefined, undefined);
+    assert(continuation.agent_id === 'chexie', 'Continuation should stay in chexie context');
+    assert(continuation.dag_id === created.dag_id, 'Continuation should report chexie dag_id');
+  });
+});
+
 test('task_dag_continue requires explicit scope instead of scanning the whole DAG', async () => {
   await withTempWorkspace('tool-continue-explicit-scope', async () => {
     const created = dag.createDAG('tool-continue-explicit-scope', [{ id: 't1', name: 'Task 1' }]);
