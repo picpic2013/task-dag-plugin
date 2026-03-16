@@ -239,6 +239,70 @@ task_dag_spawn
 
 详细迁移说明见 [MIGRATION.md](/root/workspace/task-dag-project/task-dag-plugin/MIGRATION.md)。
 
+## 常见错误与排查
+
+### `Explicit agent context is required`
+
+原因：
+
+- 调用工具时没有显式传 `agent_id`
+- 或者传了 `dag_id`，但没有对应的 `agent_id`
+
+处理方式：
+
+- `main` agent 也显式传 `agent_id="main"`
+- 非 `main` agent 例如 `chexie`，必须显式传 `agent_id="chexie"`
+
+### `Task undefined not found`
+
+原因：
+
+- 当前版本之前的典型问题是工具执行签名错位，导致 `task_id` 在执行层丢失
+- 如果现在再看到这个错误，优先检查实际 tool call payload 里是否真的传了 `task_id`
+
+处理方式：
+
+- 确认工具调用参数中显式包含 `task_id`
+- 确认调用的是当前版本插件，而不是旧构建产物
+- 用 `task_dag_get agent_id="..." dag_id="..." task_id="..."` 先验证目标 task 确实存在
+
+### `task_dag_continue` 返回 scope 相关错误
+
+原因：
+
+- `task_dag_continue` 现在不再扫描整个 DAG 猜测范围
+- 必须显式提供 `run_id`、`session_key`、`task_id`、`task_ids` 之一
+
+处理方式：
+
+- 父 agent 单 task 收口：`task_dag_continue agent_id="..." dag_id="..." task_id="t1"`
+- 多任务 worker 收口：`task_dag_continue agent_id="..." dag_id="..." run_id="run-xxx"`
+
+### 子 agent 直接把消息发给用户，父 agent 没继续
+
+原因：
+
+- 父会话没有走 `task_dag_spawn`
+- 或者 `task_dag_spawn` 没显式传 `requester_session_key`
+- 或者后续父会话没有用 `task_dag_continue` 消费 continuation
+
+处理方式：
+
+- 不要直接用 `sessions_spawn`
+- 用 `task_dag_spawn agent_id="..." requester_session_key="..." ...`
+- 子 agent 完成后，父会话在被唤醒的新一轮调用 `task_dag_continue`
+
+### `tool done ok` 但业务结果仍然是错误
+
+说明：
+
+- transport 层的 `tool done ok` 只表示插件函数正常返回
+- 不代表 task-dag 业务语义成功
+- 调试时必须同时看工具返回 payload，确认是否有：
+  - `error`
+  - `success: false`
+  - 不符合预期的 `action`
+
 ## 测试状态
 
 当前本地回归覆盖了：
