@@ -25,7 +25,10 @@ export type PendingEventType =
   | 'task_completed'
   | 'task_failed'
   | 'task_progress'
-  | 'resume_requested';
+  | 'resume_requested'
+  | 'task_ready'
+  | 'task_reopened'
+  | 'binding_orphaned';
 
 export interface TaskBinding {
   binding_id: string;

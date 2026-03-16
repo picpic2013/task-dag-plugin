@@ -5,10 +5,17 @@
  */
 
 import type { OpenClawPluginApi } from "./plugin-sdk.js";
-import { getAgentByTask, saveAgentMapping, updateAgentStatus, saveSessionMapping, getTaskBySession, removeSessionMapping, saveSessionHierarchy, getParentAgentId } from './agent.js';
+import { getAgentByTask, updateAgentStatus, saveSessionMapping, saveSessionHierarchy, getParentAgentId, getSessionInfo } from './agent.js';
 import { addEvent } from './events.js';
-import { getWaitingAgent, registerWaiting } from './waiter.js';
-import { addNotification, Notification } from './notification.js';
+import { addNotification } from './notification.js';
+import {
+  appendPendingEvent,
+  completeSessionRun,
+  completeTaskBinding,
+  getSessionRunByRunId,
+  getSessionRunBySessionKey,
+  listTaskBindings,
+} from './bindings.js';
 import * as dag from './dag.js';
 
 /**
@@ -162,6 +169,223 @@ export function notifyOnResume(taskId: string): void {
   }
 }
 
+function setHookDagContext(agentId: string, dagId: string): void {
+  dag.setCurrentAgentId(agentId);
+  dag.setCurrentDagId(dagId);
+}
+
+function getHookContextFromSpawnEvent(event: any): { agentId: string; dagId: string } | null {
+  const dagId = event.dagId || event.dag_id || dag.getCurrentDagId();
+  const requesterSessionKey = event.requesterSessionKey;
+  const parentAgentId =
+    event.parentAgentId ||
+    event.parent_agent_id ||
+    (requesterSessionKey ? getParentAgentId(requesterSessionKey) : null) ||
+    dag.getCurrentAgentId();
+
+  if (!dagId || !parentAgentId) {
+    return null;
+  }
+
+  return { agentId: parentAgentId, dagId };
+}
+
+function getHookContextFromEndedEvent(event: any): { agentId: string; dagId: string } | null {
+  const targetSessionKey = event.targetSessionKey || event.childSessionKey || event.sessionKey;
+  const runId = event.runId || event.run_id;
+  const sessionInfo = targetSessionKey ? getSessionInfo(targetSessionKey) : null;
+  const dagId = event.dagId || event.dag_id || sessionInfo?.dagId || dag.getCurrentDagId();
+  const parentAgentId =
+    event.parentAgentId ||
+    event.parent_agent_id ||
+    (targetSessionKey ? getParentAgentId(targetSessionKey) : null) ||
+    dag.getCurrentAgentId();
+
+  if (!dagId || !parentAgentId) {
+    return null;
+  }
+
+  if (runId) {
+    const sessionRun = getSessionRunByRunId(runId, { agentId: parentAgentId, dagId });
+    if (sessionRun?.dag_id) {
+      return { agentId: parentAgentId, dagId: sessionRun.dag_id };
+    }
+  }
+
+  return { agentId: parentAgentId, dagId };
+}
+
+function markNewlyReadyTasks(sourceTaskIds: string[], context: { agentId: string; dagId: string }): string[] {
+  const dagData = dag.loadDAG();
+  if (!dagData) {
+    return [];
+  }
+
+  const newlyReady = Object.values(dagData.tasks)
+    .filter(task => task.status === 'ready' && task.dependencies.some(depId => sourceTaskIds.includes(depId)))
+    .map(task => task.id);
+
+  for (const readyTaskId of newlyReady) {
+    appendPendingEvent({
+      type: 'task_ready',
+      dag_id: context.dagId,
+      task_id: readyTaskId,
+      payload: { source_task_ids: sourceTaskIds },
+    }, context);
+    addEvent({
+      event: 'task_ready',
+      task_id: readyTaskId,
+      source_task_ids: sourceTaskIds,
+      details: `Task ${readyTaskId} is ready after upstream completion`,
+    });
+  }
+
+  return newlyReady;
+}
+
+export function handleSubagentSpawnedEvent(event: any, logger?: OpenClawPluginApi['logger']): void {
+  const { childSessionKey, agentId, label, requesterSessionKey } = event;
+  if (!childSessionKey) {
+    return;
+  }
+
+  const context = getHookContextFromSpawnEvent(event);
+  if (!context) {
+    logger?.warn?.('[task-dag] Unable to resolve DAG context for subagent_spawned');
+    return;
+  }
+
+  setHookDagContext(context.agentId, context.dagId);
+  saveSessionHierarchy(childSessionKey, requesterSessionKey, context.agentId);
+
+  const taskId = parseTaskLabel(label);
+  if (!taskId) {
+    logger?.info?.(`[task-dag] No taskId in label: ${label}`);
+    return;
+  }
+
+  saveSessionMapping(childSessionKey, taskId, agentId, {
+    dagId: context.dagId,
+    runId: event.runId || event.run_id,
+    requesterSessionKey,
+    label,
+  });
+
+  appendPendingEvent({
+    type: 'subagent_spawned',
+    dag_id: context.dagId,
+    task_id: taskId,
+    session_key: childSessionKey,
+    run_id: event.runId || event.run_id,
+    payload: { requester_session_key: requesterSessionKey, label, agent_id: agentId },
+  }, context);
+
+  addEvent({
+    event: 'subtask_spawned',
+    task_id: taskId,
+    session_key: childSessionKey,
+    run_id: event.runId || event.run_id,
+    agent_id: agentId,
+    requester_session_key: requesterSessionKey,
+    details: `Sub-agent started for task ${taskId}`,
+  });
+}
+
+export function handleSubagentEndedEvent(event: any, logger?: OpenClawPluginApi['logger']): {
+  task_ids: string[];
+  newly_ready_task_ids: string[];
+  outcome: string;
+} {
+  const targetSessionKey = event.targetSessionKey || event.childSessionKey || event.sessionKey;
+  const outcome = event.outcome || 'unknown';
+  if (!targetSessionKey) {
+    return { task_ids: [], newly_ready_task_ids: [], outcome };
+  }
+
+  const context = getHookContextFromEndedEvent(event);
+  if (!context) {
+    logger?.warn?.('[task-dag] Unable to resolve DAG context for subagent_ended');
+    return { task_ids: [], newly_ready_task_ids: [], outcome };
+  }
+
+  setHookDagContext(context.agentId, context.dagId);
+
+  const runId =
+    event.runId ||
+    event.run_id ||
+    getSessionRunBySessionKey(targetSessionKey, context)?.run_id;
+  const activeBindings = listTaskBindings({ session_key: targetSessionKey, binding_status: 'active' }, context);
+
+  if (activeBindings.length === 0) {
+    appendPendingEvent({
+      type: 'binding_orphaned',
+      dag_id: context.dagId,
+      session_key: targetSessionKey,
+      run_id: runId,
+      payload: { outcome },
+    } as any, context);
+    addEvent({
+      event: 'binding_orphaned',
+      session_key: targetSessionKey,
+      run_id: runId,
+      outcome,
+      details: `No active bindings found for session ${targetSessionKey}`,
+    });
+    return { task_ids: [], newly_ready_task_ids: [], outcome };
+  }
+
+  const taskIds = activeBindings.map(binding => binding.task_id);
+  const isSuccess = outcome === 'ok' || outcome === 'success' || outcome === 'completed';
+
+  for (const binding of activeBindings) {
+    const task = dag.getTask(binding.task_id);
+    if (!task) {
+      continue;
+    }
+
+    if (task.status !== 'done' && task.status !== 'failed' && task.status !== 'cancelled') {
+      dag.updateTask(binding.task_id, {
+        status: isSuccess ? 'done' : 'failed',
+        waiting_for: undefined,
+        log: {
+          level: isSuccess ? 'info' : 'error',
+          message: `Subagent ${targetSessionKey} ended with outcome ${outcome}`,
+        },
+      } as any);
+    }
+
+    completeTaskBinding(binding.binding_id, isSuccess ? 'completed' : 'failed', context);
+    const mappedAgentId = getAgentByTask(binding.task_id);
+    if (mappedAgentId) {
+      updateAgentStatus(mappedAgentId, isSuccess ? 'completed' : 'failed');
+    }
+
+    appendPendingEvent({
+      type: isSuccess ? 'subagent_completed' : 'subagent_failed',
+      dag_id: context.dagId,
+      task_id: binding.task_id,
+      session_key: targetSessionKey,
+      run_id: binding.run_id || runId,
+      payload: { outcome },
+    }, context);
+    addEvent({
+      event: 'subtask_ended',
+      task_id: binding.task_id,
+      session_key: targetSessionKey,
+      run_id: binding.run_id || runId,
+      outcome,
+      details: `Sub-agent ended with outcome: ${outcome}`,
+    });
+  }
+
+  if (runId) {
+    completeSessionRun(runId, context);
+  }
+
+  const newlyReady = isSuccess ? markNewlyReadyTasks(taskIds, context) : [];
+  return { task_ids: taskIds, newly_ready_task_ids: newlyReady, outcome };
+}
+
 /**
  * 注册 Task DAG Hooks
  */
@@ -212,34 +436,8 @@ export function registerTaskDagHooks(api: OpenClawPluginApi): void {
   // 注册 subagent_spawned 钩子
   api.registerHook('subagent_spawned', async (event: any) => {
     try {
-      const { childSessionKey, agentId, label, requesterSessionKey } = event;
-      
-      if (!childSessionKey) return;
-      
-      // 保存父子关系（用于 DAG 路径查找）
-      const parentAgentId = getParentAgentId(requesterSessionKey) || 'main';
-      saveSessionHierarchy(childSessionKey, requesterSessionKey, parentAgentId);
-      api.logger.info(`[task-dag] Session hierarchy: ${childSessionKey} → parent ${parentAgentId}`);
-      
-      // 解析 label 获取 taskId
-      const taskId = parseTaskLabel(label);
-      if (!taskId) {
-        api.logger.info(`[task-dag] No taskId in label: ${label}`);
-        return;
-      }
-      
-      // 保存 session ↔ task 映射
-      saveSessionMapping(childSessionKey, taskId, agentId);
-      
-      addEvent({
-        event: 'subtask_spawned',
-        task_id: taskId,
-        session_key: childSessionKey,
-        agent_id: agentId,
-        details: `Sub-agent started for task ${taskId}`
-      });
-      
-      api.logger.info(`[task-dag] Mapped session ${childSessionKey} → task ${taskId}`);
+      handleSubagentSpawnedEvent(event, api.logger);
+      api.logger.info(`[task-dag] Processed subagent_spawned for ${event.childSessionKey}`);
     } catch (error) {
       api.logger.error(`[task-dag] Error in subagent_spawned: ${error}`);
     }
@@ -251,40 +449,8 @@ export function registerTaskDagHooks(api: OpenClawPluginApi): void {
   // 注册 subagent_ended 钩子
   api.registerHook('subagent_ended', async (event: any) => {
     try {
-      const { targetSessionKey, outcome } = event;
-      
-      if (!targetSessionKey) return;
-      
-      // 获取 taskId
-      const taskId = getTaskBySession(targetSessionKey);
-      if (!taskId) {
-        return;
-      }
-      
-      // 根据结果更新任务状态
-      if (outcome === 'ok') {
-        dag.updateTask(taskId, { status: 'done' });
-        api.logger.info(`[task-dag] Task ${taskId} marked as done`);
-      } else if (outcome === 'error' || outcome === 'timeout') {
-        dag.updateTask(taskId, { status: 'failed' });
-        api.logger.info(`[task-dag] Task ${taskId} marked as failed (${outcome})`);
-      }
-      
-      // 更新 agent 状态
-      const agentId = getAgentByTask(taskId);
-      if (agentId) {
-        updateAgentStatus(agentId, outcome === 'ok' ? 'completed' : 'failed');
-      }
-      
-      addEvent({
-        event: 'subtask_ended',
-        task_id: taskId,
-        outcome: outcome,
-        details: `Sub-agent ended with outcome: ${outcome}`
-      });
-      
-      // 清理映射
-      removeSessionMapping(targetSessionKey);
+      const result = handleSubagentEndedEvent(event, api.logger);
+      api.logger.info(`[task-dag] Processed subagent_ended for ${event.targetSessionKey || event.childSessionKey}, tasks=${result.task_ids.join(',')}`);
     } catch (error) {
       api.logger.error(`[task-dag] Error in subagent_ended: ${error}`);
     }

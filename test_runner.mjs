@@ -18,6 +18,8 @@ const dag = await import('./dist/src/dag.js');
 const types = await import('./dist/src/types.js');
 const bindings = await import('./dist/src/bindings.js');
 const tools = await import('./dist/src/tools.js');
+const hooks = await import('./dist/src/hooks.js');
+const events = await import('./dist/src/events.js');
 
 let passed = 0;
 let failed = 0;
@@ -545,6 +547,158 @@ test('task_dag_reconcile closes terminal task bindings', async () => {
     assert(result.success === true, 'Reconcile should succeed');
     assert(result.reconciled.length === 1, 'Reconcile should fix one task');
     assert(bindings.listTaskBindings({ task_id: 't1', binding_status: 'active' }, { dagId }).length === 0, 'Active binding should be closed');
+  });
+});
+
+console.log('\n=== Hook Flow ===\n');
+
+test('subagent_spawned hook persists session context and binding metadata', async () => {
+  await withTempWorkspace('hook-spawned', async () => {
+    dag.setCurrentAgentId('main');
+    const created = dag.createDAG('hook-spawned', [{ id: 't1', name: 'Hook task' }]);
+
+    hooks.handleSubagentSpawnedEvent({
+      childSessionKey: 'agent:worker:subagent:hook-1',
+      requesterSessionKey: 'agent:main',
+      agentId: 'worker',
+      label: 'task:t1',
+      runId: 'run-hook-1',
+      dagId: created.id,
+      parentAgentId: 'main',
+    }, console);
+
+    const run = bindings.getSessionRunByRunId('run-hook-1', { dagId: created.id });
+    const taskBindings = bindings.listTaskBindings({ task_id: 't1' }, { dagId: created.id });
+    const pendingEvents = bindings.listPendingEvents({ type: 'subagent_spawned' }, { dagId: created.id });
+
+    assert(run?.child_session_key === 'agent:worker:subagent:hook-1', 'Hook should persist session run');
+    assert(taskBindings.length >= 1, 'Hook should create task binding');
+    assert(pendingEvents.length === 1, 'Hook should emit pending spawn event');
+  });
+});
+
+test('subagent_ended hook closes all active bindings for a session and unlocks downstream tasks', async () => {
+  await withTempWorkspace('hook-ended', async () => {
+    dag.setCurrentAgentId('main');
+    const created = dag.createDAG('hook-ended', [
+      { id: 't1', name: 'Sub task 1' },
+      { id: 't2', name: 'Sub task 2' },
+      { id: 't3', name: 'Downstream', dependencies: ['t1', 't2'] },
+    ]);
+
+    bindings.saveSessionRun({
+      run_id: 'run-hook-2',
+      child_session_key: 'agent:worker:subagent:hook-2',
+      requester_session_key: 'agent:main',
+      parent_agent_id: 'main',
+      dag_id: created.id,
+      spawn_mode: 'multi_task',
+      active_task_ids: ['t1', 't2'],
+    }, { dagId: created.id });
+    bindings.upsertTaskBinding({
+      dag_id: created.id,
+      task_id: 't1',
+      executor_type: 'subagent',
+      executor_agent_id: 'worker',
+      session_key: 'agent:worker:subagent:hook-2',
+      run_id: 'run-hook-2',
+      binding_status: 'active',
+    }, { dagId: created.id });
+    bindings.upsertTaskBinding({
+      dag_id: created.id,
+      task_id: 't2',
+      executor_type: 'subagent',
+      executor_agent_id: 'worker',
+      session_key: 'agent:worker:subagent:hook-2',
+      run_id: 'run-hook-2',
+      binding_status: 'active',
+    }, { dagId: created.id });
+
+    const result = hooks.handleSubagentEndedEvent({
+      targetSessionKey: 'agent:worker:subagent:hook-2',
+      runId: 'run-hook-2',
+      outcome: 'ok',
+      dagId: created.id,
+      parentAgentId: 'main',
+    }, console);
+
+    assert(result.task_ids.length === 2, 'Ended hook should close both bound tasks');
+    assert(dag.getTask('t1')?.status === 'done', 'First task should be done');
+    assert(dag.getTask('t2')?.status === 'done', 'Second task should be done');
+    assert(dag.getTask('t3')?.status === 'ready', 'Downstream task should become ready');
+    assert(result.newly_ready_task_ids.includes('t3'), 'Ended hook should report newly ready downstream task');
+    assert(bindings.listTaskBindings({ session_key: 'agent:worker:subagent:hook-2', binding_status: 'active' }, { dagId: created.id }).length === 0, 'Active bindings should be closed');
+  });
+});
+
+test('subagent_ended hook tolerates delayed completion after task already closed', async () => {
+  await withTempWorkspace('hook-ended-delayed', async () => {
+    dag.setCurrentAgentId('main');
+    const created = dag.createDAG('hook-ended-delayed', [{ id: 't1', name: 'Already done' }]);
+
+    bindings.saveSessionRun({
+      run_id: 'run-hook-3',
+      child_session_key: 'agent:worker:subagent:hook-3',
+      parent_agent_id: 'main',
+      dag_id: created.id,
+      spawn_mode: 'single_task',
+      active_task_ids: ['t1'],
+    }, { dagId: created.id });
+    bindings.upsertTaskBinding({
+      dag_id: created.id,
+      task_id: 't1',
+      executor_type: 'subagent',
+      executor_agent_id: 'worker',
+      session_key: 'agent:worker:subagent:hook-3',
+      run_id: 'run-hook-3',
+      binding_status: 'active',
+    }, { dagId: created.id });
+    dag.updateTask('t1', { status: 'done', output_summary: 'already completed' });
+
+    const result = hooks.handleSubagentEndedEvent({
+      targetSessionKey: 'agent:worker:subagent:hook-3',
+      runId: 'run-hook-3',
+      outcome: 'ok',
+      dagId: created.id,
+      parentAgentId: 'main',
+    }, console);
+
+    assert(result.task_ids[0] === 't1', 'Delayed ended hook should still resolve task');
+    assert(dag.getTask('t1')?.status === 'done', 'Done task should remain done');
+  });
+});
+
+test('subagent_ended hook emits orphan event when bindings are missing', async () => {
+  await withTempWorkspace('hook-orphaned', async () => {
+    dag.setCurrentAgentId('main');
+    const created = dag.createDAG('hook-orphaned', [{ id: 't1', name: 'Orphan check' }]);
+
+    hooks.handleSubagentSpawnedEvent({
+      childSessionKey: 'agent:worker:subagent:hook-4',
+      requesterSessionKey: 'agent:main',
+      agentId: 'worker',
+      label: 'task:t1',
+      runId: 'run-hook-4',
+      dagId: created.id,
+      parentAgentId: 'main',
+    }, console);
+
+    const existingBindings = bindings.listTaskBindings({ session_key: 'agent:worker:subagent:hook-4', binding_status: 'active' }, { dagId: created.id });
+    for (const binding of existingBindings) {
+      bindings.completeTaskBinding(binding.binding_id, 'released', { dagId: created.id });
+    }
+
+    const result = hooks.handleSubagentEndedEvent({
+      targetSessionKey: 'agent:worker:subagent:hook-4',
+      runId: 'run-hook-4',
+      outcome: 'error',
+      dagId: created.id,
+      parentAgentId: 'main',
+    }, console);
+
+    const orphanEvents = bindings.listPendingEvents({ type: 'binding_orphaned' }, { dagId: created.id });
+    assert(result.task_ids.length === 0, 'Orphaned hook should not close any tasks');
+    assert(orphanEvents.length === 1, 'Orphaned hook should emit binding_orphaned event');
   });
 });
 
