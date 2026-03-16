@@ -1,7 +1,7 @@
 /**
  * Task DAG Plugin - OpenClaw 动态任务图编排系统
  * 
- * 阶段三：子 Agent 调度与等待机制
+ * 方案 A：运行时对齐的 DAG / binding / hook / continuation 编排插件
  */
 import { registerTaskDagTools } from "./src/tools.js";
 import { registerTaskDagHooks } from "./src/hooks.js";
@@ -15,5 +15,5 @@ export default function register(api: any) {
   // 注册 Hooks
   registerTaskDagHooks(api);
   
-  api.logger.info("Task DAG tools registered: 12 tools + hooks");
+  api.logger.info("Task DAG tools registered: DAG tools + execution tools + continuation tools + hooks");
 }

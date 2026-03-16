@@ -1,7 +1,7 @@
 {
   "id": "task-dag",
   "name": "Task DAG",
-  "description": "Dynamic task DAG orchestration system with sub-agent execution",
+  "description": "Task DAG orchestration plugin with subagent bindings, hook-based cleanup, and parent-session continuation",
   "skills": ["./skills"],
   "configSchema": {
     "type": "object",

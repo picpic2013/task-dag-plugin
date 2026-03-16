@@ -1,262 +1,162 @@
 ---
 name: task-dag
-description: "Task DAG for complex multi-step tasks with dependency management, automatic sub-agent tracking. Use when: parallel execution, dependency chains, task orchestration."
+description: "Use for complex task orchestration with DAG dependencies, subagent bindings, deterministic hook cleanup, and parent-session continuation."
 ---
 
 # Task DAG
 
-> Use when: complex multi-step tasks, parallel execution, dependency management.
+当任务同时满足以下任一条件时，应使用这个 skill：
 
-**When to use:** Complex multi-step tasks, parallel execution, dependency management.
+- 需要显式的任务拆分和依赖关系
+- 需要多个子 agent 并行工作
+- 需要父 agent 和子 agent 混合执行
+- 需要在子 agent 完成后，让父会话继续处理并可能继续给用户发消息
+- 需要尽量减少对模型记忆协议的依赖
 
----
+## 核心原则
 
-## Quick Start
+1. 优先使用插件提供的高层工具，不要自己拼低层协议。
+2. 不要把 `task_dag_wait` 当成阻塞工具。
+3. 父会话的“继续”使用 `task_dag_continue`，不是恢复旧工具调用。
+4. 子 agent 完成后的状态推进主要依赖 hook 和 pending events。
+5. 只有在需要兼容旧流程时才使用 `task_dag_update`、`task_dag_notify` 这类旧接口。
 
-```bash
-# Create tasks with dependencies
-task_dag_create name="项目" tasks=[{id:"t1",name:"任务1"},{id:"t2",dependencies:["t1"]}]
+## 当前推荐流程
 
-# Spawn sub-agent (IMPORTANT: include label!)
-sessions_spawn task="执行任务1" label="task:t1"
-
-# Must wait for completion
-task_dag_wait task_id="t1"
-
-# Check result - status updated automatically!
-task_dag_show
-```
-
----
-
-## Key Features
-
-- DAG dependency management
-- Auto sub-agent lifecycle tracking  
-- Automatic status updates (as fallback)
-- Event logging
-
----
-
-## Important Rules
-
-1. Always use `label="task:TASK_ID"` when spawning
-2. Always call `task_dag_wait` after spawning
-3. **ALWAYS update task status proactively** - do NOT rely on auto-end as primary mechanism
-4. Use `task_dag_update` to report progress and completion
-
----
-
-## Task Status Update Rules (IMPORTANT)
-
-**Always proactively update task status - don't rely on auto-end as primary mechanism!**
-
-### When to Update
-
-| Stage | Action | Example |
-|-------|--------|---------|
-| **Start** | Set status to `running` | `task_dag_update task_id="t1" status="running"` |
-| **Progress** | Update progress & log | `task_dag_update task_id="t1" progress=50 log={"message": "完成50%"}` |
-| **Complete** | Set status to `done` | `task_dag_update task_id="t1" status="done" output_summary="最终结果"` |
-| **Error** | Set status to `failed` | `task_dag_update task_id="t1" status="failed" output_summary="错误原因"` |
-
-### Why Proactive Updates?
-
-1. **Accuracy**: You know exactly when a milestone is reached
-2. **Visibility**: Progress is visible to the main agent immediately
-3. **Fallback**: The `subagent_ended` hook auto-marks as `done` only as a safety net
-
-### Auto-End Fallback
-
-The system will automatically mark the task as `done` when the sub-agent ends (via `subagent_ended` hook). **This is only a fallback** - always update status proactively for accuracy.
-
-### Example Flow
+### 父 agent 直接执行 task
 
 ```bash
-# 1. Start - mark as running
-task_dag_update task_id="t1" status="running"
-
-# 2. Progress - update milestones
-task_dag_update task_id="t1" progress=25 log={"message": "完成数据收集"}
-task_dag_update task_id="t1" progress=50 log={"message": "完成数据分析"}
-task_dag_update task_id="t1" progress=75 log={"message": "完成报告撰写"}
-
-# 3. Complete - mark as done with output
-task_dag_update task_id="t1" status="done" output_summary="报告已生成: report.pdf"
+task_dag_claim task_id="t1" executor_type="parent"
+task_dag_progress task_id="t1" progress=40 message="处理中"
+task_dag_complete task_id="t1" output_summary="已完成"
+task_dag_continue task_id="t1"
 ```
 
----
-
-## Wait Function Principle
-
-**Required:** After spawning a sub-agent, you MUST call `task_dag_wait`.
-
-**Flow:**
-```
-sessions_spawn(task="...", label="task:t1")
-         ↓
-task_dag_wait(task_id="t1")
-         ↓
-[Polling loop: check notification queue → check task status → timeout]
-         ↓
-Return: completed | failed | notified | timeout
-```
-
----
-
-## Commands
-
-### create
-```
-task_dag_create name="项目" tasks=[{name:"任务1"},{name:"任务2",dependencies:["t1"]}]
-```
-
-### show
-```
-task_dag_show
-```
-
-### ready
-```
-task_dag_ready
-```
-
-### get
-```
-task_dag_get t1
-```
-
-### update
-```
-task_dag_update task_id="t1" status="running" progress=50
-task_dag_update task_id="t1" status="done" progress=100 output_summary="完成"
-```
-Parameters: task_id, status (pending/running/done/failed/cancelled), progress (0-100), output_summary
-
-### modify (add/remove)
-```
-# Add new task
-task_dag_modify action="add" task={"name":"新任务","assigned_agent":"scout"}
-
-# Remove task
-task_dag_modify action="remove" task_id="t1"
-```
-
-### subtask_create
-```
-task_dag_subtask_create parent_id="t1" task={"name":"子任务","assigned_agent":"writer"}
-```
-
-### subtask_list
-```
-task_dag_subtask_list t1
-```
-
-### context
-```
-task_dag_context t1
-```
-Returns: task info + dependency outputs.
-
-### resume
-```
-task_dag_resume t1
-```
-Reset task and downstream tasks to pending.
-
-### logs
-```
-task_dag_logs t1
-task_dag_logs t1 "2026-01-01T00:00:00Z"
-```
-
-### set_doc / get_doc
-```
-task_dag_set_doc task_id="t1" content="# 文档内容"
-task_dag_get_doc t1
-```
-
-### wait
-```
-task_dag_wait t1
-task_dag_wait task_id="t1" timeout=3600
-```
-Returns: completed/failed/notified/timeout. After timeout, check sub-agent status and wait again if needed.
-
-### notify
-```
-task_dag_notify task_id="t1" message="进度50%" type="progress"
-```
-
----
-
-## Sub-agent Context
-
-Sub-agents can access task context:
-```
-task_dag_context t1
-```
-Returns: task info + dependency outputs.
-
----
-
-## Splitting Tasks (Subtasks)
-
-For complex tasks, sub-agents can create subtasks under a parent task:
+### 子 agent 执行单个 task
 
 ```bash
-# Sub-agent creates subtasks under t1
-task_dag_subtask_create parent_id="t1" task={"name":"竞品分析"}
-task_dag_subtask_create parent_id="t1" task={"name":"用户访谈"}
+task_dag_spawn task_id="t1" task="完成这个子任务" target_agent_id="worker"
 
-# View subtasks
-task_dag_subtask_list t1
+# 父会话后续新一轮里
+task_dag_continue task_id="t1"
 ```
 
-Result:
-```
-t1 (parent)
-├── t1_1 (竞品分析)
-└── t1_2 (用户访谈)
-```
+### 一个子 agent 处理多个 task
 
-**Note:** Subtasks automatically belong to the parent task's DAG. No need to create a new DAG.
-
----
-
-## Event Logging
-
-Automatic. Events stored in parent agent's workspace.
-
----
-
-## Markdown Docs
-
-Use standard read/write tools for markdown files. Task references doc_path.
-
----
-
-## Examples
-
-### Complete Flow
 ```bash
-task_dag_create "项目" tasks=[{id:"t1",name:"任务1"},{id:"t2",dependencies:["t1"]}]
-sessions_spawn task="做任务1" label="task:t1"
-task_dag_wait t1
-# t1 done automatically!
-task_dag_show
+task_dag_spawn task_id="t1" task="先做第一个任务" target_agent_id="worker"
+task_dag_assign run_id="run-xxx" task_ids=["t2","t3"] executor_agent_id="worker"
+task_dag_continue run_id="run-xxx"
 ```
 
-### With Multiple Tasks
+## 工具选择
+
+### DAG 与查询
+
+- `task_dag_create`
+- `task_dag_show`
+- `task_dag_ready`
+- `task_dag_get`
+- `task_dag_context`
+- `task_dag_logs`
+- `task_dag_resume`
+
+### 父执行
+
+- `task_dag_claim`
+- `task_dag_progress`
+- `task_dag_complete`
+- `task_dag_fail`
+
+### 子执行
+
+- `task_dag_spawn`
+- `task_dag_assign`
+
+### 继续与恢复
+
+- `task_dag_wait`
+  - 非阻塞检查
+- `task_dag_poll_events`
+  - 查看未消费事件
+- `task_dag_ack_event`
+  - 手工确认事件
+- `task_dag_continue`
+  - 让父会话决定继续等待、触发下游还是回复用户
+- `task_dag_reconcile`
+  - 修复 hook 时序差异、孤儿 binding、半完成状态
+
+## 如何判断是否该给用户回复
+
+优先用 `task_dag_continue`，不要自己猜。
+
+它会返回：
+
+- `action="continue_waiting"`
+  - 还有 active bindings，继续等
+- `action="trigger_downstream"`
+  - 新的下游任务 ready 了，继续 DAG
+- `action="user_reply"`
+  - 有新的终态事件，适合给用户输出
+- `action="idle"`
+  - 没有新的 continuation 动作
+
+还会返回：
+
+- `completed_task_ids`
+- `failed_task_ids`
+- `ready_task_ids`
+- `waiting_task_ids`
+- `summary`
+
+## 兼容层说明
+
+### `task_dag_wait`
+
+旧行为：
+
+- 阻塞轮询直到完成
+
+现行为：
+
+- 立即返回 `waiting / completed / failed / notified`
+
+因此：
+
+- 不要在 prompt 里写“spawn 后必须 wait 到结束”
+- 应该写“spawn 后由 runtime auto-announce + task_dag_continue 继续”
+
+### `task_dag_update`
+
+仍可用，但更推荐：
+
+- `task_dag_claim`
+- `task_dag_progress`
+- `task_dag_complete`
+- `task_dag_fail`
+
+## 推荐实践
+
+1. 创建 DAG 后，先看 `task_dag_ready`。
+2. 父 agent 能自己完成的 task，就直接 claim/progress/complete。
+3. 只有确实需要并行或隔离执行时，才用 `task_dag_spawn`。
+4. 如果一个 worker 要连续做多个 task，用 `task_dag_assign` 绑定到同一 run/session。
+5. 子 agent 完成后，父会话在下一轮使用 `task_dag_continue`。
+6. 如果 hook 或时序看起来不一致，使用 `task_dag_reconcile`。
+
+## 反模式
+
+不要这样做：
+
 ```bash
-task_dag_create "项目" tasks=[{id:"t1",name:"收集"},{id:"t2",name:"分析",dependencies:["t1"]},{id:"t3",name:"报告",dependencies:["t2"]}]
-# t1 ready
-sessions_spawn task="收集信息" label="task:t1"
-task_dag_wait t1
-# t2 ready
-sessions_spawn task="分析" label="task:t2"
-task_dag_wait t2
-# t3 ready
-sessions_spawn task="写报告" label="task:t3"
-task_dag_wait t3
+sessions_spawn task="..." label="task:t1"
+task_dag_wait task_id="t1"   # 当作阻塞工具
 ```
+
+不要把这些职责压给模型记忆：
+
+- 记住某个 session 到底对应哪个 task
+- 自己猜某个 task 属于哪个 DAG
+- 自己判断多个 completion 哪一个该给用户输出
+
+这些应优先交给插件的 binding、hook 和 continuation 工具。

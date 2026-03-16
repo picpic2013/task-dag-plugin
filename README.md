@@ -1,171 +1,225 @@
-# Task DAG - 任务编排与子Agent调度器
+# Task DAG
 
-> 🎯 为复杂多步骤任务提供 DAG 依赖管理 + 自动子Agent追踪
+Task DAG 是一个面向 OpenClaw 的任务编排插件，用来管理复杂任务的 DAG、子 agent 分工、事件收尾和父会话继续处理。
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![OpenClaw](https://img.shields.io/badge/OpenClaw-Skill-blue)](https://openclaw.ai)
-[![Version](https://img.shields.io/badge/Version-0.3.0-brightgreen)]()
-[![ClawdHub](https://img.shields.io/badge/ClawdHub-v0.3.0-brightgreen)](https://www.clawhub.ai)
+当前实现已经完成方案 A 的前六个里程碑中的前五个，并完成了里程碑 06 的文档与迁移收口。核心运行模型已经从“阻塞 wait + 模型自觉维护状态”切换到“binding + hook + pending events + parent continuation”。
 
----
+## 当前运行模型
 
-## ✨ 为什么需要 Task DAG？
+推荐流程不是：
 
-当你的 Agent 需要处理复杂的多步骤任务时：
-
-- 🔀 **任务依赖** - 任务B需要等任务A完成后才能开始
-- 🔄 **并行执行** - 多个独立任务可以同时处理
-- 🤖 **子Agent管理** - 需要 Spawn 多个子Agent并行工作
-- 📊 **进度追踪** - 每个任务的完成度需要实时可见
-- 🔔 **完成通知** - 任务完成时需要自动通知
-
-**Task DAG 就是为解决这些问题而生的。**
-
----
-
-## 🎯 核心功能
-
-### 1️⃣ DAG 依赖管理
-
-支持任务之间的依赖关系，自动计算执行顺序：
-
-```
-A ──┐
-     ├──→ C ──→ D
-B ──┘
+```text
+sessions_spawn -> task_dag_wait(阻塞轮询)
 ```
 
-| 命令 | 说明 |
-|------|------|
-| `task_dag_create` | 创建任务 DAG |
-| `task_dag_ready` | 获取可执行的任务 |
-| `task_dag_resume` | 重置任务及下游任务 |
+而是：
 
-### 2️⃣ 自动子Agent生命周期追踪
+```text
+task_dag_spawn
+-> runtime auto-announce / hook
+-> task_dag_continue
+-> 继续等待 / 触发下游 / 给用户回复
+```
 
-自动管理子Agent的Spawn、等待、完成通知：
+这意味着：
 
-| Hook | 说明 |
-|------|------|
-| `subagent_spawned` | 子Agent启动时自动关联任务 |
-| `subagent_ended` | 子Agent结束时自动更新任务状态 |
+- `task_dag_wait` 现在是非阻塞检查工具，不再在工具内部 `sleep`
+- 子 agent 完成后的收尾主要依赖 `subagent_spawned` / `subagent_ended` hook
+- 父会话继续输出依赖 `task_dag_continue` 消费 pending events
+- 一个子 agent 可以绑定多个 task
+- 父 agent 也可以直接 claim/complete/fail task，不必强制走子 agent
 
-### 3️⃣ 状态自动更新（兜底机制）
+## 核心能力
 
-当子Agent完成任务后，系统自动标记任务为 `done`：
+- DAG 任务状态机
+  - `pending / ready / running / waiting_subagent / waiting_children / done / failed / cancelled / blocked`
+- 子 agent 绑定层
+  - `task-bindings.json`
+  - `session-runs.json`
+  - `pending-events.jsonl`
+- hook 驱动收尾
+  - `subagent_spawned`
+  - `subagent_ended`
+- 父会话 continuation
+  - 单子任务完成后继续
+  - 多子任务汇总后再回复
+  - 重复 completion 去重
 
-- ✅ 任务成功完成 → 自动标记 `done`
-- ❌ 执行出错 → 自动标记 `failed`
+## 推荐工具
 
-**注意：建议主动调用 `task_dag_update` 更新状态，自动更新仅作为兜底。**
+创建与查询：
 
-### 4️⃣ 完整事件日志
+- `task_dag_create`
+- `task_dag_show`
+- `task_dag_ready`
+- `task_dag_get`
+- `task_dag_context`
+- `task_dag_logs`
+- `task_dag_resume`
 
-所有操作自动记录：
+父 agent 直接执行：
 
-- 任务创建/更新/完成
-- 子Agent启动/结束
-- 进度日志
+- `task_dag_claim`
+- `task_dag_progress`
+- `task_dag_complete`
+- `task_dag_fail`
 
----
+子 agent 执行：
 
-## 🚀 快速开始
+- `task_dag_spawn`
+- `task_dag_assign`
 
-### 创建任务
+事件与恢复：
+
+- `task_dag_wait`
+- `task_dag_poll_events`
+- `task_dag_ack_event`
+- `task_dag_continue`
+- `task_dag_reconcile`
+
+兼容层：
+
+- `task_dag_update`
+- `task_dag_modify`
+- `task_dag_subtask_create`
+- `task_dag_subtask_list`
+- `task_dag_set_doc`
+- `task_dag_get_doc`
+- `task_dag_notify`
+
+## 快速开始
+
+### 1. 创建 DAG
 
 ```bash
-# 创建依赖任务
-task_dag_create name="项目" tasks=[
-  {id:"t1",name:"任务1"},
-  {id:"t2",dependencies:["t1"],name:"任务2"}
+task_dag_create name="复杂项目" tasks=[
+  {id:"t1",name:"调研"},
+  {id:"t2",name:"分析",dependencies:["t1"]},
+  {id:"t3",name:"报告",dependencies:["t2"]}
 ]
 ```
 
-### Spawn 子Agent（重要：必须包含 label）
+### 2. 父 agent 直接执行
 
 ```bash
-# 启动子Agent执行任务1
-sessions_spawn task="执行任务1" label="task:t1"
-
-# 必须等待完成
-task_dag_wait task_id="t1"
-
-# 查看结果
-task_dag_show
+task_dag_claim task_id="t1" executor_type="parent" message="开始调研"
+task_dag_progress task_id="t1" progress=50 message="已完成一半资料收集"
+task_dag_complete task_id="t1" output_summary="调研已完成"
+task_dag_continue task_id="t1"
 ```
 
-### 更新任务状态
+### 3. 子 agent 执行单个任务
 
 ```bash
-# 开始执行
-task_dag_update task_id="t1" status="running"
+task_dag_spawn task_id="t2" task="完成分析工作并给出结论" target_agent_id="worker"
 
-# 进度更新
-task_dag_update task_id="t1" progress=50 log={"message": "完成50%"}
-
-# 任务完成
-task_dag_update task_id="t1" status="done" output_summary="最终结果"
+# 父会话在被 runtime 新一轮唤醒后继续
+task_dag_continue task_id="t2"
 ```
 
----
+### 4. 一个子 agent 处理多个任务
 
-## 📁 目录结构
-
-任务数据存储在 Agent 的 workspace 中：
-
+```bash
+task_dag_spawn task_id="t1" task="先做第一个子任务" target_agent_id="worker"
+task_dag_assign run_id="run-xxx" task_ids=["t2","t3"] executor_agent_id="worker"
+task_dag_continue run_id="run-xxx"
 ```
+
+## 子 agent 与父会话的协作方式
+
+### 单子任务
+
+```text
+task_dag_spawn
+-> subagent_spawned hook 建 binding
+-> subagent_ended hook 收尾
+-> task_dag_continue 读 completion event
+-> 父会话决定是否给用户回复
+```
+
+### 多子任务汇总
+
+```text
+多个 completion event 到达
+-> task_dag_continue 检查 active bindings
+-> 仍有未完成任务: continue_waiting
+-> 全部完成: user_reply
+```
+
+## 数据落盘
+
+任务数据存储在 agent 的 workspace 中：
+
+```text
 .openclaw/
-├── workspace-tasks/              # main agent
-│   └── {dag_id}/
+├── workspace/
+│   └── tasks/{dag_id}/
 │       ├── dag.json
+│       ├── task-bindings.json
+│       ├── session-runs.json
+│       ├── pending-events.jsonl
 │       └── events.jsonl
-│
-├── workspace-{agent_id}/         # 其他 agent
-│   └── {dag_id}/
-│       ├── dag.json
-│       └── events.jsonl
+└── workspace-{agent_id}/
+    └── tasks/{dag_id}/
+        ├── dag.json
+        ├── task-bindings.json
+        ├── session-runs.json
+        ├── pending-events.jsonl
+        └── events.jsonl
 ```
 
-| 文件 | 说明 |
-|------|------|
-| `dag.json` | DAG 定义和任务状态 |
-| `events.jsonl` | 事件日志 |
+文件说明：
 
----
+- `dag.json`
+  - DAG 定义、task 状态机、executor/waiting 元数据
+- `task-bindings.json`
+  - task 与 session/run 的绑定关系
+- `session-runs.json`
+  - run/session 的一对多任务视图
+- `pending-events.jsonl`
+  - 给父会话 continuation 消费的事件流
+- `events.jsonl`
+  - 审计和调试日志
 
-## 📖 详细文档
+## 兼容迁移
 
-完整使用说明请参考 [SKILL.md](SKILL.md)
+旧流程里最需要注意的变化有三点：
 
----
+1. `task_dag_wait` 不再阻塞
+2. 不再推荐手工 `sessions_spawn + task:t1 + wait`
+3. 新主流程是 `task_dag_spawn + task_dag_continue`
 
-## 🔗 相关链接
+旧用法不会立刻完全失效，但语义已经变化：
 
-- **📦 ClawdHub**: https://www.clawhub.ai
-- **🐙 GitHub**: https://github.com/picpic2013/task-dag-plugin
-- **📚 OpenClaw Docs**: https://docs.openclaw.ai
+- 旧 `task_dag_wait`
+  - 现在只做即时检查，返回 `waiting / completed / failed / notified`
+- 旧 `task_dag_update`
+  - 仍可用，但推荐逐步迁移到 `claim/progress/complete/fail`
+- 旧 `session -> task` 映射
+  - 仍保留兼容，但主逻辑已迁到 binding 层
 
----
+详细迁移说明见 [MIGRATION.md](/root/workspace/task-dag-project/task-dag-plugin/MIGRATION.md)。
 
-## 📝 任务状态更新规则（重要）
+## 测试状态
 
-| 阶段 | 操作 | 示例 |
-|------|------|------|
-| **开始** | 设置 status=running | `task_dag_update task_id="t1" status="running"` |
-| **进度** | 更新 progress 和 log | `task_dag_update task_id="t1" progress=50 log={"message": "完成50%"}` |
-| **完成** | 设置 status=done | `task_dag_update task_id="t1" status="done" output_summary="最终结果"` |
-| **失败** | 设置 status=failed | `task_dag_update task_id="t1" status="failed" output_summary="错误原因"` |
+当前本地回归覆盖了：
 
----
+- 父 agent 直接完成 task
+- 单子 agent 单任务
+- 单 session 多任务
+- 多 session 并发
+- hook 收尾
+- orphan binding
+- 父会话 continuation
+- 重复 completion 去重
 
-## ⚠️ 重要规则
+验证命令：
 
-1. **Spawn 时必须指定 label** - 使用 `label="task:TASK_ID"` 关联任务
-2. **Spawn 后必须调用 wait** - 使用 `task_dag_wait` 等待任务完成
-3. **主动更新状态** - 不要依赖自动完成机制，主动调用 `task_dag_update`
+```bash
+npm run build
+node test_runner.mjs
+```
 
----
+## Skill
 
-## 📄 许可证
-
-MIT License - 详见 [LICENSE](LICENSE)
+使用说明见 [SKILL.md](/root/workspace/task-dag-project/task-dag-plugin/skills/task-dag/SKILL.md)。
