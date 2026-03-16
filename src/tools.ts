@@ -29,51 +29,30 @@ type RuntimeFacade = {
 };
 
 /**
- * 从上下文和参数获取 agent ID
- * 优先级：
- * 1. 显式的 parent_agent_id 参数 (子 agent 继承父 agent)
- * 2. 显式的 agent_id 参数 (工具调用时传递)
- * 3. 显式的 agent.id / agentId (context)
- * 4. session key (基于 session key 生成唯一 ID)
- * 5. runtime.model (区分不同模型)
- * 6. 默认值 'main'
+ * 从工具参数获取 agent ID。
+ * 工具层不再假设存在 runtime session/context，只认显式参数。
  */
-function getAgentIdFromContext(context: any, params?: any): string | null {
-  // 合并 context 和 params，params 优先
-  const args = { ...context, ...params };
-
-  // 1. 优先使用 parent_agent_id (子 agent 继承父 agent 目录)
-  const parentAgentId = args?.parent_agent_id;
+function getAgentIdFromToolParams(params?: any): string | null {
+  const parentAgentId = params?.parent_agent_id;
   if (parentAgentId) {
     return parentAgentId;
   }
 
-  // 2. 尝试从 agent_id 参数获取
-  const agentIdParam = args?.agent_id;
+  const agentIdParam = params?.agent_id;
   if (agentIdParam) {
     return agentIdParam;
-  }
-
-  // 3. 尝试从显式字段获取
-  const explicitAgentId = args?.agent?.id 
-    || args?.agentId 
-    || args?.session?.agentId 
-    || args?.runtime?.agentId;
-  if (explicitAgentId) {
-    return explicitAgentId;
   }
   return null;
 }
 
-function setExecutionContext(
-  context: any,
+function setToolExecutionContext(
   params?: any,
   options: { requireAgent?: boolean; requireDag?: boolean; allowDefaultMain?: boolean } = {}
 ): { agentId: string; dagId?: string } {
-  const agentId = getAgentIdFromContext(context, params) || (options.allowDefaultMain ? 'main' : null);
-  const dagId = params?.dag_id || context?.dag_id || context?.dagId || dag.getCurrentDagId() || undefined;
+  const agentId = getAgentIdFromToolParams(params) || (options.allowDefaultMain ? 'main' : null);
+  const dagId = params?.dag_id || dag.getCurrentDagId() || undefined;
   if (options.requireAgent !== false && !agentId) {
-    throw new Error('Explicit agent context is required. Provide agent_id, parent_agent_id, or runtime agent context.');
+    throw new Error('Explicit agent context is required. Provide agent_id or parent_agent_id.');
   }
   if (options.requireDag && !dagId) {
     throw new Error('Explicit dag context is required. Provide dag_id or create/select a DAG before calling this tool.');
@@ -126,16 +105,13 @@ function extractSpawnResult(spawnResult: any): { sessionKey?: string; runId?: st
   };
 }
 
-function getRequesterSessionKey(context: any, params?: any): string | undefined {
-  return params?.requester_session_key
-    || context?.session?.key
-    || context?.sessionKey
-    || context?.requesterSessionKey;
+function getRequesterSessionKey(params?: any): string | undefined {
+  return params?.requester_session_key;
 }
 
 export async function claimTaskExecution(params: any, context?: any) {
   try {
-    const { agentId, dagId } = setExecutionContext(context, params, { requireDag: true });
+    const { agentId, dagId } = setToolExecutionContext(params, { requireDag: true });
     const { task_id, executor_type = 'parent', session_key, run_id } = params;
     const taskResult = getTaskOrError(task_id);
     if ('error' in taskResult) {
@@ -177,7 +153,7 @@ export async function claimTaskExecution(params: any, context?: any) {
 
 export async function reportTaskProgress(params: any, context?: any) {
   try {
-    const { agentId, dagId } = setExecutionContext(context, params, { requireDag: true });
+    const { agentId, dagId } = setToolExecutionContext(params, { requireDag: true });
     const { task_id, progress, message } = params;
     const taskResult = getTaskOrError(task_id);
     if ('error' in taskResult) {
@@ -230,7 +206,7 @@ function completeBindingsForTask(
 
 export async function completeTaskExecution(params: any, context?: any) {
   try {
-    const { agentId, dagId } = setExecutionContext(context, params, { requireDag: true });
+    const { agentId, dagId } = setToolExecutionContext(params, { requireDag: true });
     const { task_id, output_summary, session_key, run_id } = params;
     const taskResult = getTaskOrError(task_id);
     if ('error' in taskResult) {
@@ -266,7 +242,7 @@ export async function completeTaskExecution(params: any, context?: any) {
 
 export async function failTaskExecution(params: any, context?: any) {
   try {
-    const { agentId, dagId } = setExecutionContext(context, params, { requireDag: true });
+    const { agentId, dagId } = setToolExecutionContext(params, { requireDag: true });
     const { task_id, message, session_key, run_id } = params;
     const taskResult = getTaskOrError(task_id);
     if ('error' in taskResult) {
@@ -306,7 +282,7 @@ export async function spawnTaskExecution(runtime: RuntimeFacade, params: any, co
   delete contextParams.agentId;
   delete contextParams.target_agent_id;
   try {
-    const { agentId, dagId } = setExecutionContext(context, contextParams, { requireDag: true });
+    const { agentId, dagId } = setToolExecutionContext(contextParams, { requireDag: true });
     const { task_id, task, prompt, model, label, thread, mode, runtime: runtimeMode } = params;
     const taskResult = getTaskOrError(task_id);
     if ('error' in taskResult) {
@@ -323,7 +299,7 @@ export async function spawnTaskExecution(runtime: RuntimeFacade, params: any, co
     const dagIdToUse = dagId || dag.getCurrentDagId() || 'default';
     const spawnLabel = label || `task:${task_id}`;
     const spawnTaskText = task || prompt;
-    const requesterSessionKey = getRequesterSessionKey(context, params);
+    const requesterSessionKey = getRequesterSessionKey(params);
     if (!spawnTaskText) {
       return { error: 'task or prompt is required' };
     }
@@ -420,7 +396,7 @@ export async function spawnTaskExecution(runtime: RuntimeFacade, params: any, co
 
 export async function assignTasksToSession(params: any, context?: any) {
   try {
-    const { agentId, dagId } = setExecutionContext(context, params, { requireDag: true });
+    const { agentId, dagId } = setToolExecutionContext(params, { requireDag: true });
     const dagIdToUse = dagId || dag.getCurrentDagId() || 'default';
     const { task_ids, session_key, run_id, executor_agent_id } = params;
     if (!Array.isArray(task_ids) || task_ids.length === 0) {
@@ -505,7 +481,7 @@ export async function assignTasksToSession(params: any, context?: any) {
 
 export async function pollTaskEvents(params: any, context?: any) {
   try {
-    const { agentId, dagId } = setExecutionContext(context, params, { requireDag: true });
+    const { agentId, dagId } = setToolExecutionContext(params, { requireDag: true });
     const events = listPendingEvents({
       type: params.type,
       task_id: params.task_id,
@@ -526,7 +502,7 @@ export async function pollTaskEvents(params: any, context?: any) {
 
 export async function ackTaskEvent(params: any, context?: any) {
   try {
-    const { agentId, dagId } = setExecutionContext(context, params, { requireDag: true });
+    const { agentId, dagId } = setToolExecutionContext(params, { requireDag: true });
     const event = consumePendingEvent(params.event_id, { agentId, dagId });
     if (!event) {
       return { error: `Event ${params.event_id} not found` };
@@ -539,7 +515,7 @@ export async function ackTaskEvent(params: any, context?: any) {
 
 export async function reconcileTaskDagState(params: any, context?: any) {
   try {
-    const { agentId, dagId } = setExecutionContext(context, params, { requireDag: true });
+    const { agentId, dagId } = setToolExecutionContext(params, { requireDag: true });
     const dagData = dag.loadDAG();
     if (!dagData) {
       return { error: 'No DAG exists. Use createDAG first.' };
@@ -654,7 +630,7 @@ function selectContinuationEventsToConsume(
 export async function continueParentSession(params: any, context?: any) {
   let executionContext: { agentId: string; dagId?: string };
   try {
-    executionContext = setExecutionContext(context, params, { requireDag: true });
+    executionContext = setToolExecutionContext(params, { requireDag: true });
   } catch (error: any) {
     return { error: error.message };
   }
@@ -670,7 +646,7 @@ export async function continueParentSession(params: any, context?: any) {
   } catch (error: any) {
     return { error: error.message };
   }
-  const requesterSessionKey = getRequesterSessionKey(context, params);
+  const requesterSessionKey = getRequesterSessionKey(params);
   if (requesterSessionKey && dagId) {
     upsertRequesterSessionScope({
       requester_session_key: requesterSessionKey,
@@ -827,7 +803,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
     execute: async (_toolCallId, params: any) => {
       try {
         // 创建 DAG 时必须显式指定 agent 归属，不能静默回退到 main
-        const { agentId } = setExecutionContext({}, params, { requireAgent: true });
+        const { agentId } = setToolExecutionContext(params, { requireAgent: true });
         
         // 解析 name 参数
         const dagName = params.name || params.project_name || params.title || 'Untitled';
@@ -877,7 +853,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
       }
     },
     execute: async (_toolCallId, params: any) => {
-      const { agentId } = setExecutionContext({}, params);
+      const { agentId } = setToolExecutionContext(params);
       const mermaid = dag.showProgress();
       const stats = dag.getStats();
       return { mermaid, stats, agent_id: agentId };
@@ -896,7 +872,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
       }
     },
     execute: async (_toolCallId, params: any) => {
-      const { agentId } = setExecutionContext({}, params);
+      const { agentId } = setToolExecutionContext(params);
       const tasks = dag.getReadyTasks();
       return {
         agent_id: agentId,
@@ -923,7 +899,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
       required: ["task_id"]
     },
     execute: async (_toolCallId, params: any) => {
-      const { agentId } = setExecutionContext({}, params);
+      const { agentId } = setToolExecutionContext(params);
       const task = dag.getTask(params.task_id);
       if (!task) {
         return { error: `Task ${params.task_id} not found` };
@@ -1012,7 +988,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
       required: ["action"]
     },
     execute: async (_toolCallId, params: any) => {
-      setExecutionContext({}, params);
+      setToolExecutionContext(params);
       const { action, task_id, task } = params;
       
       try {
@@ -1089,7 +1065,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
       required: ["parent_id", "task"]
     },
     execute: async (_toolCallId, params: any) => {
-      setExecutionContext({}, params);
+      setToolExecutionContext(params);
       const subtask = dag.addSubtask(params.parent_id, params.task);
       if (!subtask) {
         return { error: `Parent task ${params.parent_id} not found` };
@@ -1115,7 +1091,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
       required: ["task_id"]
     },
     execute: async (_toolCallId, params: any) => {
-      setExecutionContext({}, params);
+      setToolExecutionContext(params);
       const subtasks = dag.getSubtasks(params.task_id);
       return {
         subtasks: subtasks.map(t => ({
@@ -1141,7 +1117,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
       required: ["task_id"]
     },
     execute: async (_toolCallId, params: any) => {
-      setExecutionContext({}, params);
+      setToolExecutionContext(params);
       const taskCtx = dag.getContext(params.task_id);
       if (!taskCtx) {
         return { error: `Task ${params.task_id} not found` };
@@ -1173,7 +1149,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
       required: ["task_id"]
     },
     execute: async (_toolCallId, params: any) => {
-      setExecutionContext({}, params);
+      setToolExecutionContext(params);
       const reset = dag.resumeFrom(params.task_id);
       return {
         success: true,
@@ -1197,7 +1173,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
       required: ["task_id"]
     },
     execute: async (_toolCallId, params: any) => {
-      setExecutionContext({}, params);
+      setToolExecutionContext(params);
       const logs = dag.getLogs(params.task_id, params.since);
       return { logs };
     }
@@ -1217,7 +1193,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
       required: ["task_id", "content"]
     },
     execute: async (_toolCallId, params: any) => {
-      setExecutionContext({}, params);
+      setToolExecutionContext(params);
       const docPath = dag.setTaskDoc(params.task_id, params.content);
       if (!docPath) {
         return { error: `Task ${params.task_id} not found` };
@@ -1239,7 +1215,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
       required: ["task_id"]
     },
     execute: async (_toolCallId, params: any) => {
-      setExecutionContext({}, params);
+      setToolExecutionContext(params);
       const content = dag.getTaskDoc(params.task_id);
       const task = dag.getTask(params.task_id);
       if (!task) {
