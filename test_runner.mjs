@@ -490,21 +490,6 @@ test('task_dag_assign binds multiple tasks to the same session run', async () =>
   });
 });
 
-test('task_dag_wait is non-blocking and reports notifications', async () => {
-  await withTempWorkspace('tool-wait', async () => {
-    dag.createDAG('tool-wait', [{ id: 't1', name: 'Wait me' }]);
-    notification.addNotification('t1', {
-      type: 'progress',
-      message: 'halfway',
-      timestamp: new Date().toISOString(),
-      agent_id: 'worker',
-    });
-
-    const result = await tools.checkTaskWaitStatus({ task_id: 't1' }, {});
-    assert(result.status === 'notified', 'Wait should return notified immediately');
-  });
-});
-
 test('task_dag_poll_events and ack_event expose deterministic event consumption', async () => {
   await withTempWorkspace('tool-events', async () => {
     dag.createDAG('tool-events', [{ id: 't1', name: 'Events task' }]);
@@ -941,6 +926,21 @@ test('compatibility helpers can operate on a non-main agent DAG', async () => {
     await resumeTool.execute({ task_id: 't1', dag_id: created.id }, { agent_id: 'worker-parent' });
     assert(dag.getTask('t1')?.status === 'ready', 'Resume tool should mutate the non-main agent DAG');
   });
+});
+
+test('deprecated tools are no longer registered', async () => {
+  const registeredTools = {};
+  tools.registerTaskDagTools({
+    logger: { info() {}, warn() {}, error() {} },
+    registerTool(tool) { registeredTools[tool.name] = tool; },
+    registerHook() {},
+    runtime: {},
+    config: {},
+  });
+
+  assert(!registeredTools['task_dag_wait'], 'task_dag_wait should be removed');
+  assert(!registeredTools['task_dag_update'], 'task_dag_update should be removed');
+  assert(!registeredTools['task_dag_notify'], 'task_dag_notify should be removed');
 });
 
 for (const { name, fn } of tests) {

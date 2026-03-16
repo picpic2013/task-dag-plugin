@@ -299,29 +299,10 @@ export function saveSessionMapping(
   }
 }
 
-/**
- * 通过 sessionKey 获取 taskId
- */
-export function getTaskBySession(sessionKey: string): string | null {
-  const currentDagId = getCurrentDagId() || 'default';
-  const bindings = listTaskBindings({ session_key: sessionKey, binding_status: 'active' }, { dagId: currentDagId });
-  if (bindings.length > 0) {
-    return bindings[0].task_id;
-  }
-
-  const mappings = loadSessionMappings();
-  return mappings.sessions[sessionKey]?.taskId || null;
-}
-
 export function getTasksBySession(sessionKey: string): string[] {
   const currentDagId = getCurrentDagId() || 'default';
   const bindings = listTaskBindings({ session_key: sessionKey }, { dagId: currentDagId });
-  if (bindings.length > 0) {
-    return bindings.map(binding => binding.task_id);
-  }
-
-  const taskId = getTaskBySession(sessionKey);
-  return taskId ? [taskId] : [];
+  return bindings.map(binding => binding.task_id);
 }
 
 /**

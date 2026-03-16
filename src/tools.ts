@@ -6,7 +6,6 @@
 
 import type { OpenClawPluginApi } from "./plugin-sdk.js";
 import * as dag from './dag.js';
-import { getParentAgentId, getParentSessionKey } from './agent.js';
 import {
   appendPendingEvent,
   attachTaskToSessionRun,
@@ -21,7 +20,6 @@ import {
   upsertTaskBinding,
 } from './bindings.js';
 import * as waiter from './waiter.js';
-import * as notificationModule from './notification.js';
 import type { PendingEvent } from './bindings.js';
 
 type RuntimeFacade = {
@@ -118,17 +116,6 @@ function hashString(str: string): string {
     hash = hash & hash; // Convert to 32bit integer
   }
   return Math.abs(hash).toString(36);
-}
-
-/**
- * 执行工具并自动设置 Agent 上下文
- */
-function executeWithAgent(executeFn: (params: any) => Promise<any>) {
-  return async (params: any, context?: any) => {
-    const agentId = getAgentIdFromContext(context, params);
-    dag.setCurrentAgentId(agentId);
-    return executeFn(params);
-  };
 }
 
 function setExecutionContext(context: any, params?: any): { agentId: string; dagId?: string } {
@@ -466,48 +453,6 @@ export async function assignTasksToSession(params: any, context?: any) {
     session_key: sessionRun.child_session_key,
     run_id: sessionRun.run_id,
     assigned_task_ids: assigned,
-  };
-}
-
-export async function checkTaskWaitStatus(params: any, context?: any) {
-  const { agentId, dagId } = setExecutionContext(context, params);
-  const { task_id, timeout = 3600, register_waiter = true } = params;
-  const taskResult = getTaskOrError(task_id);
-  if ('error' in taskResult) {
-    return taskResult;
-  }
-
-  if (register_waiter) {
-    waiter.registerWaiting(agentId, task_id, timeout);
-  }
-
-  const notification = notificationModule.getAndClearNotification(task_id);
-  if (notification) {
-    waiter.unregisterWaiting(agentId);
-    return { status: 'notified', notification, agent_id: agentId };
-  }
-
-  const task = taskResult.task;
-  if (task.status === 'done') {
-    waiter.unregisterWaiting(agentId);
-    return { status: 'completed', output: task.output_summary, task, agent_id: agentId };
-  }
-  if (task.status === 'failed' || task.status === 'cancelled') {
-    waiter.unregisterWaiting(agentId);
-    return { status: 'failed', output: task.output_summary, task, agent_id: agentId };
-  }
-
-  const events = listPendingEvents({ task_id }, { agentId, dagId });
-  if (events.length > 0) {
-    return { status: 'notified', pending_events: events, task, agent_id: agentId };
-  }
-
-  return {
-    status: 'waiting',
-    block_reason: task.waiting_for?.kind || 'task_in_progress',
-    pending_children: task.waiting_for?.child_task_ids || [],
-    task,
-    agent_id: agentId,
   };
 }
 
@@ -965,55 +910,6 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
     }
   }, { optional: false });
 
-  // ========== task_dag_update ==========
-  api.registerTool({
-    name: "task_dag_update",
-    description: "Update task status, progress, and/or output. Supports progress reporting during execution.",
-    parameters: {
-      type: "object",
-      properties: {
-        task_id: { type: "string", description: "Task ID" },
-        agent_id: { type: "string", description: "指定 agent ID（可选）" },
-        dag_id: { type: "string", description: "DAG ID (optional)" },
-        status: { 
-          type: "string", 
-          enum: ["pending", "running", "done", "failed", "cancelled"],
-          description: "Task status" 
-        },
-        progress: { 
-          type: "number", 
-          minimum: 0, 
-          maximum: 100,
-          description: "Progress percentage (0-100)" 
-        },
-        output_summary: { type: "string", description: "Task output summary" },
-        log: {
-          type: "object",
-          properties: {
-            level: { type: "string", enum: ["info", "warn", "error"] },
-            message: { type: "string" },
-            progress: { type: "number" }
-          }
-        }
-      },
-      required: ["task_id"]
-    },
-    execute: async (params, context: any) => {
-      const args = { ...(context || {}), ...(params || {}) };
-      const { agentId } = setExecutionContext(context, params);
-      const { task_id, ...updates } = args;
-      const task = dag.updateTask(task_id, updates as any);
-      if (!task) {
-        return { error: `Task ${task_id} not found` };
-      }
-      return {
-        success: true,
-        agent_id: agentId,
-        mermaid: dag.showProgress()
-      };
-    }
-  }, { optional: false });
-
   // ========== task_dag_modify ==========
   api.registerTool({
     name: "task_dag_modify",
@@ -1380,23 +1276,6 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
 
   api.logger.info('[task-dag] All tools registered');
 
-  // ========== task_dag_wait ==========
-  api.registerTool({
-    name: "task_dag_wait",
-    description: "Non-blocking task wait check. Returns waiting, completed, failed, or notified.",
-    parameters: {
-      type: "object",
-      properties: {
-        task_id: { type: "string", description: "Task ID to wait for" },
-        dag_id: { type: "string", description: "DAG ID (optional)" },
-        timeout: { type: "number", description: "Wait registration timeout in seconds", default: 3600 },
-        register_waiter: { type: "boolean", description: "Whether to refresh waiter registration", default: true }
-      },
-      required: ["task_id"]
-    },
-    execute: async (params: any, context: any) => checkTaskWaitStatus(params, context)
-  }, { optional: false });
-
   api.registerTool({
     name: "task_dag_poll_events",
     description: "Read pending task-dag events without relying on model memory.",
@@ -1458,37 +1337,6 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
       }
     },
     execute: async (params: any, context: any) => reconcileTaskDagState(params, context)
-  }, { optional: false });
-
-  // ========== task_dag_notify ==========
-  api.registerTool({
-    name: "task_dag_notify",
-    description: "Notify the waiting agent about task progress, issues, or completion",
-    parameters: {
-      type: "object",
-      properties: {
-        task_id: { type: "string", description: "Task ID" },
-        dag_id: { type: "string", description: "DAG ID (optional)" },
-        message: { type: "string", description: "Notification message" },
-        type: { type: "string", enum: ["progress", "issue", "complete", "failed"], description: "Notification type" },
-        progress: { type: "number", description: "Progress percentage (0-100)" }
-      },
-      required: ["task_id", "message", "type"]
-    },
-    execute: async (params: any, context: any) => {
-      const { agentId } = setExecutionContext(context, params);
-      
-      const { task_id, message, type, progress } = params;
-      
-      const waiter = await import("./waiter.js");
-      const notificationModule = await import("./notification.js");
-      
-      notificationModule.addNotification(task_id, { type, message, timestamp: new Date().toISOString(), agent_id: agentId, progress });
-      
-      const waitingAgent = waiter.getWaitingAgent(task_id);
-      
-      return { success: true, delivered: !!waitingAgent, waiting_agent: waitingAgent };
-    }
   }, { optional: false });
 
 }

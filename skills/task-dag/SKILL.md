@@ -16,10 +16,9 @@ description: "Use for complex task orchestration with DAG dependencies, subagent
 ## 核心原则
 
 1. 优先使用插件提供的高层工具，不要自己拼低层协议。
-2. 不要把 `task_dag_wait` 当成阻塞工具。
-3. 父会话的“继续”使用 `task_dag_continue`，不是恢复旧工具调用。
-4. 子 agent 完成后的状态推进主要依赖 hook 和 pending events。
-5. 只有在需要兼容旧流程时才使用 `task_dag_update`、`task_dag_notify` 这类旧接口。
+2. 父会话的“继续”使用 `task_dag_continue`，不是恢复旧工具调用。
+3. 子 agent 完成后的状态推进主要依赖 hook 和 pending events。
+4. 不要使用已经移除的旧接口：`task_dag_wait`、`task_dag_update`、`task_dag_notify`。
 
 ## 当前推荐流程
 
@@ -75,8 +74,6 @@ task_dag_continue run_id="run-xxx"
 
 ### 继续与恢复
 
-- `task_dag_wait`
-  - 非阻塞检查
 - `task_dag_poll_events`
   - 查看未消费事件
 - `task_dag_ack_event`
@@ -109,26 +106,15 @@ task_dag_continue run_id="run-xxx"
 - `waiting_task_ids`
 - `summary`
 
-## 兼容层说明
+## 已移除接口
 
-### `task_dag_wait`
+以下旧接口已不再提供：
 
-旧行为：
+- `task_dag_wait`
+- `task_dag_update`
+- `task_dag_notify`
 
-- 阻塞轮询直到完成
-
-现行为：
-
-- 立即返回 `waiting / completed / failed / notified`
-
-因此：
-
-- 不要在 prompt 里写“spawn 后必须 wait 到结束”
-- 应该写“spawn 后由 runtime auto-announce + task_dag_continue 继续”
-
-### `task_dag_update`
-
-仍可用，但更推荐：
+状态推进只能通过：
 
 - `task_dag_claim`
 - `task_dag_progress`
@@ -150,7 +136,13 @@ task_dag_continue run_id="run-xxx"
 
 ```bash
 sessions_spawn task="..." label="task:t1"
-task_dag_wait task_id="t1"   # 当作阻塞工具
+```
+
+应改为：
+
+```bash
+task_dag_spawn task_id="t1" task="..."
+task_dag_continue task_id="t1"
 ```
 
 不要把这些职责压给模型记忆：
