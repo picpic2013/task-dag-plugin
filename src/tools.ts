@@ -10,6 +10,7 @@ import { getParentAgentId, getParentSessionKey } from './agent.js';
 import {
   appendPendingEvent,
   attachTaskToSessionRun,
+  consumePendingEvent,
   completeSessionRun,
   completeTaskBinding,
   getSessionRunByRunId,
@@ -21,6 +22,7 @@ import {
 } from './bindings.js';
 import * as waiter from './waiter.js';
 import * as notificationModule from './notification.js';
+import type { PendingEvent } from './bindings.js';
 
 type RuntimeFacade = {
   sessions_spawn?: (params: any) => Promise<any>;
@@ -528,7 +530,7 @@ export async function pollTaskEvents(params: any, context?: any) {
 
 export async function ackTaskEvent(params: any, context?: any) {
   const { agentId, dagId } = setExecutionContext(context, params);
-  const event = (await import('./bindings.js')).consumePendingEvent(params.event_id, { agentId, dagId });
+  const event = consumePendingEvent(params.event_id, { agentId, dagId });
   if (!event) {
     return { error: `Event ${params.event_id} not found` };
   }
@@ -559,6 +561,194 @@ export async function reconcileTaskDagState(params: any, context?: any) {
     success: true,
     reconciled,
     stats: dag.getStats(),
+  };
+}
+
+function getScopeSessionRun(params: any, context: { agentId: string; dagId?: string }) {
+  if (params.run_id) {
+    return getSessionRunByRunId(params.run_id, context);
+  }
+  if (params.session_key) {
+    return getSessionRunBySessionKey(params.session_key, context);
+  }
+  return null;
+}
+
+function getScopeTaskIds(params: any, context: { agentId: string; dagId?: string }): string[] {
+  const explicitTaskIds = Array.isArray(params.task_ids) ? params.task_ids : [];
+  if (explicitTaskIds.length > 0) {
+    return explicitTaskIds;
+  }
+  if (params.task_id) {
+    return [params.task_id];
+  }
+
+  const sessionRun = getScopeSessionRun(params, context);
+  if (sessionRun) {
+    return sessionRun.active_task_ids;
+  }
+
+  const dagData = dag.loadDAG();
+  if (!dagData) {
+    return [];
+  }
+  return Object.values(dagData.tasks)
+    .filter(task => task.executor?.type === 'subagent')
+    .map(task => task.id);
+}
+
+function matchesContinuationScope(event: PendingEvent, params: any, taskIds: string[]): boolean {
+  if (params.run_id && event.run_id !== params.run_id) {
+    return false;
+  }
+  if (params.session_key && event.session_key !== params.session_key) {
+    return false;
+  }
+  if (taskIds.length > 0 && event.task_id && !taskIds.includes(event.task_id)) {
+    return false;
+  }
+  return true;
+}
+
+function buildContinuationMessage(input: {
+  completedTaskIds: string[];
+  failedTaskIds: string[];
+  readyTaskIds: string[];
+  waitingTaskIds: string[];
+}): string {
+  const parts: string[] = [];
+  if (input.completedTaskIds.length > 0) {
+    parts.push(`completed: ${input.completedTaskIds.join(', ')}`);
+  }
+  if (input.failedTaskIds.length > 0) {
+    parts.push(`failed: ${input.failedTaskIds.join(', ')}`);
+  }
+  if (input.readyTaskIds.length > 0) {
+    parts.push(`ready: ${input.readyTaskIds.join(', ')}`);
+  }
+  if (input.waitingTaskIds.length > 0) {
+    parts.push(`waiting: ${input.waitingTaskIds.join(', ')}`);
+  }
+  return parts.length > 0 ? parts.join(' | ') : 'no new task updates';
+}
+
+export async function continueParentSession(params: any, context?: any) {
+  const executionContext = setExecutionContext(context, params);
+  const { agentId, dagId } = executionContext;
+  const taskIds = getScopeTaskIds(params, executionContext);
+  const sessionRun = getScopeSessionRun(params, executionContext);
+  const pendingEvents = listPendingEvents({ includeConsumed: false }, executionContext)
+    .filter(event => matchesContinuationScope(event, params, taskIds));
+
+  const completionEvents = pendingEvents.filter(
+    event =>
+      event.type === 'subagent_completed' ||
+      event.type === 'subagent_failed' ||
+      event.type === 'task_completed' ||
+      event.type === 'task_failed'
+  );
+  const readyEvents = pendingEvents.filter(event => event.type === 'task_ready');
+
+  const activeBindings = listTaskBindings({ binding_status: 'active' }, executionContext).filter(binding => {
+    if (params.run_id && binding.run_id !== params.run_id) return false;
+    if (params.session_key && binding.session_key !== params.session_key) return false;
+    if (taskIds.length > 0 && !taskIds.includes(binding.task_id)) return false;
+    return true;
+  });
+
+  const completedTaskIds = new Set<string>();
+  const failedTaskIds = new Set<string>();
+  const readyTaskIds = new Set<string>();
+  const waitingTaskIds = new Set<string>(activeBindings.map(binding => binding.task_id));
+
+  for (const taskId of taskIds) {
+    const task = dag.getTask(taskId);
+    if (!task) continue;
+    if (task.status === 'done') completedTaskIds.add(taskId);
+    if (task.status === 'failed' || task.status === 'cancelled') failedTaskIds.add(taskId);
+    if (task.status === 'ready') readyTaskIds.add(taskId);
+    if (task.status === 'waiting_subagent' || task.status === 'running') waitingTaskIds.add(taskId);
+  }
+
+  for (const event of completionEvents) {
+    if (!event.task_id) continue;
+    if (event.type === 'subagent_failed' || event.type === 'task_failed') {
+      failedTaskIds.add(event.task_id);
+      completedTaskIds.delete(event.task_id);
+    } else {
+      if (!failedTaskIds.has(event.task_id)) {
+        completedTaskIds.add(event.task_id);
+      }
+    }
+    waitingTaskIds.delete(event.task_id);
+  }
+
+  for (const event of readyEvents) {
+    if (event.task_id) {
+      readyTaskIds.add(event.task_id);
+    }
+  }
+
+  const allScopedTasksTerminal =
+    taskIds.length > 0 &&
+    taskIds.every(taskId => {
+      const task = dag.getTask(taskId);
+      return task && (task.status === 'done' || task.status === 'failed' || task.status === 'cancelled');
+    });
+
+  let action: 'continue_waiting' | 'trigger_downstream' | 'user_reply' | 'idle' = 'idle';
+  let shouldReplyToUser = false;
+  if (activeBindings.length > 0) {
+    action = 'continue_waiting';
+    shouldReplyToUser = !!params.reply_on_partial && completionEvents.length > 0;
+  } else if (completionEvents.length > 0 || (params.force_summary === true && allScopedTasksTerminal)) {
+    action = 'user_reply';
+    shouldReplyToUser = true;
+  } else if (readyTaskIds.size > 0) {
+    action = 'trigger_downstream';
+  }
+
+  const eventIdsToConsume = pendingEvents
+    .filter(event => action !== 'idle' && matchesContinuationScope(event, params, taskIds))
+    .map(event => event.event_id);
+  const consumedEventIds: string[] = [];
+  if (params.consume !== false) {
+    for (const eventId of eventIdsToConsume) {
+      const consumed = consumePendingEvent(eventId, executionContext);
+      if (consumed) {
+        consumedEventIds.push(consumed.event_id);
+      }
+    }
+  }
+
+  return {
+    action,
+    should_reply_to_user: shouldReplyToUser,
+    agent_id: agentId,
+    dag_id: dagId || dag.getCurrentDagId(),
+    run_id: params.run_id || sessionRun?.run_id,
+    session_key: params.session_key || sessionRun?.child_session_key,
+    completed_task_ids: Array.from(completedTaskIds),
+    failed_task_ids: Array.from(failedTaskIds),
+    ready_task_ids: Array.from(readyTaskIds),
+    waiting_task_ids: Array.from(waitingTaskIds),
+    active_binding_count: activeBindings.length,
+    pending_event_ids: pendingEvents.map(event => event.event_id),
+    consumed_event_ids: consumedEventIds,
+    summary: buildContinuationMessage({
+      completedTaskIds: Array.from(completedTaskIds),
+      failedTaskIds: Array.from(failedTaskIds),
+      readyTaskIds: Array.from(readyTaskIds),
+      waitingTaskIds: Array.from(waitingTaskIds),
+    }),
+    continuation_reason:
+      action === 'continue_waiting'
+        ? 'subtasks_still_running'
+        : action === 'trigger_downstream'
+          ? 'downstream_tasks_ready'
+          : action === 'user_reply'
+            ? 'new_terminal_updates'
+            : 'no_new_updates',
   };
 }
 
@@ -1200,6 +1390,25 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
       }
     },
     execute: async (params: any, context: any) => pollTaskEvents(params, context)
+  }, { optional: false });
+
+  api.registerTool({
+    name: "task_dag_continue",
+    description: "Build a parent-session continuation summary after auto-announce and decide whether to wait, trigger downstream work, or reply to the user.",
+    parameters: {
+      type: "object",
+      properties: {
+        dag_id: { type: "string", description: "DAG ID (optional)" },
+        task_id: { type: "string", description: "Single task scope" },
+        task_ids: { type: "array", items: { type: "string" }, description: "Explicit task scope" },
+        session_key: { type: "string", description: "Session scope" },
+        run_id: { type: "string", description: "Run scope" },
+        consume: { type: "boolean", description: "Consume included events", default: true },
+        reply_on_partial: { type: "boolean", description: "Allow replying before all active subtasks are done", default: false },
+        force_summary: { type: "boolean", description: "Force a summary even when there are no new pending events", default: false }
+      }
+    },
+    execute: async (params: any, context: any) => continueParentSession(params, context)
   }, { optional: false });
 
   api.registerTool({

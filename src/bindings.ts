@@ -63,6 +63,7 @@ export interface PendingEvent {
   task_id?: string;
   session_key?: string;
   run_id?: string;
+  dedupe_key?: string;
   payload?: Record<string, unknown>;
   created_at: string;
   consumed_at?: string;
@@ -339,6 +340,15 @@ export function appendPendingEvent(
   context?: { agentId?: string; dagId?: string }
 ): PendingEvent {
   const { agentId, dagId } = resolveContext(context?.agentId, context?.dagId);
+  if (input.dedupe_key) {
+    const existing = Object.values(loadPendingEventsData(agentId, dagId)).find(
+      event => event.dedupe_key === input.dedupe_key
+    );
+    if (existing) {
+      return existing;
+    }
+  }
+
   const event: PendingEvent = {
     event_id: input.event_id || createId('event'),
     type: input.type,
@@ -346,6 +356,7 @@ export function appendPendingEvent(
     task_id: input.task_id,
     session_key: input.session_key,
     run_id: input.run_id,
+    dedupe_key: input.dedupe_key,
     payload: input.payload,
     created_at: input.created_at || new Date().toISOString(),
     consumed_at: input.consumed_at,
@@ -361,6 +372,7 @@ export function listPendingEvents(
     task_id?: string;
     session_key?: string;
     run_id?: string;
+    dedupe_key?: string;
     includeConsumed?: boolean;
   } = {},
   context?: { agentId?: string; dagId?: string }
@@ -373,6 +385,7 @@ export function listPendingEvents(
       if (filter.task_id && event.task_id !== filter.task_id) return false;
       if (filter.session_key && event.session_key !== filter.session_key) return false;
       if (filter.run_id && event.run_id !== filter.run_id) return false;
+      if (filter.dedupe_key && event.dedupe_key !== filter.dedupe_key) return false;
       return true;
     })
     .sort((a, b) => a.created_at.localeCompare(b.created_at));

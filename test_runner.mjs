@@ -702,6 +702,170 @@ test('subagent_ended hook emits orphan event when bindings are missing', async (
   });
 });
 
+console.log('\n=== Continuation Flow ===\n');
+
+test('task_dag_continue produces a user reply summary for a completed single subagent run', async () => {
+  await withTempWorkspace('continue-single', async () => {
+    dag.setCurrentAgentId('main');
+    const created = dag.createDAG('continue-single', [{ id: 't1', name: 'Single task' }]);
+
+    bindings.saveSessionRun({
+      run_id: 'run-continue-1',
+      child_session_key: 'agent:worker:subagent:continue-1',
+      requester_session_key: 'agent:main',
+      parent_agent_id: 'main',
+      dag_id: created.id,
+      spawn_mode: 'single_task',
+      active_task_ids: ['t1'],
+    }, { dagId: created.id });
+    bindings.upsertTaskBinding({
+      dag_id: created.id,
+      task_id: 't1',
+      executor_type: 'subagent',
+      executor_agent_id: 'worker',
+      session_key: 'agent:worker:subagent:continue-1',
+      run_id: 'run-continue-1',
+      binding_status: 'active',
+    }, { dagId: created.id });
+
+    hooks.handleSubagentEndedEvent({
+      targetSessionKey: 'agent:worker:subagent:continue-1',
+      runId: 'run-continue-1',
+      outcome: 'ok',
+      dagId: created.id,
+      parentAgentId: 'main',
+    }, console);
+
+    const result = await tools.continueParentSession({ run_id: 'run-continue-1' }, {});
+    const secondResult = await tools.continueParentSession({ run_id: 'run-continue-1' }, {});
+
+    assert(result.action === 'user_reply', 'Single completed run should trigger user reply');
+    assert(result.should_reply_to_user === true, 'Single completed run should be replyable');
+    assert(result.completed_task_ids.includes('t1'), 'Completed task should appear in summary');
+    assert(secondResult.action === 'user_reply' || secondResult.action === 'idle', 'Second continuation should not regress');
+    assert(secondResult.pending_event_ids.length === 0, 'Consumed events should not reappear');
+  });
+});
+
+test('task_dag_continue waits for remaining subtasks before final reply', async () => {
+  await withTempWorkspace('continue-multi', async () => {
+    dag.setCurrentAgentId('main');
+    const created = dag.createDAG('continue-multi', [
+      { id: 't1', name: 'First subtask' },
+      { id: 't2', name: 'Second subtask' },
+    ]);
+
+    bindings.saveSessionRun({
+      run_id: 'run-continue-2',
+      child_session_key: 'agent:worker:subagent:continue-2',
+      requester_session_key: 'agent:main',
+      parent_agent_id: 'main',
+      dag_id: created.id,
+      spawn_mode: 'multi_task',
+      active_task_ids: ['t1', 't2'],
+    }, { dagId: created.id });
+    for (const taskId of ['t1', 't2']) {
+      bindings.upsertTaskBinding({
+        dag_id: created.id,
+        task_id: taskId,
+        executor_type: 'subagent',
+        executor_agent_id: 'worker',
+        session_key: 'agent:worker:subagent:continue-2',
+        run_id: 'run-continue-2',
+        binding_status: 'active',
+      }, { dagId: created.id });
+      dag.updateTask(taskId, {
+        status: 'waiting_subagent',
+        executor: { type: 'subagent', agent_id: 'worker', session_key: 'agent:worker:subagent:continue-2', run_id: 'run-continue-2' },
+        waiting_for: { kind: 'subagent', session_key: 'agent:worker:subagent:continue-2', run_id: 'run-continue-2' },
+      });
+    }
+
+    dag.updateTask('t1', { status: 'done', output_summary: 'partial result' });
+    const activeT1Binding = bindings.listTaskBindings({ task_id: 't1', binding_status: 'active' }, { dagId: created.id })[0];
+    bindings.completeTaskBinding(activeT1Binding.binding_id, 'completed', { dagId: created.id });
+    bindings.appendPendingEvent({
+      type: 'subagent_completed',
+      dag_id: created.id,
+      task_id: 't1',
+      session_key: 'agent:worker:subagent:continue-2',
+      run_id: 'run-continue-2',
+      dedupe_key: 'continue-multi-partial',
+      payload: { outcome: 'ok' },
+    }, { dagId: created.id });
+
+    const partial = await tools.continueParentSession({ run_id: 'run-continue-2' }, {});
+    assert(partial.action === 'continue_waiting', 'Partial completion should keep waiting');
+    assert(partial.should_reply_to_user === false, 'Partial completion should not reply by default');
+    assert(partial.completed_task_ids.includes('t1'), 'Partial completion should report completed task');
+    assert(partial.waiting_task_ids.includes('t2'), 'Remaining task should still be waiting');
+
+    hooks.handleSubagentEndedEvent({
+      targetSessionKey: 'agent:worker:subagent:continue-2',
+      runId: 'run-continue-2',
+      outcome: 'ok',
+      dagId: created.id,
+      parentAgentId: 'main',
+    }, console);
+
+    const final = await tools.continueParentSession({ run_id: 'run-continue-2' }, {});
+    assert(final.action === 'user_reply', 'All tasks finished should trigger final reply');
+    assert(final.completed_task_ids.includes('t1') && final.completed_task_ids.includes('t2'), 'Final summary should include both tasks');
+  });
+});
+
+test('duplicate ended events do not create duplicate continuation output', async () => {
+  await withTempWorkspace('continue-dedup', async () => {
+    dag.setCurrentAgentId('main');
+    const created = dag.createDAG('continue-dedup', [{ id: 't1', name: 'Dedup task' }]);
+
+    bindings.saveSessionRun({
+      run_id: 'run-continue-3',
+      child_session_key: 'agent:worker:subagent:continue-3',
+      parent_agent_id: 'main',
+      dag_id: created.id,
+      spawn_mode: 'single_task',
+      active_task_ids: ['t1'],
+    }, { dagId: created.id });
+    bindings.upsertTaskBinding({
+      dag_id: created.id,
+      task_id: 't1',
+      executor_type: 'subagent',
+      executor_agent_id: 'worker',
+      session_key: 'agent:worker:subagent:continue-3',
+      run_id: 'run-continue-3',
+      binding_status: 'active',
+    }, { dagId: created.id });
+
+    hooks.handleSubagentEndedEvent({
+      targetSessionKey: 'agent:worker:subagent:continue-3',
+      runId: 'run-continue-3',
+      outcome: 'ok',
+      dagId: created.id,
+      parentAgentId: 'main',
+    }, console);
+    hooks.handleSubagentEndedEvent({
+      targetSessionKey: 'agent:worker:subagent:continue-3',
+      runId: 'run-continue-3',
+      outcome: 'ok',
+      dagId: created.id,
+      parentAgentId: 'main',
+    }, console);
+
+    const completionEvents = bindings.listPendingEvents({
+      run_id: 'run-continue-3',
+      type: 'subagent_completed',
+      includeConsumed: true,
+    }, { dagId: created.id });
+    const first = await tools.continueParentSession({ run_id: 'run-continue-3' }, {});
+    const second = await tools.continueParentSession({ run_id: 'run-continue-3' }, {});
+
+    assert(completionEvents.length === 1, 'Duplicate ended hooks should dedupe completion events');
+    assert(first.action === 'user_reply', 'First continuation should produce reply');
+    assert(second.pending_event_ids.length === 0, 'Second continuation should not see duplicate events');
+  });
+});
+
 for (const { name, fn } of tests) {
   try {
     await fn();

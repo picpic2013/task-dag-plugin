@@ -14,6 +14,7 @@ import {
   completeTaskBinding,
   getSessionRunByRunId,
   getSessionRunBySessionKey,
+  listPendingEvents,
   listTaskBindings,
 } from './bindings.js';
 import * as dag from './dag.js';
@@ -226,12 +227,13 @@ function markNewlyReadyTasks(sourceTaskIds: string[], context: { agentId: string
     .map(task => task.id);
 
   for (const readyTaskId of newlyReady) {
-    appendPendingEvent({
-      type: 'task_ready',
-      dag_id: context.dagId,
-      task_id: readyTaskId,
-      payload: { source_task_ids: sourceTaskIds },
-    }, context);
+  appendPendingEvent({
+    type: 'task_ready',
+    dag_id: context.dagId,
+    task_id: readyTaskId,
+    dedupe_key: `task_ready:${context.dagId}:${readyTaskId}:${sourceTaskIds.slice().sort().join(',')}`,
+    payload: { source_task_ids: sourceTaskIds },
+  }, context);
     addEvent({
       event: 'task_ready',
       task_id: readyTaskId,
@@ -277,6 +279,7 @@ export function handleSubagentSpawnedEvent(event: any, logger?: OpenClawPluginAp
     task_id: taskId,
     session_key: childSessionKey,
     run_id: event.runId || event.run_id,
+    dedupe_key: `subagent_spawned:${context.dagId}:${taskId}:${event.runId || event.run_id || childSessionKey}`,
     payload: { requester_session_key: requesterSessionKey, label, agent_id: agentId },
   }, context);
 
@@ -317,11 +320,25 @@ export function handleSubagentEndedEvent(event: any, logger?: OpenClawPluginApi[
   const activeBindings = listTaskBindings({ session_key: targetSessionKey, binding_status: 'active' }, context);
 
   if (activeBindings.length === 0) {
+    const existingCompletionEvents = listPendingEvents({
+      session_key: targetSessionKey,
+      run_id: runId,
+      includeConsumed: true,
+    }, context).filter(existingEvent => existingEvent.type === 'subagent_completed' || existingEvent.type === 'subagent_failed');
+    if (existingCompletionEvents.length > 0) {
+      return {
+        task_ids: existingCompletionEvents.map(existingEvent => existingEvent.task_id).filter((taskId): taskId is string => !!taskId),
+        newly_ready_task_ids: [],
+        outcome,
+      };
+    }
+
     appendPendingEvent({
       type: 'binding_orphaned',
       dag_id: context.dagId,
       session_key: targetSessionKey,
       run_id: runId,
+      dedupe_key: `binding_orphaned:${context.dagId}:${targetSessionKey}:${runId || 'no-run'}:${outcome}`,
       payload: { outcome },
     } as any, context);
     addEvent({
@@ -366,6 +383,7 @@ export function handleSubagentEndedEvent(event: any, logger?: OpenClawPluginApi[
       task_id: binding.task_id,
       session_key: targetSessionKey,
       run_id: binding.run_id || runId,
+      dedupe_key: `${isSuccess ? 'subagent_completed' : 'subagent_failed'}:${context.dagId}:${binding.task_id}:${binding.run_id || runId || targetSessionKey}`,
       payload: { outcome },
     }, context);
     addEvent({
