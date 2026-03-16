@@ -234,7 +234,7 @@ export async function completeTaskExecution(params: any, context?: any) {
       payload: { output_summary },
     }, { agentId, dagId });
 
-    return { success: true, task, agent_id: agentId };
+    return { success: true, task, agent_id: agentId, dag_id: dagId || dag.getCurrentDagId() };
   } catch (error: any) {
     return { error: error.message };
   }
@@ -270,7 +270,7 @@ export async function failTaskExecution(params: any, context?: any) {
       payload: { message },
     }, { agentId, dagId });
 
-    return { success: true, task, agent_id: agentId };
+    return { success: true, task, agent_id: agentId, dag_id: dagId || dag.getCurrentDagId() };
   } catch (error: any) {
     return { error: error.message };
   }
@@ -473,6 +473,8 @@ export async function assignTasksToSession(params: any, context?: any) {
       session_key: sessionRun.child_session_key,
       run_id: sessionRun.run_id,
       assigned_task_ids: assigned,
+      agent_id: agentId,
+      dag_id: dagIdToUse,
     };
   } catch (error: any) {
     return { error: error.message };
@@ -507,7 +509,7 @@ export async function ackTaskEvent(params: any, context?: any) {
     if (!event) {
       return { error: `Event ${params.event_id} not found` };
     }
-    return { success: true, event };
+    return { success: true, event, agent_id: agentId, dag_id: dagId || dag.getCurrentDagId() };
   } catch (error: any) {
     return { error: error.message };
   }
@@ -537,6 +539,8 @@ export async function reconcileTaskDagState(params: any, context?: any) {
     return {
       success: true,
       reconciled,
+      agent_id: agentId,
+      dag_id: dagId || dag.getCurrentDagId(),
       stats: dag.getStats(),
     };
   } catch (error: any) {
@@ -1235,6 +1239,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
       type: "object",
       properties: {
         task_id: { type: "string", description: "Task ID" },
+        agent_id: { type: "string", description: "Agent ID owning the DAG" },
         dag_id: { type: "string", description: "DAG ID (optional)" },
         executor_type: { type: "string", enum: ["parent", "subagent"], description: "Executor type", default: "parent" },
         executor_agent_id: { type: "string", description: "Executor agent ID" },
@@ -1254,6 +1259,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
       type: "object",
       properties: {
         task_id: { type: "string", description: "Task ID" },
+        agent_id: { type: "string", description: "Agent ID owning the DAG" },
         dag_id: { type: "string", description: "DAG ID (optional)" },
         progress: { type: "number", minimum: 0, maximum: 100, description: "Progress percentage" },
         message: { type: "string", description: "Progress message" },
@@ -1272,6 +1278,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
       type: "object",
       properties: {
         task_id: { type: "string", description: "Task ID" },
+        agent_id: { type: "string", description: "Agent ID owning the DAG" },
         dag_id: { type: "string", description: "DAG ID (optional)" },
         output_summary: { type: "string", description: "Task output summary" },
         message: { type: "string", description: "Completion log message" },
@@ -1290,6 +1297,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
       type: "object",
       properties: {
         task_id: { type: "string", description: "Task ID" },
+        agent_id: { type: "string", description: "Agent ID owning the DAG" },
         dag_id: { type: "string", description: "DAG ID (optional)" },
         message: { type: "string", description: "Failure reason" },
         session_key: { type: "string", description: "Session key (optional)" },
@@ -1307,6 +1315,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
       type: "object",
       properties: {
         task_id: { type: "string", description: "Task ID" },
+        agent_id: { type: "string", description: "Agent ID owning the DAG" },
         dag_id: { type: "string", description: "DAG ID (optional)" },
         task: { type: "string", description: "Subagent task prompt" },
         prompt: { type: "string", description: "Alias of task prompt" },
@@ -1331,6 +1340,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
       type: "object",
       properties: {
         task_ids: { type: "array", items: { type: "string" }, description: "Task IDs to assign" },
+        agent_id: { type: "string", description: "Agent ID owning the DAG" },
         dag_id: { type: "string", description: "DAG ID (optional)" },
         session_key: { type: "string", description: "Existing session key" },
         run_id: { type: "string", description: "Existing run ID" },
@@ -1349,6 +1359,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
     parameters: {
       type: "object",
       properties: {
+        agent_id: { type: "string", description: "Agent ID owning the DAG" },
         dag_id: { type: "string", description: "DAG ID (optional)" },
         type: { type: "string", description: "Filter by event type" },
         task_id: { type: "string", description: "Filter by task ID" },
@@ -1367,6 +1378,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
     parameters: {
       type: "object",
       properties: {
+        agent_id: { type: "string", description: "Agent ID owning the DAG" },
         dag_id: { type: "string", description: "DAG ID (optional)" },
         task_id: { type: "string", description: "Single task scope" },
         task_ids: { type: "array", items: { type: "string" }, description: "Explicit task scope" },
@@ -1387,6 +1399,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
       type: "object",
       properties: {
         event_id: { type: "string", description: "Event ID" },
+        agent_id: { type: "string", description: "Agent ID owning the DAG" },
         dag_id: { type: "string", description: "DAG ID (optional)" }
       },
       required: ["event_id"]
@@ -1400,6 +1413,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
     parameters: {
       type: "object",
       properties: {
+        agent_id: { type: "string", description: "Agent ID owning the DAG" },
         dag_id: { type: "string", description: "DAG ID (optional)" }
       }
     },

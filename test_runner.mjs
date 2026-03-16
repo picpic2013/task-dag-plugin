@@ -584,7 +584,8 @@ test('task_dag_spawn creates binding and moves task into waiting_subagent', asyn
       agent_id: 'main',
       task: 'Do sub work',
       agentId: 'worker',
-    }, { session: { key: 'agent:main' } });
+      requester_session_key: 'agent:main',
+    }, {});
 
     assert(result.success === true, 'Spawn should succeed');
     assert(dag.getTask('t1')?.status === 'waiting_subagent', 'Task should wait on subagent');
@@ -819,6 +820,37 @@ test('registered task_dag_complete uses runtime execute signature without losing
 
     assert(result.success === true, `Registered complete tool should succeed under runtime signature: ${JSON.stringify(result)}`);
     assert(dag.getTask('t1')?.status === 'done', 'Registered complete tool should mark the task done');
+  });
+});
+
+test('execution and continuation tools expose a consistent agent_id contract', async () => {
+  await withTempWorkspace('tool-agent-contract', async () => {
+    const registeredTools = {};
+    tools.registerTaskDagTools({
+      logger: { info() {}, warn() {}, error() {} },
+      registerTool(tool) { registeredTools[tool.name] = tool; },
+      registerHook() {},
+      runtime: {},
+      config: {},
+    });
+
+    const toolNames = [
+      'task_dag_claim',
+      'task_dag_progress',
+      'task_dag_complete',
+      'task_dag_fail',
+      'task_dag_spawn',
+      'task_dag_assign',
+      'task_dag_poll_events',
+      'task_dag_continue',
+      'task_dag_ack_event',
+      'task_dag_reconcile',
+    ];
+
+    for (const toolName of toolNames) {
+      const properties = registeredTools[toolName]?.parameters?.properties || {};
+      assert(Object.prototype.hasOwnProperty.call(properties, 'agent_id'), `${toolName} should declare agent_id`);
+    }
   });
 });
 
