@@ -253,6 +253,7 @@ export function saveSessionMapping(
     runId?: string;
     requesterSessionKey?: string;
     label?: string;
+    parentAgentId?: string;
   }
 ): void {
   const mappings = loadSessionMappings();
@@ -284,7 +285,7 @@ export function saveSessionMapping(
       run_id: options.runId,
       child_session_key: sessionKey,
       requester_session_key: options.requesterSessionKey,
-      parent_agent_id: agentId,
+      parent_agent_id: options.parentAgentId || agentId,
       dag_id: dagId,
       spawn_mode: 'single_task',
       label: options.label,

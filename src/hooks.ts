@@ -271,6 +271,7 @@ export function handleSubagentSpawnedEvent(event: any, logger?: OpenClawPluginAp
     runId: event.runId || event.run_id,
     requesterSessionKey,
     label,
+    parentAgentId: context.agentId,
   });
 
   appendPendingEvent({

@@ -572,6 +572,7 @@ test('subagent_spawned hook persists session context and binding metadata', asyn
     const pendingEvents = bindings.listPendingEvents({ type: 'subagent_spawned' }, { dagId: created.id });
 
     assert(run?.child_session_key === 'agent:worker:subagent:hook-1', 'Hook should persist session run');
+    assert(run?.parent_agent_id === 'main', 'Session run should persist parent agent, not child agent');
     assert(taskBindings.length >= 1, 'Hook should create task binding');
     assert(pendingEvents.length === 1, 'Hook should emit pending spawn event');
   });
@@ -753,6 +754,7 @@ test('task_dag_continue waits for remaining subtasks before final reply', async 
     const created = dag.createDAG('continue-multi', [
       { id: 't1', name: 'First subtask' },
       { id: 't2', name: 'Second subtask' },
+      { id: 't3', name: 'Downstream ready', dependencies: ['t1'] },
     ]);
 
     bindings.saveSessionRun({
@@ -763,7 +765,7 @@ test('task_dag_continue waits for remaining subtasks before final reply', async 
       dag_id: created.id,
       spawn_mode: 'multi_task',
       active_task_ids: ['t1', 't2'],
-    }, { dagId: created.id });
+    }, { agentId: 'main', dagId: created.id });
     for (const taskId of ['t1', 't2']) {
       bindings.upsertTaskBinding({
         dag_id: created.id,
@@ -773,7 +775,7 @@ test('task_dag_continue waits for remaining subtasks before final reply', async 
         session_key: 'agent:worker:subagent:continue-2',
         run_id: 'run-continue-2',
         binding_status: 'active',
-      }, { dagId: created.id });
+      }, { agentId: 'main', dagId: created.id });
       dag.updateTask(taskId, {
         status: 'waiting_subagent',
         executor: { type: 'subagent', agent_id: 'worker', session_key: 'agent:worker:subagent:continue-2', run_id: 'run-continue-2' },
@@ -782,8 +784,8 @@ test('task_dag_continue waits for remaining subtasks before final reply', async 
     }
 
     dag.updateTask('t1', { status: 'done', output_summary: 'partial result' });
-    const activeT1Binding = bindings.listTaskBindings({ task_id: 't1', binding_status: 'active' }, { dagId: created.id })[0];
-    bindings.completeTaskBinding(activeT1Binding.binding_id, 'completed', { dagId: created.id });
+    const activeT1Binding = bindings.listTaskBindings({ task_id: 't1', binding_status: 'active' }, { agentId: 'main', dagId: created.id })[0];
+    bindings.completeTaskBinding(activeT1Binding.binding_id, 'completed', { agentId: 'main', dagId: created.id });
     bindings.appendPendingEvent({
       type: 'subagent_completed',
       dag_id: created.id,
@@ -792,13 +794,22 @@ test('task_dag_continue waits for remaining subtasks before final reply', async 
       run_id: 'run-continue-2',
       dedupe_key: 'continue-multi-partial',
       payload: { outcome: 'ok' },
-    }, { dagId: created.id });
+    }, { agentId: 'main', dagId: created.id });
+    bindings.appendPendingEvent({
+      type: 'task_ready',
+      dag_id: created.id,
+      task_id: 't3',
+      dedupe_key: 'continue-multi-ready-t3',
+      payload: { source_task_ids: ['t1'] },
+    }, { agentId: 'main', dagId: created.id });
 
     const partial = await tools.continueParentSession({ run_id: 'run-continue-2' }, {});
+    const remainingReadyEvents = bindings.listPendingEvents({ type: 'task_ready' }, { agentId: 'main', dagId: created.id });
     assert(partial.action === 'continue_waiting', 'Partial completion should keep waiting');
     assert(partial.should_reply_to_user === false, 'Partial completion should not reply by default');
     assert(partial.completed_task_ids.includes('t1'), 'Partial completion should report completed task');
     assert(partial.waiting_task_ids.includes('t2'), 'Remaining task should still be waiting');
+    assert(remainingReadyEvents.some(event => event.task_id === 't3'), 'task_ready event should remain pending during continue_waiting');
 
     hooks.handleSubagentEndedEvent({
       targetSessionKey: 'agent:worker:subagent:continue-2',
@@ -863,6 +874,72 @@ test('duplicate ended events do not create duplicate continuation output', async
     assert(completionEvents.length === 1, 'Duplicate ended hooks should dedupe completion events');
     assert(first.action === 'user_reply', 'First continuation should produce reply');
     assert(second.pending_event_ids.length === 0, 'Second continuation should not see duplicate events');
+  });
+});
+
+console.log('\n=== Compatibility Context ===\n');
+
+test('compatibility tools respect dag_id instead of drifting to another DAG', async () => {
+  await withTempWorkspace('compat-dag', async () => {
+    dag.setCurrentAgentId('main');
+    const first = dag.createDAG('compat-first', [{ id: 't1', name: 'First DAG task' }]);
+    await new Promise(resolve => setTimeout(resolve, 2));
+    const second = dag.createDAG('compat-second', [{ id: 't1', name: 'Second DAG task' }]);
+
+    const registeredTools = {};
+    tools.registerTaskDagTools({
+      logger: { info() {}, warn() {}, error() {} },
+      registerTool(tool) { registeredTools[tool.name] = tool; },
+      registerHook() {},
+      runtime: {},
+      config: {},
+    });
+
+    const updateTool = registeredTools['task_dag_modify'];
+
+    await updateTool.execute({
+      action: 'update',
+      dag_id: second.id,
+      task_id: 't1',
+      task: { description: 'only-second-dag' },
+    }, {});
+
+    dag.setCurrentAgentId('main');
+    dag.setCurrentDagId(first.id);
+    const firstTask = dag.getTask('t1');
+
+    dag.setCurrentAgentId('main');
+    dag.setCurrentDagId(second.id);
+    const secondTask = dag.getTask('t1');
+
+    assert(firstTask?.description !== 'only-second-dag', 'First DAG should remain untouched');
+    assert(secondTask?.description === 'only-second-dag', 'Second DAG should receive the update');
+  });
+});
+
+test('compatibility helpers can operate on a non-main agent DAG', async () => {
+  await withTempWorkspace('compat-agent', async () => {
+    dag.setCurrentAgentId('worker-parent');
+    const created = dag.createDAG('compat-agent', [{ id: 't1', name: 'Agent scoped task' }]);
+
+    const registeredTools = {};
+    tools.registerTaskDagTools({
+      logger: { info() {}, warn() {}, error() {} },
+      registerTool(tool) { registeredTools[tool.name] = tool; },
+      registerHook() {},
+      runtime: {},
+      config: {},
+    });
+
+    const contextTool = registeredTools['task_dag_context'];
+    const resumeTool = registeredTools['task_dag_resume'];
+
+    const contextResult = await contextTool.execute({ task_id: 't1', dag_id: created.id }, { agent_id: 'worker-parent' });
+    assert(contextResult.dag_name === 'compat-agent', 'Context tool should resolve under non-main agent');
+
+    dag.updateTask('t1', { status: 'done', output_summary: 'done' });
+    await resumeTool.execute({ task_id: 't1', dag_id: created.id }, { agent_id: 'worker-parent' });
+    assert(dag.getTask('t1')?.status === 'ready', 'Resume tool should mutate the non-main agent DAG');
   });
 });
 
