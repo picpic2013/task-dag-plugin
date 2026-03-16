@@ -25,6 +25,22 @@ task_dag_spawn
 - 一个子 agent 可以绑定多个 task
 - 父 agent 也可以直接 claim/complete/fail task，不必强制走子 agent
 
+## 显式上下文要求
+
+当前版本不再依赖工具层的隐式 runtime session context。使用 task-dag 工具时，应遵守下面的硬规则：
+
+- 非 `main` agent 必须显式传 `agent_id`
+- `task_dag_create` 不会再静默回退到 `main`
+- `task_dag_spawn` 若希望父会话在子 agent 完成后继续处理，必须显式传 `requester_session_key`
+- `task_dag_continue` 必须显式提供 continuation scope：
+  - `run_id`
+  - `session_key`
+  - `task_id`
+  - `task_ids`
+  以上至少一个
+
+如果不满足这些条件，工具会直接报错，而不是猜测上下文。
+
 ## 核心能力
 
 - DAG 任务状态机
@@ -86,7 +102,7 @@ task_dag_spawn
 ### 1. 创建 DAG
 
 ```bash
-task_dag_create name="复杂项目" tasks=[
+task_dag_create agent_id="main" name="复杂项目" tasks=[
   {id:"t1",name:"调研"},
   {id:"t2",name:"分析",dependencies:["t1"]},
   {id:"t3",name:"报告",dependencies:["t2"]}
@@ -96,27 +112,43 @@ task_dag_create name="复杂项目" tasks=[
 ### 2. 父 agent 直接执行
 
 ```bash
-task_dag_claim task_id="t1" executor_type="parent" message="开始调研"
-task_dag_progress task_id="t1" progress=50 message="已完成一半资料收集"
-task_dag_complete task_id="t1" output_summary="调研已完成"
-task_dag_continue task_id="t1"
+task_dag_claim agent_id="main" task_id="t1" executor_type="parent" message="开始调研"
+task_dag_progress agent_id="main" task_id="t1" progress=50 message="已完成一半资料收集"
+task_dag_complete agent_id="main" task_id="t1" output_summary="调研已完成"
+task_dag_continue agent_id="main" task_id="t1"
 ```
 
 ### 3. 子 agent 执行单个任务
 
 ```bash
-task_dag_spawn task_id="t2" task="完成分析工作并给出结论" target_agent_id="worker"
+task_dag_spawn agent_id="main" requester_session_key="agent:main:feishu:group:xxx" task_id="t2" task="完成分析工作并给出结论" target_agent_id="worker"
 
 # 父会话在被 runtime 新一轮唤醒后继续
-task_dag_continue task_id="t2"
+task_dag_continue agent_id="main" task_id="t2"
 ```
 
 ### 4. 一个子 agent 处理多个任务
 
 ```bash
-task_dag_spawn task_id="t1" task="先做第一个子任务" target_agent_id="worker"
-task_dag_assign run_id="run-xxx" task_ids=["t2","t3"] executor_agent_id="worker"
-task_dag_continue run_id="run-xxx"
+task_dag_spawn agent_id="main" requester_session_key="agent:main:feishu:group:xxx" task_id="t1" task="先做第一个子任务" target_agent_id="worker"
+task_dag_assign agent_id="main" run_id="run-xxx" task_ids=["t2","t3"] executor_agent_id="worker"
+task_dag_continue agent_id="main" run_id="run-xxx"
+```
+
+### 5. 非 `main` agent 示例
+
+`chexie` 这类非主 agent 必须显式声明 `agent_id`，否则 DAG 创建会直接失败：
+
+```bash
+task_dag_create agent_id="chexie" name="Chexie README Flow" tasks=[
+  {id:"t1",name:"阅读前端 README",assigned_agent:"parent"},
+  {id:"t2",name:"阅读后端 README",assigned_agent:"parent"}
+]
+
+task_dag_claim agent_id="chexie" dag_id="dag-xxx" task_id="t1" executor_type="parent" executor_agent_id="chexie"
+task_dag_progress agent_id="chexie" dag_id="dag-xxx" task_id="t1" progress=50 message="正在阅读前端 README"
+task_dag_complete agent_id="chexie" dag_id="dag-xxx" task_id="t1" output_summary="前端 README 已总结"
+task_dag_continue agent_id="chexie" dag_id="dag-xxx" task_ids=["t1","t2"]
 ```
 
 ## 子 agent 与父会话的协作方式
@@ -179,6 +211,12 @@ task_dag_spawn
 - `requester-sessions.json`
   - `requesterSessionKey -> parentAgentId/dagId/active runs/tasks` 的全局恢复注册表
 
+说明：
+
+- `main` agent 使用 `.openclaw/workspace/tasks/{dag_id}`
+- 非 `main` agent 使用 `.openclaw/workspace-{agent_id}/tasks/{dag_id}`
+- 当前版本不会在缺少 `agent_id` 时把非 `main` agent 的 DAG 静默写到 `main`
+
 ## 兼容迁移
 
 当前版本已经移除的旧接口有：
@@ -216,6 +254,8 @@ task_dag_spawn
 - orphan binding
 - 父会话 continuation
 - 重复 completion 去重
+- 非 `main` agent（`chexie`）自建 DAG、自执行 task
+- OpenClaw runtime 真实 `execute(toolCallId, params, signal, onUpdate)` 调用签名
 
 验证命令：
 
