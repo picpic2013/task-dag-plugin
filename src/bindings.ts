@@ -74,7 +74,7 @@ interface TaskBindingsData {
 
 interface SessionRunsData {
   runs: Record<string, SessionRun>;
-  by_session: Record<string, string>;
+  by_session: Record<string, string[] | string>;
 }
 
 function getStorageDirForAgent(agentId: string, dagId: string): string {
@@ -145,6 +145,17 @@ function loadSessionRunsData(agentId: string, dagId: string): SessionRunsData {
 
 function saveSessionRunsData(agentId: string, dagId: string, data: SessionRunsData): void {
   writeJsonFile(getSessionRunsFile(agentId, dagId), data);
+}
+
+function getRunIdsForSession(data: SessionRunsData, sessionKey: string): string[] {
+  const raw = data.by_session[sessionKey];
+  if (!raw) {
+    return [];
+  }
+  if (Array.isArray(raw)) {
+    return raw;
+  }
+  return [raw];
 }
 
 function appendJsonLine(file: string, data: unknown): void {
@@ -276,7 +287,8 @@ export function saveSessionRun(
   };
 
   data.runs[sessionRun.run_id] = sessionRun;
-  data.by_session[sessionRun.child_session_key] = sessionRun.run_id;
+  const existingRunIds = getRunIdsForSession(data, sessionRun.child_session_key);
+  data.by_session[sessionRun.child_session_key] = Array.from(new Set([...existingRunIds, sessionRun.run_id]));
   saveSessionRunsData(agentId, dagId, data);
   return sessionRun;
 }
@@ -329,10 +341,31 @@ export function getSessionRunBySessionKey(
   sessionKey: string,
   context?: { agentId?: string; dagId?: string }
 ): SessionRun | null {
+  const sessionRuns = listSessionRunsBySessionKey(sessionKey, context);
+  if (sessionRuns.length === 0) {
+    return null;
+  }
+  if (sessionRuns.length === 1) {
+    return sessionRuns[0];
+  }
+  const activeRuns = sessionRuns.filter(run => !run.completed_at);
+  if (activeRuns.length === 1) {
+    return activeRuns[0];
+  }
+  return null;
+}
+
+export function listSessionRunsBySessionKey(
+  sessionKey: string,
+  context?: { agentId?: string; dagId?: string }
+): SessionRun[] {
   const { agentId, dagId } = resolveContext(context?.agentId, context?.dagId);
   const data = loadSessionRunsData(agentId, dagId);
-  const runId = data.by_session[sessionKey];
-  return runId ? data.runs[runId] || null : null;
+  const runIds = getRunIdsForSession(data, sessionKey);
+  return runIds
+    .map(runId => data.runs[runId])
+    .filter((run): run is SessionRun => !!run)
+    .sort((a, b) => b.created_at.localeCompare(a.created_at));
 }
 
 export function appendPendingEvent(
@@ -411,4 +444,70 @@ export function consumePendingEvent(
   };
   appendJsonLine(getPendingEventsFile(agentId, dagId), consumed);
   return consumed;
+}
+
+export function removeTaskRuntimeState(
+  taskIds: string[],
+  context?: { agentId?: string; dagId?: string }
+): {
+  removed_binding_ids: string[];
+  affected_run_ids: string[];
+  removed_event_ids: string[];
+} {
+  const { agentId, dagId } = resolveContext(context?.agentId, context?.dagId);
+  const taskIdSet = new Set(taskIds);
+  const bindingsData = loadTaskBindingsData(agentId, dagId);
+  const runsData = loadSessionRunsData(agentId, dagId);
+  const eventsData = loadPendingEventsData(agentId, dagId);
+
+  const removedBindingIds: string[] = [];
+  const affectedRunIds = new Set<string>();
+  for (const [bindingId, binding] of Object.entries(bindingsData.bindings)) {
+    if (taskIdSet.has(binding.task_id)) {
+      removedBindingIds.push(bindingId);
+      if (binding.run_id) {
+        affectedRunIds.add(binding.run_id);
+      }
+      delete bindingsData.bindings[bindingId];
+    }
+  }
+
+  for (const runId of Object.keys(runsData.runs)) {
+    const run = runsData.runs[runId];
+    const nextTaskIds = run.active_task_ids.filter(taskId => !taskIdSet.has(taskId));
+    if (nextTaskIds.length === 0) {
+      delete runsData.runs[runId];
+      const remainingRunIds = getRunIdsForSession(runsData, run.child_session_key).filter(id => id !== runId);
+      if (remainingRunIds.length === 0) {
+        delete runsData.by_session[run.child_session_key];
+      } else {
+        runsData.by_session[run.child_session_key] = remainingRunIds;
+      }
+      affectedRunIds.add(runId);
+    } else if (nextTaskIds.length !== run.active_task_ids.length) {
+      run.active_task_ids = nextTaskIds;
+      affectedRunIds.add(runId);
+    }
+  }
+
+  const removedEventIds: string[] = [];
+  const remainingEvents = Object.values(eventsData).filter(event => {
+    const shouldRemove = !!event.task_id && taskIdSet.has(event.task_id);
+    if (shouldRemove) {
+      removedEventIds.push(event.event_id);
+    }
+    return !shouldRemove;
+  }).sort((a, b) => a.created_at.localeCompare(b.created_at));
+
+  saveTaskBindingsData(agentId, dagId, bindingsData);
+  saveSessionRunsData(agentId, dagId, runsData);
+  const pendingEventsFile = getPendingEventsFile(agentId, dagId);
+  ensureDir(path.dirname(pendingEventsFile));
+  fs.writeFileSync(pendingEventsFile, remainingEvents.map(event => JSON.stringify(event)).join('\n') + (remainingEvents.length > 0 ? '\n' : ''));
+
+  return {
+    removed_binding_ids: removedBindingIds,
+    affected_run_ids: Array.from(affectedRunIds),
+    removed_event_ids: removedEventIds,
+  };
 }

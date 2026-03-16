@@ -151,7 +151,7 @@ export function saveDAG(dag: TaskDAG): void {
  * 创建新 DAG
  */
 export function createDAG(name: string, tasks: CreateTaskInput[]): TaskDAG {
-  const dagId = `dag-${Date.now()}`;
+  const dagId = `dag-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const dag: TaskDAG = {
     id: dagId,
     name,
@@ -325,6 +325,9 @@ export function removeTask(taskId: string): boolean {
     if (t) {
       for (const subId of t.subtasks) {
         deleteSubtasks(subId);
+      }
+      if (t.doc_path && fs.existsSync(t.doc_path)) {
+        fs.unlinkSync(t.doc_path);
       }
       delete dag.tasks[id];
     }
@@ -513,9 +516,12 @@ export function getLogs(taskId: string, since?: string): Array<{
  * 获取任务文档目录
  */
 function getTaskDocDir(): string {
+  const agentId = getCurrentAgentId();
+  const dagId = getCurrentDagId() || 'default';
   const baseDir = process.env.WORKSPACE_DIR || path.join(os.homedir(), '.openclaw');
-  // 格式：~/.openclaw/workspace-{agent_id}/tasks/docs
-  const docDir = path.join(baseDir, `${WORKSPACE_PREFIX}${getCurrentAgentId()}`, DAG_DIR, 'docs');
+  const docDir = agentId === 'main'
+    ? path.join(baseDir, 'workspace', DAG_DIR, dagId, 'docs')
+    : path.join(baseDir, `${WORKSPACE_PREFIX}${agentId}`, DAG_DIR, dagId, 'docs');
   if (!fs.existsSync(docDir)) {
     fs.mkdirSync(docDir, { recursive: true });
   }

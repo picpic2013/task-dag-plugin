@@ -12,15 +12,17 @@ import {
   consumePendingEvent,
   completeSessionRun,
   completeTaskBinding,
+  listSessionRunsBySessionKey,
   getSessionRunByRunId,
   getSessionRunBySessionKey,
   listPendingEvents,
   listTaskBindings,
+  removeTaskRuntimeState,
   saveSessionRun,
   upsertTaskBinding,
 } from './bindings.js';
 import type { PendingEvent } from './bindings.js';
-import { upsertRequesterSessionScope } from './requester-sessions.js';
+import { removeTasksFromRequesterScopes, upsertRequesterSessionScope } from './requester-sessions.js';
 
 type RuntimeFacade = {
   sessions_spawn?: (params: any) => Promise<any>;
@@ -425,6 +427,10 @@ export async function assignTasksToSession(params: any, context?: any) {
       return { error: 'task_ids must be a non-empty array' };
     }
 
+    const sessionRunsByKey = session_key ? listSessionRunsBySessionKey(session_key, { agentId, dagId: dagIdToUse }) : [];
+    if (!run_id && session_key && sessionRunsByKey.length > 1) {
+      return { error: 'Multiple runs exist for this session_key. Provide run_id explicitly.' };
+    }
     const sessionRun =
       (run_id ? getSessionRunByRunId(run_id, { agentId, dagId: dagIdToUse }) : null) ||
       (session_key ? getSessionRunBySessionKey(session_key, { agentId, dagId: dagIdToUse }) : null);
@@ -567,6 +573,10 @@ function getScopeSessionRun(params: any, context: { agentId: string; dagId?: str
     return getSessionRunByRunId(params.run_id, context);
   }
   if (params.session_key) {
+    const sessionRuns = listSessionRunsBySessionKey(params.session_key, context);
+    if (sessionRuns.length > 1) {
+      throw new Error('Multiple runs exist for this session_key. Provide run_id explicitly.');
+    }
     return getSessionRunBySessionKey(params.session_key, context);
   }
   return null;
@@ -585,14 +595,7 @@ function getScopeTaskIds(params: any, context: { agentId: string; dagId?: string
   if (sessionRun) {
     return sessionRun.active_task_ids;
   }
-
-  const dagData = dag.loadDAG();
-  if (!dagData) {
-    return [];
-  }
-  return Object.values(dagData.tasks)
-    .filter(task => task.executor?.type === 'subagent')
-    .map(task => task.id);
+  return [];
 }
 
 function matchesContinuationScope(event: PendingEvent, params: any, taskIds: string[]): boolean {
@@ -656,8 +659,17 @@ export async function continueParentSession(params: any, context?: any) {
     return { error: error.message };
   }
   const { agentId, dagId } = executionContext;
-  const taskIds = getScopeTaskIds(params, executionContext);
-  const sessionRun = getScopeSessionRun(params, executionContext);
+  if (!params.run_id && !params.session_key && !params.task_id && (!Array.isArray(params.task_ids) || params.task_ids.length === 0)) {
+    return { error: 'Explicit continuation scope is required. Provide run_id, session_key, task_id, or task_ids.' };
+  }
+  let sessionRun;
+  let taskIds: string[];
+  try {
+    sessionRun = getScopeSessionRun(params, executionContext);
+    taskIds = getScopeTaskIds(params, executionContext);
+  } catch (error: any) {
+    return { error: error.message };
+  }
   const requesterSessionKey = getRequesterSessionKey(context, params);
   if (requesterSessionKey && dagId) {
     upsertRequesterSessionScope({
@@ -937,7 +949,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
       }
     },
     execute: async (params, context: any) => {
-      const args = context || params;
+      const args = { ...(context || {}), ...(params || {}) };
       const parentAgentId = args.parent_agent_id;
       
       if (!parentAgentId) {
@@ -1018,8 +1030,34 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
           
           case 'remove':
             if (!task_id) return { error: "Task ID required for remove action" };
+            const taskToRemove = dag.getTask(task_id);
+            if (!taskToRemove) {
+              return { error: `Task ${task_id} not found` };
+            }
+            const collectTaskIds = (id: string, collected: string[]) => {
+              const current = dag.getTask(id);
+              if (!current || collected.includes(id)) {
+                return;
+              }
+              collected.push(id);
+              for (const subId of current.subtasks) {
+                collectTaskIds(subId, collected);
+              }
+            };
+            const removedTaskIds: string[] = [];
+            collectTaskIds(task_id, removedTaskIds);
+            const cleanup = removeTaskRuntimeState(removedTaskIds, {
+              agentId: dag.getCurrentAgentId(),
+              dagId: dag.getCurrentDagId() || undefined,
+            });
+            removeTasksFromRequesterScopes({
+              parent_agent_id: dag.getCurrentAgentId(),
+              dag_id: dag.getCurrentDagId() || 'default',
+              task_ids: removedTaskIds,
+              run_ids: cleanup.affected_run_ids,
+            });
             dag.removeTask(task_id);
-            return { success: true, mermaid: dag.showProgress() };
+            return { success: true, removed_task_ids: removedTaskIds, cleanup, mermaid: dag.showProgress() };
           
           case 'update':
             if (!task_id || !task) return { error: "Task ID and data required for update action" };

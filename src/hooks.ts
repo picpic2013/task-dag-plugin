@@ -12,6 +12,7 @@ import {
   completeTaskBinding,
   getSessionRunByRunId,
   getSessionRunBySessionKey,
+  listSessionRunsBySessionKey,
   listPendingEvents,
   listTaskBindings,
   saveSessionRun,
@@ -273,10 +274,12 @@ export function handleSubagentEndedEvent(event: any, ctx?: HookContext, logger?:
   }
 
   return withHookDagContext(context.agentId, context.dagId, () => {
+    const sessionRunsByKey = listSessionRunsBySessionKey(targetSessionKey, context);
+    const fallbackRunId = sessionRunsByKey.length === 1 ? sessionRunsByKey[0].run_id : undefined;
     const runId =
       event.runId ||
       event.run_id ||
-      getSessionRunBySessionKey(targetSessionKey, context)?.run_id;
+      fallbackRunId;
     const activeBindings = listTaskBindings({ session_key: targetSessionKey, binding_status: 'active' }, context);
 
     if (activeBindings.length === 0) {

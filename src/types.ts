@@ -113,7 +113,7 @@ export interface ModifyAction {
  */
 export function createTask(input: CreateTaskInput): Task {
   const now = new Date().toISOString();
-  const id = input.id || `t${Date.now()}`;
+  const id = input.id || `t${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   
   return {
     id,

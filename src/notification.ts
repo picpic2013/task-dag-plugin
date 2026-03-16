@@ -7,9 +7,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-
-const WORKSPACE = process.env.WORKSPACE_DIR || path.join(os.homedir(), '.openclaw', 'workspace');
-const NOTIFICATIONS_FILE = path.join(WORKSPACE, 'tasks', 'notifications.json');
+import { getCurrentAgentId, getCurrentDagId } from './events.js';
 
 export type NotificationType = 'progress' | 'issue' | 'complete' | 'failed';
 
@@ -27,8 +25,18 @@ interface NotificationsData {
 
 // ============= 辅助函数 =============
 
-function ensureDir(): void {
-  const dir = path.dirname(NOTIFICATIONS_FILE);
+function getNotificationsFile(): string {
+  const workspaceRoot = process.env.WORKSPACE_DIR || path.join(os.homedir(), '.openclaw');
+  const agentId = getCurrentAgentId();
+  const dagId = getCurrentDagId() || 'default';
+  if (agentId === 'main') {
+    return path.join(workspaceRoot, 'workspace', 'tasks', dagId, 'notifications.json');
+  }
+  return path.join(workspaceRoot, `workspace-${agentId}`, 'tasks', dagId, 'notifications.json');
+}
+
+function ensureDirForFile(file: string): void {
+  const dir = path.dirname(file);
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
   }
@@ -36,11 +44,12 @@ function ensureDir(): void {
 
 function loadNotifications(): NotificationsData {
   try {
-    ensureDir();
-    if (!fs.existsSync(NOTIFICATIONS_FILE)) {
+    const file = getNotificationsFile();
+    ensureDirForFile(file);
+    if (!fs.existsSync(file)) {
       return { queue: {} };
     }
-    const data = fs.readFileSync(NOTIFICATIONS_FILE, 'utf-8');
+    const data = fs.readFileSync(file, 'utf-8');
     return JSON.parse(data);
   } catch {
     return { queue: {} };
@@ -48,8 +57,9 @@ function loadNotifications(): NotificationsData {
 }
 
 function saveNotifications(data: NotificationsData): void {
-  ensureDir();
-  fs.writeFileSync(NOTIFICATIONS_FILE, JSON.stringify(data, null, 2));
+  const file = getNotificationsFile();
+  ensureDirForFile(file);
+  fs.writeFileSync(file, JSON.stringify(data, null, 2));
 }
 
 // ============= 核心函数 =============

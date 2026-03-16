@@ -371,6 +371,35 @@ test('bindings and runs survive reload from disk', () => {
   });
 });
 
+test('session key can resolve multiple runs without overwriting previous entries', () => {
+  withTempWorkspace('bindings-session-multi-run', () => {
+    const context = { agentId: 'main', dagId: 'dag-bind-6' };
+
+    bindings.saveSessionRun({
+      run_id: 'run-6a',
+      child_session_key: 'agent:worker:subagent:shared',
+      child_agent_id: 'worker',
+      parent_agent_id: 'main',
+      dag_id: 'dag-bind-6',
+      spawn_mode: 'shared_worker',
+      active_task_ids: ['t1'],
+    }, context);
+    bindings.saveSessionRun({
+      run_id: 'run-6b',
+      child_session_key: 'agent:worker:subagent:shared',
+      child_agent_id: 'worker',
+      parent_agent_id: 'main',
+      dag_id: 'dag-bind-6',
+      spawn_mode: 'shared_worker',
+      active_task_ids: ['t2'],
+    }, context);
+
+    const runs = bindings.listSessionRunsBySessionKey('agent:worker:subagent:shared', context);
+    assert(runs.length === 2, 'Session key should retain both runs');
+    assert(bindings.getSessionRunBySessionKey('agent:worker:subagent:shared', context) === null, 'Ambiguous multi-run session lookup should not guess');
+  });
+});
+
 test('requester session scope persists requester to dag/run mapping', () => {
   withTempWorkspace('requester-scope', () => {
     const scope = requesterSessions.upsertRequesterSessionScope({
@@ -557,6 +586,32 @@ test('task_dag_assign rejects session runs without child agent metadata unless e
   });
 });
 
+test('task_dag_assign rejects ambiguous session_key when multiple runs share the same session', async () => {
+  await withTempWorkspace('tool-assign-ambiguous-session', async () => {
+    const created = dag.createDAG('tool-assign-ambiguous-session', [{ id: 't1', name: 'Task 1' }]);
+    for (const runId of ['run-amb-a', 'run-amb-b']) {
+      bindings.saveSessionRun({
+        run_id: runId,
+        child_session_key: 'agent:worker:subagent:shared-assign',
+        child_agent_id: 'worker',
+        parent_agent_id: 'main',
+        dag_id: created.id,
+        spawn_mode: 'shared_worker',
+        active_task_ids: [],
+      }, { agentId: 'main', dagId: created.id });
+    }
+
+    const result = await tools.assignTasksToSession({
+      task_ids: ['t1'],
+      dag_id: created.id,
+      agent_id: 'main',
+      session_key: 'agent:worker:subagent:shared-assign',
+    }, {});
+
+    assert(result.error?.includes('Multiple runs exist for this session_key'), 'Assign should reject ambiguous session-only selection');
+  });
+});
+
 test('task_dag_poll_events and ack_event expose deterministic event consumption', async () => {
   await withTempWorkspace('tool-events', async () => {
     const created = dag.createDAG('tool-events', [{ id: 't1', name: 'Events task' }]);
@@ -670,6 +725,39 @@ test('task_dag_complete rejects non-running tasks', async () => {
       output_summary: 'done',
     }, {});
     assert(result.error?.includes('cannot be completed'), 'Ready task should not be completed directly');
+  });
+});
+
+test('task_dag_continue requires explicit scope instead of scanning the whole DAG', async () => {
+  await withTempWorkspace('tool-continue-explicit-scope', async () => {
+    const created = dag.createDAG('tool-continue-explicit-scope', [{ id: 't1', name: 'Task 1' }]);
+    const result = await tools.continueParentSession({ dag_id: created.id, agent_id: 'main' }, {});
+    assert(result.error?.includes('Explicit continuation scope is required'), 'Continue should require an explicit scope');
+  });
+});
+
+test('task_dag_continue rejects ambiguous session_key when multiple runs exist', async () => {
+  await withTempWorkspace('tool-continue-ambiguous-session', async () => {
+    const created = dag.createDAG('tool-continue-ambiguous-session', [{ id: 't1', name: 'Task 1' }]);
+    for (const runId of ['run-cont-a', 'run-cont-b']) {
+      bindings.saveSessionRun({
+        run_id: runId,
+        child_session_key: 'agent:worker:subagent:shared-continue',
+        child_agent_id: 'worker',
+        parent_agent_id: 'main',
+        dag_id: created.id,
+        spawn_mode: 'shared_worker',
+        active_task_ids: ['t1'],
+      }, { agentId: 'main', dagId: created.id });
+    }
+
+    const result = await tools.continueParentSession({
+      dag_id: created.id,
+      agent_id: 'main',
+      session_key: 'agent:worker:subagent:shared-continue',
+    }, {});
+
+    assert(result.error?.includes('Multiple runs exist for this session_key'), 'Continue should reject ambiguous session-only scope');
   });
 });
 
@@ -1230,6 +1318,58 @@ test('before_prompt_build injects continuation instructions for requester sessio
   });
 });
 
+test('subagent_ended hook does not guess run_id when one session key has multiple runs', async () => {
+  await withTempWorkspace('hook-ended-ambiguous-run', async () => {
+    dag.setCurrentAgentId('main');
+    const created = dag.createDAG('hook-ended-ambiguous-run', [
+      { id: 't1', name: 'Task 1' },
+      { id: 't2', name: 'Task 2' },
+    ]);
+    requesterSessions.upsertRequesterSessionScope({
+      requester_session_key: 'agent:main',
+      parent_agent_id: 'main',
+      dag_id: created.id,
+      run_id: 'run-ended-a',
+      task_ids: ['t1'],
+    });
+    requesterSessions.upsertRequesterSessionScope({
+      requester_session_key: 'agent:main',
+      parent_agent_id: 'main',
+      dag_id: created.id,
+      run_id: 'run-ended-b',
+      task_ids: ['t2'],
+    });
+    for (const [taskId, runId] of [['t1', 'run-ended-a'], ['t2', 'run-ended-b']]) {
+      bindings.saveSessionRun({
+        run_id: runId,
+        child_session_key: 'agent:worker:subagent:shared-ended',
+        child_agent_id: 'worker',
+        requester_session_key: 'agent:main',
+        parent_agent_id: 'main',
+        dag_id: created.id,
+        spawn_mode: 'shared_worker',
+        active_task_ids: [taskId],
+      }, { agentId: 'main', dagId: created.id });
+      bindings.upsertTaskBinding({
+        dag_id: created.id,
+        task_id: taskId,
+        executor_type: 'subagent',
+        executor_agent_id: 'worker',
+        session_key: 'agent:worker:subagent:shared-ended',
+        run_id: runId,
+        binding_status: 'active',
+      }, { agentId: 'main', dagId: created.id });
+    }
+
+    const result = hooks.handleSubagentEndedEvent({
+      targetSessionKey: 'agent:worker:subagent:shared-ended',
+      outcome: 'ok',
+    }, { requesterSessionKey: 'agent:main', childSessionKey: 'agent:worker:subagent:shared-ended' }, console);
+
+    assert(result.task_ids.length === 0, 'Ended hook should not close tasks when session-only lookup is ambiguous');
+  });
+});
+
 console.log('\n=== Compatibility Context ===\n');
 
 test('compatibility tools respect dag_id instead of drifting to another DAG', async () => {
@@ -1268,6 +1408,143 @@ test('compatibility tools respect dag_id instead of drifting to another DAG', as
 
     assert(firstTask?.description !== 'only-second-dag', 'First DAG should remain untouched');
     assert(secondTask?.description === 'only-second-dag', 'Second DAG should receive the update');
+  });
+});
+
+test('task_dag_get_parent prefers explicit params over context', async () => {
+  await withTempWorkspace('tool-get-parent-params', async () => {
+    dag.setCurrentAgentId('main');
+    const created = dag.createDAG('tool-get-parent-params', [{ id: 't1', name: 'Parent task' }]);
+
+    const registeredTools = {};
+    tools.registerTaskDagTools({
+      logger: { info() {}, warn() {}, error() {} },
+      registerTool(tool) { registeredTools[tool.name] = tool; },
+      registerHook() {},
+      runtime: {},
+      config: {},
+    });
+
+    const getParentTool = registeredTools['task_dag_get_parent'];
+    const result = await getParentTool.execute({
+      parent_agent_id: 'main',
+      dag_id: created.id,
+    }, {
+      parent_agent_id: 'wrong-agent',
+      dag_id: 'wrong-dag',
+    });
+
+    assert(result.parent_agent_id === 'main', 'Explicit params should win over context for parent lookup');
+    assert(result.dag_id === created.id, 'Explicit dag_id should win over context for parent lookup');
+  });
+});
+
+test('task_dag_modify remove cleans runtime artifacts for deleted tasks', async () => {
+  await withTempWorkspace('tool-remove-cleanup', async () => {
+    dag.setCurrentAgentId('main');
+    const created = dag.createDAG('tool-remove-cleanup', [{ id: 't1', name: 'To delete' }]);
+    dag.updateTask('t1', {
+      status: 'waiting_subagent',
+      executor: { type: 'subagent', agent_id: 'worker', session_key: 'agent:worker:subagent:remove', run_id: 'run-remove' },
+      waiting_for: { kind: 'subagent', session_key: 'agent:worker:subagent:remove', run_id: 'run-remove' },
+    });
+    bindings.saveSessionRun({
+      run_id: 'run-remove',
+      child_session_key: 'agent:worker:subagent:remove',
+      child_agent_id: 'worker',
+      requester_session_key: 'agent:main',
+      parent_agent_id: 'main',
+      dag_id: created.id,
+      spawn_mode: 'single_task',
+      active_task_ids: ['t1'],
+    }, { agentId: 'main', dagId: created.id });
+    bindings.upsertTaskBinding({
+      dag_id: created.id,
+      task_id: 't1',
+      executor_type: 'subagent',
+      executor_agent_id: 'worker',
+      session_key: 'agent:worker:subagent:remove',
+      run_id: 'run-remove',
+      binding_status: 'active',
+    }, { agentId: 'main', dagId: created.id });
+    bindings.appendPendingEvent({
+      type: 'subagent_completed',
+      dag_id: created.id,
+      task_id: 't1',
+      session_key: 'agent:worker:subagent:remove',
+      run_id: 'run-remove',
+      payload: { outcome: 'ok' },
+    }, { agentId: 'main', dagId: created.id });
+    requesterSessions.upsertRequesterSessionScope({
+      requester_session_key: 'agent:main',
+      parent_agent_id: 'main',
+      dag_id: created.id,
+      run_id: 'run-remove',
+      task_ids: ['t1'],
+    });
+    dag.setTaskDoc('t1', '# deleted');
+
+    const registeredTools = {};
+    tools.registerTaskDagTools({
+      logger: { info() {}, warn() {}, error() {} },
+      registerTool(tool) { registeredTools[tool.name] = tool; },
+      registerHook() {},
+      runtime: {},
+      config: {},
+    });
+
+    const modifyTool = registeredTools['task_dag_modify'];
+    const result = await modifyTool.execute({
+      action: 'remove',
+      dag_id: created.id,
+      agent_id: 'main',
+      task_id: 't1',
+    }, {});
+
+    assert(result.success === true, 'Task removal should succeed');
+    assert(dag.getTask('t1') === null, 'Removed task should disappear from DAG');
+    assert(bindings.listTaskBindings({ task_id: 't1' }, { agentId: 'main', dagId: created.id }).length === 0, 'Bindings for removed task should be deleted');
+    assert(bindings.getSessionRunByRunId('run-remove', { agentId: 'main', dagId: created.id }) === null, 'Empty session run should be removed');
+    assert(bindings.listPendingEvents({ task_id: 't1', includeConsumed: true }, { agentId: 'main', dagId: created.id }).length === 0, 'Pending events for removed task should be deleted');
+    assert(requesterSessions.findRequesterSessionScope({ requester_session_key: 'agent:main', parent_agent_id: 'main', dag_id: created.id, run_id: 'run-remove' }) === null, 'Requester scope should be cleaned');
+  });
+});
+
+test('task docs are isolated per dag even when task ids match', async () => {
+  await withTempWorkspace('dag-docs-isolated', async (workspaceDir) => {
+    dag.setCurrentAgentId('main');
+    const first = dag.createDAG('dag-docs-1', [{ id: 't1', name: 'Task' }]);
+    dag.setTaskDoc('t1', 'first');
+    const firstPath = dag.getTask('t1')?.doc_path;
+
+    const second = dag.createDAG('dag-docs-2', [{ id: 't1', name: 'Task' }]);
+    dag.setTaskDoc('t1', 'second');
+    const secondPath = dag.getTask('t1')?.doc_path;
+
+    assert(firstPath !== secondPath, 'Doc paths should differ across DAGs');
+    assert(fs.readFileSync(firstPath, 'utf-8') === 'first', 'First DAG doc should keep its content');
+    assert(fs.readFileSync(secondPath, 'utf-8') === 'second', 'Second DAG doc should keep its content');
+    assert(firstPath.includes(path.join('workspace', 'tasks', first.id, 'docs')), 'Main agent docs should live under workspace/tasks/{dag}/docs');
+    assert(secondPath.includes(path.join('workspace', 'tasks', second.id, 'docs')), 'Main agent docs should live under workspace/tasks/{dag}/docs');
+  });
+});
+
+test('notifications are isolated by current dag context', () => {
+  withTempWorkspace('notifications-isolated', () => {
+    dag.setCurrentAgentId('main');
+    const first = dag.createDAG('notif-1', [{ id: 't1', name: 'Task' }]);
+    notification.addNotification('t1', { type: 'progress', message: 'first', timestamp: new Date().toISOString(), agent_id: 'main' });
+
+    const second = dag.createDAG('notif-2', [{ id: 't1', name: 'Task' }]);
+    notification.addNotification('t1', { type: 'progress', message: 'second', timestamp: new Date().toISOString(), agent_id: 'main' });
+
+    dag.setCurrentAgentId('main');
+    dag.setCurrentDagId(first.id);
+    assert(notification.peekNotification('t1')?.message === 'first', 'First DAG should keep its own notification queue');
+
+    dag.setCurrentAgentId('main');
+    dag.setCurrentDagId(second.id);
+    assert(notification.peekNotification('t1')?.message === 'second', 'Second DAG should keep its own notification queue');
   });
 });
 

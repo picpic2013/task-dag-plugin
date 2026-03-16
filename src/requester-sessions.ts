@@ -155,6 +155,43 @@ export function completeRequesterSessionRun(params: {
   return nextScope;
 }
 
+export function removeTasksFromRequesterScopes(params: {
+  parent_agent_id: string;
+  dag_id: string;
+  task_ids: string[];
+  run_ids?: string[];
+}): number {
+  const data = loadData();
+  let updated = 0;
+  const taskIdSet = new Set(params.task_ids);
+  const runIdSet = new Set(params.run_ids || []);
+
+  for (const [scopeId, scope] of Object.entries(data.scopes)) {
+    if (scope.parent_agent_id !== params.parent_agent_id || scope.dag_id !== params.dag_id) {
+      continue;
+    }
+    const nextTaskIds = scope.active_task_ids.filter(taskId => !taskIdSet.has(taskId));
+    const nextRunIds = scope.active_run_ids.filter(runId => !runIdSet.has(runId));
+    if (nextTaskIds.length === scope.active_task_ids.length && nextRunIds.length === scope.active_run_ids.length) {
+      continue;
+    }
+    updated++;
+    if (nextTaskIds.length === 0 && nextRunIds.length === 0) {
+      delete data.scopes[scopeId];
+      continue;
+    }
+    data.scopes[scopeId] = {
+      ...scope,
+      active_task_ids: nextTaskIds,
+      active_run_ids: nextRunIds,
+      updated_at: new Date().toISOString(),
+    };
+  }
+
+  saveData(data);
+  return updated;
+}
+
 export function getRequesterSessionsFilePath(): string {
   return getRequesterSessionsFile();
 }
