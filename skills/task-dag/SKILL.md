@@ -17,7 +17,7 @@ description: "Use for complex task orchestration with DAG dependencies, subagent
 
 1. 优先使用插件提供的高层工具，不要自己拼低层协议。
 2. 父会话的“继续”使用 `task_dag_continue`，不是恢复旧工具调用。
-3. 子 agent 完成后的状态推进主要依赖 hook 和 pending events。
+3. 子 agent 完成后的状态推进主要依赖 hook、requester session 注册表和 pending events。
 4. 不要使用已经移除的旧接口：`task_dag_wait`、`task_dag_update`、`task_dag_notify`。
 
 ## 当前推荐流程
@@ -36,7 +36,8 @@ task_dag_continue task_id="t1"
 ```bash
 task_dag_spawn task_id="t1" task="完成这个子任务" target_agent_id="worker"
 
-# 父会话后续新一轮里
+# 插件会在 ended hook 后主动唤醒父 session
+# 父会话在被唤醒的新一轮里
 task_dag_continue task_id="t1"
 ```
 
@@ -79,7 +80,7 @@ task_dag_continue run_id="run-xxx"
 - `task_dag_ack_event`
   - 手工确认事件
 - `task_dag_continue`
-  - 让父会话决定继续等待、触发下游还是回复用户
+  - 让父会话在被插件唤醒后决定继续等待、触发下游还是回复用户
 - `task_dag_reconcile`
   - 修复 hook 时序差异、孤儿 binding、半完成状态
 
@@ -127,7 +128,7 @@ task_dag_continue run_id="run-xxx"
 2. 父 agent 能自己完成的 task，就直接 claim/progress/complete。
 3. 只有确实需要并行或隔离执行时，才用 `task_dag_spawn`。
 4. 如果一个 worker 要连续做多个 task，用 `task_dag_assign` 绑定到同一 run/session。
-5. 子 agent 完成后，父会话在下一轮使用 `task_dag_continue`。
+5. 子 agent 完成后，插件会主动向 requester session 发送 continuation 消息；父会话在被唤醒的新一轮使用 `task_dag_continue`。
 6. 如果 hook 或时序看起来不一致，使用 `task_dag_reconcile`。
 
 ## 反模式
@@ -149,6 +150,7 @@ task_dag_continue task_id="t1"
 
 - 记住某个 session 到底对应哪个 task
 - 自己猜某个 task 属于哪个 DAG
+- 记住哪个 requester session 该在 completion 后被继续唤醒
 - 自己判断多个 completion 哪一个该给用户输出
 
-这些应优先交给插件的 binding、hook 和 continuation 工具。
+这些应优先交给插件的 binding、requester session 注册表、hook 和 continuation 工具。

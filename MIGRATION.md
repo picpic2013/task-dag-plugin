@@ -32,7 +32,8 @@ create DAG
 ```text
 create DAG
 -> task_dag_claim / task_dag_spawn / task_dag_assign
--> hook + bindings + pending events
+-> hook + bindings + requester session registry + pending events
+-> ended hook 主动唤醒 requester session
 -> task_dag_continue / task_dag_reconcile
 ```
 
@@ -76,6 +77,7 @@ create DAG
 - `session-runs.json`
 - `pending-events.jsonl`
 - `events.jsonl`
+- `requester-sessions.json`
 
 ## 推荐迁移顺序
 
@@ -86,4 +88,9 @@ create DAG
 
 ## 已知边界
 
-插件已经把主要 continuation 逻辑和 task 收尾逻辑代码化，但它仍依赖 OpenClaw runtime 提供 requester session 的 auto-announce 新一轮处理。
+插件已经把主要 continuation 逻辑和 task 收尾逻辑代码化，并在 ended hook 后主动通过 `sessions_send` 唤醒 requester session。
+
+仍然需要注意的边界：
+
+- OpenClaw runtime 仍可能把 completion 直接发给用户
+- 插件无法恢复“原来的工具调用栈”，只能触发父 session 新一轮继续
