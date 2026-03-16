@@ -354,6 +354,7 @@ export async function spawnTaskExecution(runtime: RuntimeFacade, params: any, co
       saveSessionRun({
         run_id: effectiveRunId,
         child_session_key: sessionKey,
+        child_agent_id: targetAgentId,
         requester_session_key: requesterSessionKey,
         parent_agent_id: agentId,
         dag_id: dagIdToUse,
@@ -432,6 +433,10 @@ export async function assignTasksToSession(params: any, context?: any) {
     }
 
     const assigned: string[] = [];
+    const resolvedExecutorAgentId = executor_agent_id || sessionRun.child_agent_id;
+    if (!resolvedExecutorAgentId) {
+      return { error: 'executor_agent_id is required when the session run has no child_agent_id' };
+    }
     for (const taskId of task_ids) {
       const taskResult = getTaskOrError(taskId);
       if ('error' in taskResult) {
@@ -447,7 +452,7 @@ export async function assignTasksToSession(params: any, context?: any) {
         dag_id: dagIdToUse,
         task_id: taskId,
         executor_type: 'subagent',
-        executor_agent_id: executor_agent_id || sessionRun.parent_agent_id,
+        executor_agent_id: resolvedExecutorAgentId,
         session_key: sessionRun.child_session_key,
         run_id: sessionRun.run_id,
         binding_status: 'active',
@@ -456,7 +461,7 @@ export async function assignTasksToSession(params: any, context?: any) {
         status: 'waiting_subagent',
         executor: {
           type: 'subagent',
-          agent_id: executor_agent_id || sessionRun.parent_agent_id,
+          agent_id: resolvedExecutorAgentId,
           session_key: sessionRun.child_session_key,
           run_id: sessionRun.run_id,
           claimed_at: new Date().toISOString(),

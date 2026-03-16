@@ -49,8 +49,8 @@ function saveData(data: RequesterSessionsData): void {
   fs.writeFileSync(file, JSON.stringify(data, null, 2));
 }
 
-function createScopeId(requesterSessionKey: string, dagId: string): string {
-  return `${requesterSessionKey}::${dagId}`;
+function createScopeId(requesterSessionKey: string, parentAgentId: string, dagId: string): string {
+  return `${requesterSessionKey}::${parentAgentId}::${dagId}`;
 }
 
 function unique(items: string[]): string[] {
@@ -65,7 +65,7 @@ export function upsertRequesterSessionScope(input: {
   task_ids?: string[];
 }): RequesterSessionScope {
   const data = loadData();
-  const scopeId = createScopeId(input.requester_session_key, input.dag_id);
+  const scopeId = createScopeId(input.requester_session_key, input.parent_agent_id, input.dag_id);
   const existing = data.scopes[scopeId];
   const scope: RequesterSessionScope = {
     scope_id: scopeId,
@@ -91,11 +91,15 @@ export function listRequesterSessionScopes(requesterSessionKey?: string): Reques
 
 export function findRequesterSessionScope(params: {
   requester_session_key?: string;
+  parent_agent_id?: string;
   dag_id?: string;
   run_id?: string;
   task_id?: string;
 }): RequesterSessionScope | null {
   let scopes = listRequesterSessionScopes(params.requester_session_key);
+  if (params.parent_agent_id) {
+    scopes = scopes.filter(scope => scope.parent_agent_id === params.parent_agent_id);
+  }
   if (params.dag_id) {
     scopes = scopes.filter(scope => scope.dag_id === params.dag_id);
   }
@@ -111,8 +115,11 @@ export function findRequesterSessionScope(params: {
       return taskMatch;
     }
   }
-  if (scopes.length === 1) {
-    return scopes[0];
+  if (params.dag_id) {
+    const dagMatch = scopes.find(scope => scope.dag_id === params.dag_id);
+    if (dagMatch) {
+      return dagMatch;
+    }
   }
   return null;
 }
@@ -123,6 +130,7 @@ export function findRequesterSessionScopeByRunId(runId: string): RequesterSessio
 
 export function completeRequesterSessionRun(params: {
   requester_session_key?: string;
+  parent_agent_id?: string;
   dag_id?: string;
   run_id?: string;
   task_ids?: string[];
@@ -138,7 +146,11 @@ export function completeRequesterSessionRun(params: {
     active_task_ids: scope.active_task_ids.filter(taskId => !(params.task_ids || []).includes(taskId)),
     updated_at: new Date().toISOString(),
   };
-  data.scopes[scope.scope_id] = nextScope;
+  if (nextScope.active_run_ids.length === 0 && nextScope.active_task_ids.length === 0) {
+    delete data.scopes[scope.scope_id];
+  } else {
+    data.scopes[scope.scope_id] = nextScope;
+  }
   saveData(data);
   return nextScope;
 }

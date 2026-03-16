@@ -44,6 +44,7 @@ export interface TaskBinding {
 export interface SessionRun {
   run_id: string;
   child_session_key: string;
+  child_agent_id?: string;
   requester_session_key?: string;
   parent_agent_id: string;
   dag_id: string;
@@ -263,6 +264,7 @@ export function saveSessionRun(
   const sessionRun: SessionRun = {
     run_id: input.run_id,
     child_session_key: input.child_session_key,
+    child_agent_id: input.child_agent_id || existing?.child_agent_id,
     requester_session_key: input.requester_session_key,
     parent_agent_id: input.parent_agent_id,
     dag_id: input.dag_id || dagId,
