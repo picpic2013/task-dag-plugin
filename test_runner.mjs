@@ -542,6 +542,31 @@ test('task_dag_claim marks a task running with executor metadata', async () => {
   });
 });
 
+test('registered task_dag_claim uses runtime execute signature without losing params', async () => {
+  await withTempWorkspace('tool-claim-runtime-signature', async () => {
+    const created = dag.createDAG('tool-claim-runtime-signature', [{ id: 't1', name: 'Claim me' }]);
+    const registeredTools = {};
+    tools.registerTaskDagTools({
+      logger: { info() {}, warn() {}, error() {} },
+      registerTool(tool) { registeredTools[tool.name] = tool; },
+      registerHook() {},
+      runtime: {},
+      config: {},
+    });
+
+    const result = await registeredTools.task_dag_claim.execute('call-claim-runtime', {
+      task_id: 't1',
+      dag_id: created.id,
+      agent_id: 'main',
+      executor_type: 'parent',
+      executor_agent_id: 'main',
+    }, undefined, undefined);
+
+    assert(result.success === true, `Registered claim tool should succeed under runtime signature: ${JSON.stringify(result)}`);
+    assert(dag.getTask('t1')?.status === 'running', 'Registered claim tool should update task state');
+  });
+});
+
 test('task_dag_spawn creates binding and moves task into waiting_subagent', async () => {
   await withTempWorkspace('tool-spawn', async () => {
     const created = dag.createDAG('tool-spawn', [{ id: 't1', name: 'Spawn me' }]);
@@ -765,6 +790,35 @@ test('task_dag_complete rejects non-running tasks', async () => {
       output_summary: 'done',
     }, {});
     assert(result.error?.includes('cannot be completed'), 'Ready task should not be completed directly');
+  });
+});
+
+test('registered task_dag_complete uses runtime execute signature without losing params', async () => {
+  await withTempWorkspace('tool-complete-runtime-signature', async () => {
+    const created = dag.createDAG('tool-complete-runtime-signature', [{ id: 't1', name: 'Task 1' }]);
+    dag.updateTask('t1', {
+      status: 'running',
+      executor: { type: 'parent', agent_id: 'main' },
+    });
+
+    const registeredTools = {};
+    tools.registerTaskDagTools({
+      logger: { info() {}, warn() {}, error() {} },
+      registerTool(tool) { registeredTools[tool.name] = tool; },
+      registerHook() {},
+      runtime: {},
+      config: {},
+    });
+
+    const result = await registeredTools.task_dag_complete.execute('call-complete-runtime', {
+      task_id: 't1',
+      dag_id: created.id,
+      agent_id: 'main',
+      output_summary: 'done',
+    }, undefined, undefined);
+
+    assert(result.success === true, `Registered complete tool should succeed under runtime signature: ${JSON.stringify(result)}`);
+    assert(dag.getTask('t1')?.status === 'done', 'Registered complete tool should mark the task done');
   });
 });
 
@@ -1430,13 +1484,13 @@ test('compatibility tools respect dag_id instead of drifting to another DAG', as
 
     const updateTool = registeredTools['task_dag_modify'];
 
-    await updateTool.execute({
+    await updateTool.execute('call-compat-update', {
       action: 'update',
       dag_id: second.id,
       agent_id: 'main',
       task_id: 't1',
       task: { description: 'only-second-dag' },
-    }, {});
+    }, undefined, undefined);
 
     dag.setCurrentAgentId('main');
     dag.setCurrentDagId(first.id);
@@ -1466,13 +1520,10 @@ test('task_dag_get_parent prefers explicit params over context', async () => {
     });
 
     const getParentTool = registeredTools['task_dag_get_parent'];
-    const result = await getParentTool.execute({
+    const result = await getParentTool.execute('call-get-parent', {
       parent_agent_id: 'main',
       dag_id: created.id,
-    }, {
-      parent_agent_id: 'wrong-agent',
-      dag_id: 'wrong-dag',
-    });
+    }, undefined, undefined);
 
     assert(result.parent_agent_id === 'main', 'Explicit params should win over context for parent lookup');
     assert(result.dag_id === created.id, 'Explicit dag_id should win over context for parent lookup');
@@ -1534,12 +1585,12 @@ test('task_dag_modify remove cleans runtime artifacts for deleted tasks', async 
     });
 
     const modifyTool = registeredTools['task_dag_modify'];
-    const result = await modifyTool.execute({
+    const result = await modifyTool.execute('call-remove-task', {
       action: 'remove',
       dag_id: created.id,
       agent_id: 'main',
       task_id: 't1',
-    }, {});
+    }, undefined, undefined);
 
     assert(result.success === true, 'Task removal should succeed');
     assert(dag.getTask('t1') === null, 'Removed task should disappear from DAG');
@@ -1605,11 +1656,11 @@ test('compatibility helpers can operate on a non-main agent DAG', async () => {
     const contextTool = registeredTools['task_dag_context'];
     const resumeTool = registeredTools['task_dag_resume'];
 
-    const contextResult = await contextTool.execute({ task_id: 't1', dag_id: created.id }, { agent_id: 'worker-parent' });
+    const contextResult = await contextTool.execute('call-context-non-main', { task_id: 't1', dag_id: created.id, agent_id: 'worker-parent' }, undefined, undefined);
     assert(contextResult.dag_name === 'compat-agent', 'Context tool should resolve under non-main agent');
 
     dag.updateTask('t1', { status: 'done', output_summary: 'done' });
-    await resumeTool.execute({ task_id: 't1', dag_id: created.id }, { agent_id: 'worker-parent' });
+    await resumeTool.execute('call-resume-non-main', { task_id: 't1', dag_id: created.id, agent_id: 'worker-parent' }, undefined, undefined);
     assert(dag.getTask('t1')?.status === 'ready', 'Resume tool should mutate the non-main agent DAG');
   });
 });

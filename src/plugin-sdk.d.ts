@@ -29,7 +29,7 @@ export interface ToolDefinition {
     properties: Record<string, any>;
     required?: string[];
   };
-  execute: (params: any, context?: any) => Promise<any>;
+  execute: (toolCallId: string, params: any, signal?: AbortSignal, onUpdate?: any) => Promise<any>;
 }
 
 export interface ToolOptions {
