@@ -829,8 +829,8 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
         // 同时检查 context 和 params，params 优先
         const args = { ...(context || {}), ...(params || {}) };
         
-        // 获取 agent ID（支持继承父 agent）
-        const { agentId } = setExecutionContext(context, params, { requireAgent: false, allowDefaultMain: true });
+        // 创建 DAG 时必须显式指定 agent 归属，不能静默回退到 main
+        const { agentId } = setExecutionContext(context, params, { requireAgent: true });
         
         // 解析 name 参数
         const dagName = args.name || args.project_name || args.title || 'Untitled';

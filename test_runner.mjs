@@ -109,6 +109,46 @@ test('createDAG marks root tasks as ready and dependent tasks as blocked', () =>
   });
 });
 
+test('task_dag_create requires explicit agent context instead of defaulting to main', async () => {
+  await withTempWorkspace('tool-create-explicit-agent', async () => {
+    const registeredTools = {};
+    tools.registerTaskDagTools({
+      logger: { info() {}, warn() {}, error() {} },
+      registerTool(tool) { registeredTools[tool.name] = tool; },
+      registerHook() {},
+      runtime: {},
+      config: {},
+    });
+
+    const result = await registeredTools.task_dag_create.execute('call-create-1', { name: 'chexie-dag', tasks: [{ id: 't1', name: 'Task 1', assigned_agent: 'parent' }] }, undefined, undefined);
+    assert(typeof result.error === 'string', 'Create should fail without explicit agent context');
+    assert(result.error.includes('Explicit agent context is required'), 'Create should require explicit agent context');
+  });
+});
+
+test('task_dag_create stores DAG under explicit non-main agent workspace', async () => {
+  await withTempWorkspace('tool-create-chexie', async (workspaceDir) => {
+    const registeredTools = {};
+    tools.registerTaskDagTools({
+      logger: { info() {}, warn() {}, error() {} },
+      registerTool(tool) { registeredTools[tool.name] = tool; },
+      registerHook() {},
+      runtime: {},
+      config: {},
+    });
+
+    const result = await registeredTools.task_dag_create.execute('call-create-2', {
+      name: 'chexie-dag',
+      agent_id: 'chexie',
+      tasks: [{ id: 't1', name: 'Task 1', assigned_agent: 'parent' }],
+    }, undefined, undefined);
+
+    assert(result.success === true, 'Create should succeed with explicit agent_id');
+    const dagFile = path.join(workspaceDir, 'workspace-chexie', 'tasks', result.dag_id, 'dag.json');
+    assert(fs.existsSync(dagFile), 'DAG should be written into workspace-chexie');
+  });
+});
+
 test('getReadyTasks only returns ready tasks', () => {
   withTempWorkspace('state-ready-list', () => {
     dag.createDAG('ready-list', [
