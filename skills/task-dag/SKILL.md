@@ -19,34 +19,50 @@ description: "Use for complex task orchestration with DAG dependencies, subagent
 2. 父会话的“继续”使用 `task_dag_continue`，不是恢复旧工具调用。
 3. 子 agent 完成后的状态推进主要依赖 hook、requester session 注册表和 pending events。
 4. 不要使用已经移除的旧接口：`task_dag_wait`、`task_dag_update`、`task_dag_notify`。
+5. 工具层不依赖隐式 runtime session context；非 `main` agent 必须显式传 `agent_id`。
+6. `task_dag_spawn` 若需要父会话恢复，必须显式传 `requester_session_key`。
+7. `task_dag_continue` 必须显式带 continuation scope：`run_id`、`session_key`、`task_id`、`task_ids` 之一。
 
 ## 当前推荐流程
 
 ### 父 agent 直接执行 task
 
 ```bash
-task_dag_claim task_id="t1" executor_type="parent"
-task_dag_progress task_id="t1" progress=40 message="处理中"
-task_dag_complete task_id="t1" output_summary="已完成"
-task_dag_continue task_id="t1"
+task_dag_claim agent_id="main" task_id="t1" executor_type="parent"
+task_dag_progress agent_id="main" task_id="t1" progress=40 message="处理中"
+task_dag_complete agent_id="main" task_id="t1" output_summary="已完成"
+task_dag_continue agent_id="main" task_id="t1"
 ```
 
 ### 子 agent 执行单个 task
 
 ```bash
-task_dag_spawn task_id="t1" task="完成这个子任务" target_agent_id="worker"
+task_dag_spawn agent_id="main" requester_session_key="agent:main:feishu:group:xxx" task_id="t1" task="完成这个子任务" target_agent_id="worker"
 
 # 插件会在 ended hook 后主动唤醒父 session
 # 父会话在被唤醒的新一轮里
-task_dag_continue task_id="t1"
+task_dag_continue agent_id="main" task_id="t1"
 ```
 
 ### 一个子 agent 处理多个 task
 
 ```bash
-task_dag_spawn task_id="t1" task="先做第一个任务" target_agent_id="worker"
-task_dag_assign run_id="run-xxx" task_ids=["t2","t3"] executor_agent_id="worker"
-task_dag_continue run_id="run-xxx"
+task_dag_spawn agent_id="main" requester_session_key="agent:main:feishu:group:xxx" task_id="t1" task="先做第一个任务" target_agent_id="worker"
+task_dag_assign agent_id="main" run_id="run-xxx" task_ids=["t2","t3"] executor_agent_id="worker"
+task_dag_continue agent_id="main" run_id="run-xxx"
+```
+
+### 非 `main` agent 示例
+
+```bash
+task_dag_create agent_id="chexie" name="Chexie README Flow" tasks=[
+  {id:"t1",name:"阅读前端 README",assigned_agent:"parent"},
+  {id:"t2",name:"阅读后端 README",assigned_agent:"parent"}
+]
+
+task_dag_claim agent_id="chexie" dag_id="dag-xxx" task_id="t1" executor_type="parent" executor_agent_id="chexie"
+task_dag_complete agent_id="chexie" dag_id="dag-xxx" task_id="t1" output_summary="前端 README 已总结"
+task_dag_continue agent_id="chexie" dag_id="dag-xxx" task_ids=["t1","t2"]
 ```
 
 ## 工具选择
@@ -125,11 +141,13 @@ task_dag_continue run_id="run-xxx"
 ## 推荐实践
 
 1. 创建 DAG 后，先看 `task_dag_ready`。
+1.1. 创建 DAG 时显式传 `agent_id`；不要假设会自动继承当前 agent。
 2. 父 agent 能自己完成的 task，就直接 claim/progress/complete。
-3. 只有确实需要并行或隔离执行时，才用 `task_dag_spawn`。
+3. 只有确实需要并行或隔离执行时，才用 `task_dag_spawn`，并显式传 `requester_session_key`。
 4. 如果一个 worker 要连续做多个 task，用 `task_dag_assign` 绑定到同一 run/session。
 5. 子 agent 完成后，插件会主动向 requester session 发送 continuation 消息；父会话在被唤醒的新一轮使用 `task_dag_continue`。
-6. 如果 hook 或时序看起来不一致，使用 `task_dag_reconcile`。
+6. 调 `task_dag_continue` 时显式传 `run_id/session_key/task_id/task_ids` 之一，不要空调用。
+7. 如果 hook 或时序看起来不一致，使用 `task_dag_reconcile`。
 
 ## 反模式
 
@@ -142,15 +160,22 @@ sessions_spawn task="..." label="task:t1"
 应改为：
 
 ```bash
-task_dag_spawn task_id="t1" task="..."
-task_dag_continue task_id="t1"
+task_dag_spawn agent_id="main" requester_session_key="agent:main:feishu:group:xxx" task_id="t1" task="..."
+task_dag_continue agent_id="main" task_id="t1"
 ```
 
 不要把这些职责压给模型记忆：
 
+- 猜当前 DAG 到底属于 `main` 还是某个非 `main` agent
 - 记住某个 session 到底对应哪个 task
 - 自己猜某个 task 属于哪个 DAG
 - 记住哪个 requester session 该在 completion 后被继续唤醒
 - 自己判断多个 completion 哪一个该给用户输出
+
+不要省略这些关键参数：
+
+- `agent_id`
+- `requester_session_key`
+- `task_dag_continue` 的 scope 参数
 
 这些应优先交给插件的 binding、requester session 注册表、hook 和 continuation 工具。
