@@ -5,9 +5,7 @@
  */
 
 import type { OpenClawPluginApi } from "./plugin-sdk.js";
-import { getAgentByTask, updateAgentStatus, saveSessionMapping, saveSessionHierarchy, getParentAgentId, getSessionInfo } from './agent.js';
 import { addEvent } from './events.js';
-import { addNotification } from './notification.js';
 import {
   appendPendingEvent,
   completeSessionRun,
@@ -16,6 +14,8 @@ import {
   getSessionRunBySessionKey,
   listPendingEvents,
   listTaskBindings,
+  saveSessionRun,
+  upsertTaskBinding,
 } from './bindings.js';
 import * as dag from './dag.js';
 
@@ -46,53 +46,17 @@ export function parseTaskLabel(label: string): string | null {
   return null;
 }
 
-/**
- * 通知恢复
- */
-export function notifyOnResume(taskId: string): void {
-  // 1. 通知该任务的 agent
-  const agentId = getAgentByTask(taskId);
-  if (agentId) {
-    addNotification(taskId, {
-      type: 'issue',
-      message: `任务 ${taskId} 已重置，需要重新执行`,
-      timestamp: new Date().toISOString(),
-      agent_id: 'system'
-    });
-  }
-  
-  // 2. 通知下游任务的 agent
-  const dagData = dag.loadDAG?.();
-  if (dagData?.tasks) {
-    for (const [tid, task] of Object.entries(dagData.tasks)) {
-      if (task.dependencies?.includes(taskId)) {
-        const downstreamAgent = getAgentByTask(tid);
-        if (downstreamAgent) {
-          addNotification(tid, {
-            type: 'issue',
-            message: `上游任务 ${taskId} 已重置`,
-            timestamp: new Date().toISOString(),
-            agent_id: 'system'
-          });
-        }
-      }
-    }
-  }
-}
-
 function setHookDagContext(agentId: string, dagId: string): void {
   dag.setCurrentAgentId(agentId);
   dag.setCurrentDagId(dagId);
 }
 
 function getHookContextFromSpawnEvent(event: any): { agentId: string; dagId: string } | null {
-  const dagId = event.dagId || event.dag_id || dag.getCurrentDagId();
+  const dagId = event.dagId || event.dag_id;
   const requesterSessionKey = event.requesterSessionKey;
   const parentAgentId =
     event.parentAgentId ||
-    event.parent_agent_id ||
-    (requesterSessionKey ? getParentAgentId(requesterSessionKey) : null) ||
-    dag.getCurrentAgentId();
+    event.parent_agent_id;
 
   if (!dagId || !parentAgentId) {
     return null;
@@ -102,15 +66,11 @@ function getHookContextFromSpawnEvent(event: any): { agentId: string; dagId: str
 }
 
 function getHookContextFromEndedEvent(event: any): { agentId: string; dagId: string } | null {
-  const targetSessionKey = event.targetSessionKey || event.childSessionKey || event.sessionKey;
   const runId = event.runId || event.run_id;
-  const sessionInfo = targetSessionKey ? getSessionInfo(targetSessionKey) : null;
-  const dagId = event.dagId || event.dag_id || sessionInfo?.dagId || dag.getCurrentDagId();
+  const dagId = event.dagId || event.dag_id;
   const parentAgentId =
     event.parentAgentId ||
-    event.parent_agent_id ||
-    (targetSessionKey ? getParentAgentId(targetSessionKey) : null) ||
-    dag.getCurrentAgentId();
+    event.parent_agent_id;
 
   if (!dagId || !parentAgentId) {
     return null;
@@ -137,13 +97,13 @@ function markNewlyReadyTasks(sourceTaskIds: string[], context: { agentId: string
     .map(task => task.id);
 
   for (const readyTaskId of newlyReady) {
-  appendPendingEvent({
-    type: 'task_ready',
-    dag_id: context.dagId,
-    task_id: readyTaskId,
-    dedupe_key: `task_ready:${context.dagId}:${readyTaskId}:${sourceTaskIds.slice().sort().join(',')}`,
-    payload: { source_task_ids: sourceTaskIds },
-  }, context);
+    appendPendingEvent({
+      type: 'task_ready',
+      dag_id: context.dagId,
+      task_id: readyTaskId,
+      dedupe_key: `task_ready:${context.dagId}:${readyTaskId}:${sourceTaskIds.slice().sort().join(',')}`,
+      payload: { source_task_ids: sourceTaskIds },
+    }, context);
     addEvent({
       event: 'task_ready',
       task_id: readyTaskId,
@@ -168,7 +128,6 @@ export function handleSubagentSpawnedEvent(event: any, logger?: OpenClawPluginAp
   }
 
   setHookDagContext(context.agentId, context.dagId);
-  saveSessionHierarchy(childSessionKey, requesterSessionKey, context.agentId);
 
   const taskId = parseTaskLabel(label);
   if (!taskId) {
@@ -176,21 +135,34 @@ export function handleSubagentSpawnedEvent(event: any, logger?: OpenClawPluginAp
     return;
   }
 
-  saveSessionMapping(childSessionKey, taskId, agentId, {
-    dagId: context.dagId,
-    runId: event.runId || event.run_id,
-    requesterSessionKey,
+  const runId = event.runId || event.run_id || `run-${taskId}-${Date.now()}`;
+  saveSessionRun({
+    run_id: runId,
+    child_session_key: childSessionKey,
+    requester_session_key: requesterSessionKey,
+    parent_agent_id: context.agentId,
+    dag_id: context.dagId,
+    spawn_mode: 'single_task',
     label,
-    parentAgentId: context.agentId,
-  });
+    active_task_ids: [taskId],
+  }, context);
+  upsertTaskBinding({
+    dag_id: context.dagId,
+    task_id: taskId,
+    executor_type: 'subagent',
+    executor_agent_id: agentId,
+    session_key: childSessionKey,
+    run_id: runId,
+    binding_status: 'active',
+  }, context);
 
   appendPendingEvent({
     type: 'subagent_spawned',
     dag_id: context.dagId,
     task_id: taskId,
     session_key: childSessionKey,
-    run_id: event.runId || event.run_id,
-    dedupe_key: `subagent_spawned:${context.dagId}:${taskId}:${event.runId || event.run_id || childSessionKey}`,
+    run_id: runId,
+    dedupe_key: `subagent_spawned:${context.dagId}:${taskId}:${runId}`,
     payload: { requester_session_key: requesterSessionKey, label, agent_id: agentId },
   }, context);
 
@@ -283,10 +255,6 @@ export function handleSubagentEndedEvent(event: any, logger?: OpenClawPluginApi[
     }
 
     completeTaskBinding(binding.binding_id, isSuccess ? 'completed' : 'failed', context);
-    const mappedAgentId = getAgentByTask(binding.task_id);
-    if (mappedAgentId) {
-      updateAgentStatus(mappedAgentId, isSuccess ? 'completed' : 'failed');
-    }
 
     appendPendingEvent({
       type: isSuccess ? 'subagent_completed' : 'subagent_failed',

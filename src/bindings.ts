@@ -7,8 +7,6 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { getCurrentAgentId, getCurrentDagId } from './events.js';
-
 const DEFAULT_WORKSPACE = path.join(os.homedir(), '.openclaw');
 const WORKSPACE_PREFIX = 'workspace-';
 const DAG_DIR = 'tasks';
@@ -89,10 +87,13 @@ function getStorageDirForAgent(agentId: string, dagId: string): string {
 }
 
 function resolveContext(agentId?: string, dagId?: string): { agentId: string; dagId: string } {
-  return {
-    agentId: agentId || getCurrentAgentId(),
-    dagId: dagId || getCurrentDagId() || 'default',
-  };
+  if (!agentId) {
+    throw new Error('bindings context requires explicit agentId');
+  }
+  if (!dagId) {
+    throw new Error('bindings context requires explicit dagId');
+  }
+  return { agentId, dagId };
 }
 
 function ensureDir(dir: string): void {

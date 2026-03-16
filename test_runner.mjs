@@ -12,7 +12,6 @@ fs.rmSync(testWorkspaceDir, { recursive: true, force: true });
 fs.mkdirSync(testWorkspaceDir, { recursive: true });
 process.env.WORKSPACE_DIR = testWorkspaceDir;
 
-const waiter = await import('./dist/src/waiter.js');
 const notification = await import('./dist/src/notification.js');
 const dag = await import('./dist/src/dag.js');
 const types = await import('./dist/src/types.js');
@@ -42,43 +41,8 @@ function withTempWorkspace(name, fn) {
   return fn(workspaceDir);
 }
 
-console.log('=== Waiter Module ===\n');
-
-// Test 1
-test('register and get waiting task', () => {
-  waiter.registerWaiting('agent-1', 't1', 3600);
-  assert(waiter.getWaitingTask('agent-1') === 't1', 'Should get task t1');
-});
-
-// Test 2
-test('get waiting agent', () => {
-  assert(waiter.getWaitingAgent('t1') === 'agent-1', 'Should get agent-1');
-});
-
-// Test 3
-test('unregister waiting', () => {
-  waiter.unregisterWaiting('agent-1');
-  assert(waiter.getWaitingTask('agent-1') === null, 'Should be null after unregister');
-});
-
-// Test 4
-test('get all waiting', () => {
-  waiter.registerWaiting('agent-1', 't1', 3600);
-  waiter.registerWaiting('agent-2', 't2', 1800);
-  const all = waiter.getAllWaiting();
-  assert(all.length === 2, 'Should have 2 waiting entries');
-});
-
-// Test 5
-test('is waiting', () => {
-  assert(waiter.isWaiting('t1') === true, 't1 should be waiting');
-  assert(waiter.isWaiting('t2') === true, 't2 should be waiting');
-  assert(waiter.isWaiting('t3') === false, 't3 should not be waiting');
-});
-
 console.log('\n=== Notification Module ===\n');
 
-// Test 6
 test('add and peek notification', () => {
   notification.addNotification('task-1', {
     type: 'progress',
@@ -90,14 +54,12 @@ test('add and peek notification', () => {
   assert(notif.message === '50%', 'Should get 50% message');
 });
 
-// Test 7
 test('get and clear notification', () => {
   const notif = notification.getAndClearNotification('task-1');
   assert(notif.message === '50%', 'Should get and remove notification');
   assert(notification.getAndClearNotification('task-1') === null, 'Should be null after clear');
 });
 
-// Test 8
 test('multiple notifications', () => {
   notification.addNotification('task-2', { type: 'progress', message: '30%', timestamp: new Date().toISOString(), agent_id: 'a1' });
   notification.addNotification('task-2', { type: 'progress', message: '60%', timestamp: new Date().toISOString(), agent_id: 'a1' });
@@ -105,20 +67,17 @@ test('multiple notifications', () => {
   assert(all.length === 2, 'Should have 2 notifications');
 });
 
-// Test 9
 test('clear notifications', () => {
   notification.clearNotifications('task-2');
   assert(notification.peekNotification('task-2') === null, 'Should be null after clear');
 });
 
-// Test 10
 test('get tasks with notifications', () => {
   notification.addNotification('task-A', { type: 'progress', message: 'test', timestamp: new Date().toISOString(), agent_id: 'a' });
   const tasks = notification.getTasksWithNotifications();
   assert(tasks.includes('task-A') || tasks.length >= 0, 'Should include task-A');
 });
 
-// Test 11
 test('notification count', () => {
   const count = notification.getNotificationCount('task-A');
   assert(count >= 0, 'Count should be >= 0');
@@ -126,22 +85,13 @@ test('notification count', () => {
 
 console.log('\n=== Integration ===\n');
 
-// Test 12
 test('complete flow', () => {
-  // Register wait
-  waiter.registerWaiting('main', 't1', 3600);
-  assert(waiter.getWaitingTask('main') === 't1', 'Should register wait');
-  
   // Add notification
   notification.addNotification('t1', { type: 'progress', message: '进度50%', timestamp: new Date().toISOString(), agent_id: 'sub' });
   
   // Get notification
   const notif = notification.getAndClearNotification('t1');
   assert(notif.message === '进度50%', 'Should get notification');
-  
-  // Unregister
-  waiter.unregisterWaiting('main');
-  assert(waiter.getWaitingTask('main') === null, 'Should unregister');
 });
 
 console.log('\n=== Task State Machine ===\n');
@@ -420,13 +370,25 @@ test('bindings and runs survive reload from disk', () => {
   });
 });
 
+test('bindings require explicit context', () => {
+  let errorMessage = '';
+  try {
+    bindings.listTaskBindings({ task_id: 't1' });
+  } catch (error) {
+    errorMessage = error.message;
+  }
+  assert(errorMessage.includes('explicit agentId'), 'Bindings should reject missing explicit context');
+});
+
 console.log('\n=== Tool Protocol ===\n');
 
 test('task_dag_claim marks a task running with executor metadata', async () => {
   await withTempWorkspace('tool-claim', async () => {
-    dag.createDAG('tool-claim', [{ id: 't1', name: 'Claim me' }]);
+    const created = dag.createDAG('tool-claim', [{ id: 't1', name: 'Claim me' }]);
     const result = await tools.claimTaskExecution({
       task_id: 't1',
+      dag_id: created.id,
+      agent_id: 'main',
       executor_type: 'parent',
       executor_agent_id: 'main',
       message: 'started work',
@@ -440,7 +402,7 @@ test('task_dag_claim marks a task running with executor metadata', async () => {
 
 test('task_dag_spawn creates binding and moves task into waiting_subagent', async () => {
   await withTempWorkspace('tool-spawn', async () => {
-    dag.createDAG('tool-spawn', [{ id: 't1', name: 'Spawn me' }]);
+    const created = dag.createDAG('tool-spawn', [{ id: 't1', name: 'Spawn me' }]);
 
     const runtime = {
       sessions_spawn: async () => ({
@@ -451,20 +413,23 @@ test('task_dag_spawn creates binding and moves task into waiting_subagent', asyn
 
     const result = await tools.spawnTaskExecution(runtime, {
       task_id: 't1',
+      dag_id: created.id,
+      agent_id: 'main',
       task: 'Do sub work',
       agentId: 'worker',
     }, { session: { key: 'agent:main' } });
 
     assert(result.success === true, 'Spawn should succeed');
     assert(dag.getTask('t1')?.status === 'waiting_subagent', 'Task should wait on subagent');
-    assert(bindings.listTaskBindings({ task_id: 't1' }, { dagId: result.dag_id }).length === 1, 'Binding should exist');
-    assert(bindings.getSessionRunByRunId('run-spawn-1', { dagId: result.dag_id })?.child_session_key === 'agent:worker:subagent:spawn-1', 'Session run should persist');
+    assert(bindings.listTaskBindings({ task_id: 't1' }, { agentId: 'main', dagId: result.dag_id }).length === 1, 'Binding should exist');
+    assert(bindings.getSessionRunByRunId('run-spawn-1', { agentId: 'main', dagId: result.dag_id })?.child_session_key === 'agent:worker:subagent:spawn-1', 'Session run should persist');
+    assert(bindings.listPendingEvents({ type: 'subagent_spawned' }, { agentId: 'main', dagId: result.dag_id }).length === 0, 'Spawn tool should not emit hook-owned spawn event');
   });
 });
 
 test('task_dag_assign binds multiple tasks to the same session run', async () => {
   await withTempWorkspace('tool-assign', async () => {
-    dag.createDAG('tool-assign', [
+    const created = dag.createDAG('tool-assign', [
       { id: 't1', name: 'Task 1' },
       { id: 't2', name: 'Task 2' },
     ]);
@@ -473,48 +438,50 @@ test('task_dag_assign binds multiple tasks to the same session run', async () =>
       run_id: 'run-assign-1',
       child_session_key: 'agent:worker:subagent:assign-1',
       parent_agent_id: 'main',
-      dag_id: dag.getCurrentDagId(),
+      dag_id: created.id,
       spawn_mode: 'shared_worker',
       active_task_ids: ['t1'],
-    }, { dagId: dag.getCurrentDagId() });
+    }, { agentId: 'main', dagId: created.id });
 
     const result = await tools.assignTasksToSession({
       task_ids: ['t1', 't2'],
+      dag_id: created.id,
+      agent_id: 'main',
       run_id: 'run-assign-1',
       executor_agent_id: 'worker',
     }, {});
 
     assert(result.success === true, 'Assign should succeed');
     assert(result.assigned_task_ids.length === 2, 'Two tasks should be assigned');
-    assert(bindings.getSessionRunByRunId('run-assign-1', { dagId: dag.getCurrentDagId() })?.active_task_ids.length === 2, 'Run should track both tasks');
+    assert(bindings.getSessionRunByRunId('run-assign-1', { agentId: 'main', dagId: created.id })?.active_task_ids.length === 2, 'Run should track both tasks');
   });
 });
 
 test('task_dag_poll_events and ack_event expose deterministic event consumption', async () => {
   await withTempWorkspace('tool-events', async () => {
-    dag.createDAG('tool-events', [{ id: 't1', name: 'Events task' }]);
+    const created = dag.createDAG('tool-events', [{ id: 't1', name: 'Events task' }]);
     const dagId = dag.getCurrentDagId();
     const event = bindings.appendPendingEvent({
       type: 'task_progress',
       dag_id: dagId,
       task_id: 't1',
       payload: { progress: 25 },
-    }, { dagId });
+    }, { agentId: 'main', dagId });
 
-    const polled = await tools.pollTaskEvents({ task_id: 't1' }, {});
+    const polled = await tools.pollTaskEvents({ task_id: 't1', dag_id: created.id, agent_id: 'main' }, {});
     assert(polled.events.length === 1, 'Poll should return one event');
 
-    const acked = await tools.ackTaskEvent({ event_id: event.event_id }, {});
+    const acked = await tools.ackTaskEvent({ event_id: event.event_id, dag_id: created.id, agent_id: 'main' }, {});
     assert(acked.success === true, 'Ack should succeed');
 
-    const afterAck = await tools.pollTaskEvents({ task_id: 't1' }, {});
+    const afterAck = await tools.pollTaskEvents({ task_id: 't1', dag_id: created.id, agent_id: 'main' }, {});
     assert(afterAck.events.length === 0, 'Consumed event should no longer appear by default');
   });
 });
 
 test('task_dag_reconcile closes terminal task bindings', async () => {
   await withTempWorkspace('tool-reconcile', async () => {
-    dag.createDAG('tool-reconcile', [{ id: 't1', name: 'Reconcile me' }]);
+    const created = dag.createDAG('tool-reconcile', [{ id: 't1', name: 'Reconcile me' }]);
     const dagId = dag.getCurrentDagId();
 
     bindings.upsertTaskBinding({
@@ -525,13 +492,84 @@ test('task_dag_reconcile closes terminal task bindings', async () => {
       session_key: 'agent:worker:subagent:reconcile',
       run_id: 'run-reconcile',
       binding_status: 'active',
-    }, { dagId });
+    }, { agentId: 'main', dagId });
     dag.updateTask('t1', { status: 'done', output_summary: 'finished' });
 
-    const result = await tools.reconcileTaskDagState({}, {});
+    const result = await tools.reconcileTaskDagState({ dag_id: created.id, agent_id: 'main' }, {});
     assert(result.success === true, 'Reconcile should succeed');
     assert(result.reconciled.length === 1, 'Reconcile should fix one task');
-    assert(bindings.listTaskBindings({ task_id: 't1', binding_status: 'active' }, { dagId }).length === 0, 'Active binding should be closed');
+    assert(bindings.listTaskBindings({ task_id: 't1', binding_status: 'active' }, { agentId: 'main', dagId }).length === 0, 'Active binding should be closed');
+  });
+});
+
+test('task_dag_claim rejects missing explicit agent context', async () => {
+  await withTempWorkspace('tool-claim-context-error', async () => {
+    const created = dag.createDAG('tool-claim-context-error', [{ id: 't1', name: 'Claim me' }]);
+    const result = await tools.claimTaskExecution({ task_id: 't1', dag_id: created.id }, {});
+    assert(typeof result.error === 'string', 'Claim should reject missing agent context');
+  });
+});
+
+test('task_dag_claim rejects blocked tasks', async () => {
+  await withTempWorkspace('tool-claim-blocked', async () => {
+    const created = dag.createDAG('tool-claim-blocked', [
+      { id: 't1', name: 'Root' },
+      { id: 't2', name: 'Blocked', dependencies: ['t1'] },
+    ]);
+    const result = await tools.claimTaskExecution({ task_id: 't2', dag_id: created.id, agent_id: 'main' }, {});
+    assert(result.error?.includes('cannot be claimed'), 'Blocked task should not be claimable');
+  });
+});
+
+test('task_dag_spawn rejects terminal tasks', async () => {
+  await withTempWorkspace('tool-spawn-terminal', async () => {
+    const created = dag.createDAG('tool-spawn-terminal', [{ id: 't1', name: 'Done task' }]);
+    dag.updateTask('t1', { status: 'done' });
+    const result = await tools.spawnTaskExecution({ sessions_spawn: async () => ({ sessionKey: 's', runId: 'r' }) }, {
+      task_id: 't1',
+      dag_id: created.id,
+      agent_id: 'main',
+      task: 'noop',
+      agentId: 'worker',
+    }, {});
+    assert(result.error?.includes('cannot spawn a subagent'), 'Done task should not spawn');
+  });
+});
+
+test('task_dag_assign rejects non-ready tasks', async () => {
+  await withTempWorkspace('tool-assign-terminal', async () => {
+    const created = dag.createDAG('tool-assign-terminal', [{ id: 't1', name: 'Task 1' }]);
+    dag.updateTask('t1', { status: 'done' });
+    bindings.saveSessionRun({
+      run_id: 'run-assign-terminal',
+      child_session_key: 'agent:worker:subagent:assign-terminal',
+      parent_agent_id: 'main',
+      dag_id: created.id,
+      spawn_mode: 'shared_worker',
+      active_task_ids: [],
+    }, { agentId: 'main', dagId: created.id });
+
+    const result = await tools.assignTasksToSession({
+      task_ids: ['t1'],
+      dag_id: created.id,
+      agent_id: 'main',
+      run_id: 'run-assign-terminal',
+      executor_agent_id: 'worker',
+    }, {});
+    assert(result.error?.includes('cannot be assigned'), 'Terminal task should not be assignable');
+  });
+});
+
+test('task_dag_complete rejects non-running tasks', async () => {
+  await withTempWorkspace('tool-complete-illegal', async () => {
+    const created = dag.createDAG('tool-complete-illegal', [{ id: 't1', name: 'Task 1' }]);
+    const result = await tools.completeTaskExecution({
+      task_id: 't1',
+      dag_id: created.id,
+      agent_id: 'main',
+      output_summary: 'done',
+    }, {});
+    assert(result.error?.includes('cannot be completed'), 'Ready task should not be completed directly');
   });
 });
 
@@ -552,14 +590,18 @@ test('subagent_spawned hook persists session context and binding metadata', asyn
       parentAgentId: 'main',
     }, console);
 
-    const run = bindings.getSessionRunByRunId('run-hook-1', { dagId: created.id });
-    const taskBindings = bindings.listTaskBindings({ task_id: 't1' }, { dagId: created.id });
-    const pendingEvents = bindings.listPendingEvents({ type: 'subagent_spawned' }, { dagId: created.id });
+    const run = bindings.getSessionRunByRunId('run-hook-1', { agentId: 'main', dagId: created.id });
+    const taskBindings = bindings.listTaskBindings({ task_id: 't1' }, { agentId: 'main', dagId: created.id });
+    const pendingEvents = bindings.listPendingEvents({ type: 'subagent_spawned' }, { agentId: 'main', dagId: created.id });
+    const oldSessionMappings = path.join(process.env.WORKSPACE_DIR, 'workspace', 'tasks', 'session-mappings.json');
+    const oldHierarchy = path.join(process.env.WORKSPACE_DIR, 'workspace', 'tasks', 'session-hierarchy.json');
 
     assert(run?.child_session_key === 'agent:worker:subagent:hook-1', 'Hook should persist session run');
     assert(run?.parent_agent_id === 'main', 'Session run should persist parent agent, not child agent');
     assert(taskBindings.length >= 1, 'Hook should create task binding');
     assert(pendingEvents.length === 1, 'Hook should emit pending spawn event');
+    assert(fs.existsSync(oldSessionMappings) === false, 'Old session mapping file should not be created');
+    assert(fs.existsSync(oldHierarchy) === false, 'Old session hierarchy file should not be created');
   });
 });
 
@@ -580,7 +622,7 @@ test('subagent_ended hook closes all active bindings for a session and unlocks d
       dag_id: created.id,
       spawn_mode: 'multi_task',
       active_task_ids: ['t1', 't2'],
-    }, { dagId: created.id });
+    }, { agentId: 'main', dagId: created.id });
     bindings.upsertTaskBinding({
       dag_id: created.id,
       task_id: 't1',
@@ -589,7 +631,7 @@ test('subagent_ended hook closes all active bindings for a session and unlocks d
       session_key: 'agent:worker:subagent:hook-2',
       run_id: 'run-hook-2',
       binding_status: 'active',
-    }, { dagId: created.id });
+    }, { agentId: 'main', dagId: created.id });
     bindings.upsertTaskBinding({
       dag_id: created.id,
       task_id: 't2',
@@ -598,7 +640,7 @@ test('subagent_ended hook closes all active bindings for a session and unlocks d
       session_key: 'agent:worker:subagent:hook-2',
       run_id: 'run-hook-2',
       binding_status: 'active',
-    }, { dagId: created.id });
+    }, { agentId: 'main', dagId: created.id });
 
     const result = hooks.handleSubagentEndedEvent({
       targetSessionKey: 'agent:worker:subagent:hook-2',
@@ -613,7 +655,7 @@ test('subagent_ended hook closes all active bindings for a session and unlocks d
     assert(dag.getTask('t2')?.status === 'done', 'Second task should be done');
     assert(dag.getTask('t3')?.status === 'ready', 'Downstream task should become ready');
     assert(result.newly_ready_task_ids.includes('t3'), 'Ended hook should report newly ready downstream task');
-    assert(bindings.listTaskBindings({ session_key: 'agent:worker:subagent:hook-2', binding_status: 'active' }, { dagId: created.id }).length === 0, 'Active bindings should be closed');
+    assert(bindings.listTaskBindings({ session_key: 'agent:worker:subagent:hook-2', binding_status: 'active' }, { agentId: 'main', dagId: created.id }).length === 0, 'Active bindings should be closed');
   });
 });
 
@@ -629,7 +671,7 @@ test('subagent_ended hook tolerates delayed completion after task already closed
       dag_id: created.id,
       spawn_mode: 'single_task',
       active_task_ids: ['t1'],
-    }, { dagId: created.id });
+    }, { agentId: 'main', dagId: created.id });
     bindings.upsertTaskBinding({
       dag_id: created.id,
       task_id: 't1',
@@ -638,7 +680,7 @@ test('subagent_ended hook tolerates delayed completion after task already closed
       session_key: 'agent:worker:subagent:hook-3',
       run_id: 'run-hook-3',
       binding_status: 'active',
-    }, { dagId: created.id });
+    }, { agentId: 'main', dagId: created.id });
     dag.updateTask('t1', { status: 'done', output_summary: 'already completed' });
 
     const result = hooks.handleSubagentEndedEvent({
@@ -669,9 +711,9 @@ test('subagent_ended hook emits orphan event when bindings are missing', async (
       parentAgentId: 'main',
     }, console);
 
-    const existingBindings = bindings.listTaskBindings({ session_key: 'agent:worker:subagent:hook-4', binding_status: 'active' }, { dagId: created.id });
+    const existingBindings = bindings.listTaskBindings({ session_key: 'agent:worker:subagent:hook-4', binding_status: 'active' }, { agentId: 'main', dagId: created.id });
     for (const binding of existingBindings) {
-      bindings.completeTaskBinding(binding.binding_id, 'released', { dagId: created.id });
+      bindings.completeTaskBinding(binding.binding_id, 'released', { agentId: 'main', dagId: created.id });
     }
 
     const result = hooks.handleSubagentEndedEvent({
@@ -682,7 +724,7 @@ test('subagent_ended hook emits orphan event when bindings are missing', async (
       parentAgentId: 'main',
     }, console);
 
-    const orphanEvents = bindings.listPendingEvents({ type: 'binding_orphaned' }, { dagId: created.id });
+    const orphanEvents = bindings.listPendingEvents({ type: 'binding_orphaned' }, { agentId: 'main', dagId: created.id });
     assert(result.task_ids.length === 0, 'Orphaned hook should not close any tasks');
     assert(orphanEvents.length === 1, 'Orphaned hook should emit binding_orphaned event');
   });
@@ -703,7 +745,7 @@ test('task_dag_continue produces a user reply summary for a completed single sub
       dag_id: created.id,
       spawn_mode: 'single_task',
       active_task_ids: ['t1'],
-    }, { dagId: created.id });
+    }, { agentId: 'main', dagId: created.id });
     bindings.upsertTaskBinding({
       dag_id: created.id,
       task_id: 't1',
@@ -712,7 +754,7 @@ test('task_dag_continue produces a user reply summary for a completed single sub
       session_key: 'agent:worker:subagent:continue-1',
       run_id: 'run-continue-1',
       binding_status: 'active',
-    }, { dagId: created.id });
+    }, { agentId: 'main', dagId: created.id });
 
     hooks.handleSubagentEndedEvent({
       targetSessionKey: 'agent:worker:subagent:continue-1',
@@ -722,8 +764,8 @@ test('task_dag_continue produces a user reply summary for a completed single sub
       parentAgentId: 'main',
     }, console);
 
-    const result = await tools.continueParentSession({ run_id: 'run-continue-1' }, {});
-    const secondResult = await tools.continueParentSession({ run_id: 'run-continue-1' }, {});
+    const result = await tools.continueParentSession({ run_id: 'run-continue-1', dag_id: created.id, agent_id: 'main' }, {});
+    const secondResult = await tools.continueParentSession({ run_id: 'run-continue-1', dag_id: created.id, agent_id: 'main' }, {});
 
     assert(result.action === 'user_reply', 'Single completed run should trigger user reply');
     assert(result.should_reply_to_user === true, 'Single completed run should be replyable');
@@ -788,7 +830,7 @@ test('task_dag_continue waits for remaining subtasks before final reply', async 
       payload: { source_task_ids: ['t1'] },
     }, { agentId: 'main', dagId: created.id });
 
-    const partial = await tools.continueParentSession({ run_id: 'run-continue-2' }, {});
+    const partial = await tools.continueParentSession({ run_id: 'run-continue-2', dag_id: created.id, agent_id: 'main' }, {});
     const remainingReadyEvents = bindings.listPendingEvents({ type: 'task_ready' }, { agentId: 'main', dagId: created.id });
     assert(partial.action === 'continue_waiting', 'Partial completion should keep waiting');
     assert(partial.should_reply_to_user === false, 'Partial completion should not reply by default');
@@ -804,7 +846,7 @@ test('task_dag_continue waits for remaining subtasks before final reply', async 
       parentAgentId: 'main',
     }, console);
 
-    const final = await tools.continueParentSession({ run_id: 'run-continue-2' }, {});
+    const final = await tools.continueParentSession({ run_id: 'run-continue-2', dag_id: created.id, agent_id: 'main' }, {});
     assert(final.action === 'user_reply', 'All tasks finished should trigger final reply');
     assert(final.completed_task_ids.includes('t1') && final.completed_task_ids.includes('t2'), 'Final summary should include both tasks');
   });
@@ -822,7 +864,7 @@ test('duplicate ended events do not create duplicate continuation output', async
       dag_id: created.id,
       spawn_mode: 'single_task',
       active_task_ids: ['t1'],
-    }, { dagId: created.id });
+    }, { agentId: 'main', dagId: created.id });
     bindings.upsertTaskBinding({
       dag_id: created.id,
       task_id: 't1',
@@ -831,7 +873,7 @@ test('duplicate ended events do not create duplicate continuation output', async
       session_key: 'agent:worker:subagent:continue-3',
       run_id: 'run-continue-3',
       binding_status: 'active',
-    }, { dagId: created.id });
+    }, { agentId: 'main', dagId: created.id });
 
     hooks.handleSubagentEndedEvent({
       targetSessionKey: 'agent:worker:subagent:continue-3',
@@ -852,9 +894,9 @@ test('duplicate ended events do not create duplicate continuation output', async
       run_id: 'run-continue-3',
       type: 'subagent_completed',
       includeConsumed: true,
-    }, { dagId: created.id });
-    const first = await tools.continueParentSession({ run_id: 'run-continue-3' }, {});
-    const second = await tools.continueParentSession({ run_id: 'run-continue-3' }, {});
+    }, { agentId: 'main', dagId: created.id });
+    const first = await tools.continueParentSession({ run_id: 'run-continue-3', dag_id: created.id, agent_id: 'main' }, {});
+    const second = await tools.continueParentSession({ run_id: 'run-continue-3', dag_id: created.id, agent_id: 'main' }, {});
 
     assert(completionEvents.length === 1, 'Duplicate ended hooks should dedupe completion events');
     assert(first.action === 'user_reply', 'First continuation should produce reply');
@@ -885,6 +927,7 @@ test('compatibility tools respect dag_id instead of drifting to another DAG', as
     await updateTool.execute({
       action: 'update',
       dag_id: second.id,
+      agent_id: 'main',
       task_id: 't1',
       task: { description: 'only-second-dag' },
     }, {});
