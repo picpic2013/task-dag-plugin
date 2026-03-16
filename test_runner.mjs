@@ -16,6 +16,7 @@ const notification = await import('./dist/src/notification.js');
 const dag = await import('./dist/src/dag.js');
 const types = await import('./dist/src/types.js');
 const bindings = await import('./dist/src/bindings.js');
+const requesterSessions = await import('./dist/src/requester-sessions.js');
 const tools = await import('./dist/src/tools.js');
 const hooks = await import('./dist/src/hooks.js');
 const events = await import('./dist/src/events.js');
@@ -370,6 +371,26 @@ test('bindings and runs survive reload from disk', () => {
   });
 });
 
+test('requester session scope persists requester to dag/run mapping', () => {
+  withTempWorkspace('requester-scope', () => {
+    const scope = requesterSessions.upsertRequesterSessionScope({
+      requester_session_key: 'agent:main:session:1',
+      parent_agent_id: 'main',
+      dag_id: 'dag-r1',
+      run_id: 'run-r1',
+      task_ids: ['t1'],
+    });
+
+    const fetched = requesterSessions.findRequesterSessionScope({
+      requester_session_key: 'agent:main:session:1',
+      run_id: 'run-r1',
+    });
+
+    assert(scope.dag_id === 'dag-r1', 'Scope should persist dag id');
+    assert(fetched?.active_task_ids.includes('t1') === true, 'Scope lookup should resolve by run id');
+  });
+});
+
 test('bindings require explicit context', () => {
   let errorMessage = '';
   try {
@@ -424,6 +445,7 @@ test('task_dag_spawn creates binding and moves task into waiting_subagent', asyn
     assert(bindings.listTaskBindings({ task_id: 't1' }, { agentId: 'main', dagId: result.dag_id }).length === 1, 'Binding should exist');
     assert(bindings.getSessionRunByRunId('run-spawn-1', { agentId: 'main', dagId: result.dag_id })?.child_session_key === 'agent:worker:subagent:spawn-1', 'Session run should persist');
     assert(bindings.listPendingEvents({ type: 'subagent_spawned' }, { agentId: 'main', dagId: result.dag_id }).length === 0, 'Spawn tool should not emit hook-owned spawn event');
+    assert(requesterSessions.findRequesterSessionScope({ requester_session_key: 'agent:main', run_id: 'run-spawn-1' })?.dag_id === result.dag_id, 'Spawn should register requester session scope');
   });
 });
 
@@ -579,16 +601,20 @@ test('subagent_spawned hook persists session context and binding metadata', asyn
   await withTempWorkspace('hook-spawned', async () => {
     dag.setCurrentAgentId('main');
     const created = dag.createDAG('hook-spawned', [{ id: 't1', name: 'Hook task' }]);
+    requesterSessions.upsertRequesterSessionScope({
+      requester_session_key: 'agent:main',
+      parent_agent_id: 'main',
+      dag_id: created.id,
+      run_id: 'run-hook-1',
+      task_ids: ['t1'],
+    });
 
     hooks.handleSubagentSpawnedEvent({
       childSessionKey: 'agent:worker:subagent:hook-1',
-      requesterSessionKey: 'agent:main',
       agentId: 'worker',
       label: 'task:t1',
       runId: 'run-hook-1',
-      dagId: created.id,
-      parentAgentId: 'main',
-    }, console);
+    }, { requesterSessionKey: 'agent:main', runId: 'run-hook-1', childSessionKey: 'agent:worker:subagent:hook-1' }, console);
 
     const run = bindings.getSessionRunByRunId('run-hook-1', { agentId: 'main', dagId: created.id });
     const taskBindings = bindings.listTaskBindings({ task_id: 't1' }, { agentId: 'main', dagId: created.id });
@@ -642,13 +668,19 @@ test('subagent_ended hook closes all active bindings for a session and unlocks d
       binding_status: 'active',
     }, { agentId: 'main', dagId: created.id });
 
+    requesterSessions.upsertRequesterSessionScope({
+      requester_session_key: 'agent:main',
+      parent_agent_id: 'main',
+      dag_id: created.id,
+      run_id: 'run-hook-2',
+      task_ids: ['t1', 't2'],
+    });
+
     const result = hooks.handleSubagentEndedEvent({
       targetSessionKey: 'agent:worker:subagent:hook-2',
       runId: 'run-hook-2',
       outcome: 'ok',
-      dagId: created.id,
-      parentAgentId: 'main',
-    }, console);
+    }, { requesterSessionKey: 'agent:main', runId: 'run-hook-2', childSessionKey: 'agent:worker:subagent:hook-2' }, console);
 
     assert(result.task_ids.length === 2, 'Ended hook should close both bound tasks');
     assert(dag.getTask('t1')?.status === 'done', 'First task should be done');
@@ -683,13 +715,19 @@ test('subagent_ended hook tolerates delayed completion after task already closed
     }, { agentId: 'main', dagId: created.id });
     dag.updateTask('t1', { status: 'done', output_summary: 'already completed' });
 
+    requesterSessions.upsertRequesterSessionScope({
+      requester_session_key: 'agent:main',
+      parent_agent_id: 'main',
+      dag_id: created.id,
+      run_id: 'run-hook-3',
+      task_ids: ['t1'],
+    });
+
     const result = hooks.handleSubagentEndedEvent({
       targetSessionKey: 'agent:worker:subagent:hook-3',
       runId: 'run-hook-3',
       outcome: 'ok',
-      dagId: created.id,
-      parentAgentId: 'main',
-    }, console);
+    }, { requesterSessionKey: 'agent:main', runId: 'run-hook-3', childSessionKey: 'agent:worker:subagent:hook-3' }, console);
 
     assert(result.task_ids[0] === 't1', 'Delayed ended hook should still resolve task');
     assert(dag.getTask('t1')?.status === 'done', 'Done task should remain done');
@@ -700,16 +738,20 @@ test('subagent_ended hook emits orphan event when bindings are missing', async (
   await withTempWorkspace('hook-orphaned', async () => {
     dag.setCurrentAgentId('main');
     const created = dag.createDAG('hook-orphaned', [{ id: 't1', name: 'Orphan check' }]);
+    requesterSessions.upsertRequesterSessionScope({
+      requester_session_key: 'agent:main',
+      parent_agent_id: 'main',
+      dag_id: created.id,
+      run_id: 'run-hook-4',
+      task_ids: ['t1'],
+    });
 
     hooks.handleSubagentSpawnedEvent({
       childSessionKey: 'agent:worker:subagent:hook-4',
-      requesterSessionKey: 'agent:main',
       agentId: 'worker',
       label: 'task:t1',
       runId: 'run-hook-4',
-      dagId: created.id,
-      parentAgentId: 'main',
-    }, console);
+    }, { requesterSessionKey: 'agent:main', runId: 'run-hook-4', childSessionKey: 'agent:worker:subagent:hook-4' }, console);
 
     const existingBindings = bindings.listTaskBindings({ session_key: 'agent:worker:subagent:hook-4', binding_status: 'active' }, { agentId: 'main', dagId: created.id });
     for (const binding of existingBindings) {
@@ -720,9 +762,7 @@ test('subagent_ended hook emits orphan event when bindings are missing', async (
       targetSessionKey: 'agent:worker:subagent:hook-4',
       runId: 'run-hook-4',
       outcome: 'error',
-      dagId: created.id,
-      parentAgentId: 'main',
-    }, console);
+    }, { requesterSessionKey: 'agent:main', runId: 'run-hook-4', childSessionKey: 'agent:worker:subagent:hook-4' }, console);
 
     const orphanEvents = bindings.listPendingEvents({ type: 'binding_orphaned' }, { agentId: 'main', dagId: created.id });
     assert(result.task_ids.length === 0, 'Orphaned hook should not close any tasks');
@@ -755,14 +795,19 @@ test('task_dag_continue produces a user reply summary for a completed single sub
       run_id: 'run-continue-1',
       binding_status: 'active',
     }, { agentId: 'main', dagId: created.id });
+    requesterSessions.upsertRequesterSessionScope({
+      requester_session_key: 'agent:main',
+      parent_agent_id: 'main',
+      dag_id: created.id,
+      run_id: 'run-continue-1',
+      task_ids: ['t1'],
+    });
 
     hooks.handleSubagentEndedEvent({
       targetSessionKey: 'agent:worker:subagent:continue-1',
       runId: 'run-continue-1',
       outcome: 'ok',
-      dagId: created.id,
-      parentAgentId: 'main',
-    }, console);
+    }, { requesterSessionKey: 'agent:main', runId: 'run-continue-1', childSessionKey: 'agent:worker:subagent:continue-1' }, console);
 
     const result = await tools.continueParentSession({ run_id: 'run-continue-1', dag_id: created.id, agent_id: 'main' }, {});
     const secondResult = await tools.continueParentSession({ run_id: 'run-continue-1', dag_id: created.id, agent_id: 'main' }, {});
@@ -793,6 +838,13 @@ test('task_dag_continue waits for remaining subtasks before final reply', async 
       spawn_mode: 'multi_task',
       active_task_ids: ['t1', 't2'],
     }, { agentId: 'main', dagId: created.id });
+    requesterSessions.upsertRequesterSessionScope({
+      requester_session_key: 'agent:main',
+      parent_agent_id: 'main',
+      dag_id: created.id,
+      run_id: 'run-continue-2',
+      task_ids: ['t1', 't2'],
+    });
     for (const taskId of ['t1', 't2']) {
       bindings.upsertTaskBinding({
         dag_id: created.id,
@@ -842,9 +894,7 @@ test('task_dag_continue waits for remaining subtasks before final reply', async 
       targetSessionKey: 'agent:worker:subagent:continue-2',
       runId: 'run-continue-2',
       outcome: 'ok',
-      dagId: created.id,
-      parentAgentId: 'main',
-    }, console);
+    }, { requesterSessionKey: 'agent:main', runId: 'run-continue-2', childSessionKey: 'agent:worker:subagent:continue-2' }, console);
 
     const final = await tools.continueParentSession({ run_id: 'run-continue-2', dag_id: created.id, agent_id: 'main' }, {});
     assert(final.action === 'user_reply', 'All tasks finished should trigger final reply');
@@ -875,20 +925,24 @@ test('duplicate ended events do not create duplicate continuation output', async
       binding_status: 'active',
     }, { agentId: 'main', dagId: created.id });
 
+    requesterSessions.upsertRequesterSessionScope({
+      requester_session_key: 'agent:main',
+      parent_agent_id: 'main',
+      dag_id: created.id,
+      run_id: 'run-continue-3',
+      task_ids: ['t1'],
+    });
+
     hooks.handleSubagentEndedEvent({
       targetSessionKey: 'agent:worker:subagent:continue-3',
       runId: 'run-continue-3',
       outcome: 'ok',
-      dagId: created.id,
-      parentAgentId: 'main',
-    }, console);
+    }, { requesterSessionKey: 'agent:main', runId: 'run-continue-3', childSessionKey: 'agent:worker:subagent:continue-3' }, console);
     hooks.handleSubagentEndedEvent({
       targetSessionKey: 'agent:worker:subagent:continue-3',
       runId: 'run-continue-3',
       outcome: 'ok',
-      dagId: created.id,
-      parentAgentId: 'main',
-    }, console);
+    }, { requesterSessionKey: 'agent:main', runId: 'run-continue-3', childSessionKey: 'agent:worker:subagent:continue-3' }, console);
 
     const completionEvents = bindings.listPendingEvents({
       run_id: 'run-continue-3',
@@ -901,6 +955,69 @@ test('duplicate ended events do not create duplicate continuation output', async
     assert(completionEvents.length === 1, 'Duplicate ended hooks should dedupe completion events');
     assert(first.action === 'user_reply', 'First continuation should produce reply');
     assert(second.pending_event_ids.length === 0, 'Second continuation should not see duplicate events');
+  });
+});
+
+test('registerTaskDagHooks uses runtime hook ctx and sends resume wake-up', async () => {
+  await withTempWorkspace('hook-register-resume', async () => {
+    dag.setCurrentAgentId('main');
+    const created = dag.createDAG('hook-register-resume', [{ id: 't1', name: 'Resume me' }]);
+    requesterSessions.upsertRequesterSessionScope({
+      requester_session_key: 'agent:main',
+      parent_agent_id: 'main',
+      dag_id: created.id,
+      run_id: 'run-resume-1',
+      task_ids: ['t1'],
+    });
+    bindings.saveSessionRun({
+      run_id: 'run-resume-1',
+      child_session_key: 'agent:worker:subagent:resume-1',
+      requester_session_key: 'agent:main',
+      parent_agent_id: 'main',
+      dag_id: created.id,
+      spawn_mode: 'single_task',
+      active_task_ids: ['t1'],
+    }, { agentId: 'main', dagId: created.id });
+    bindings.upsertTaskBinding({
+      dag_id: created.id,
+      task_id: 't1',
+      executor_type: 'subagent',
+      executor_agent_id: 'worker',
+      session_key: 'agent:worker:subagent:resume-1',
+      run_id: 'run-resume-1',
+      binding_status: 'active',
+    }, { agentId: 'main', dagId: created.id });
+
+    const sentMessages = [];
+    const registeredHooks = {};
+    hooks.registerTaskDagHooks({
+      logger: { info() {}, warn() {}, error() {} },
+      registerTool() {},
+      registerHook(name, handler) { registeredHooks[name] = handler; },
+      runtime: {
+        sessions_spawn: async () => ({}),
+        sessions_send: async (params) => { sentMessages.push(params); return { success: true }; },
+        sessions_list: async () => ([]),
+        subagents: async () => ([]),
+      },
+      config: {},
+    });
+
+    await registeredHooks['subagent_ended']({
+      targetSessionKey: 'agent:worker:subagent:resume-1',
+      runId: 'run-resume-1',
+      outcome: 'ok',
+    }, {
+      requesterSessionKey: 'agent:main',
+      runId: 'run-resume-1',
+      childSessionKey: 'agent:worker:subagent:resume-1',
+    });
+
+    const resumeEvents = bindings.listPendingEvents({ type: 'resume_requested' }, { agentId: 'main', dagId: created.id });
+    assert(sentMessages.length === 1, 'Ended hook should send one resume message to requester session');
+    assert(sentMessages[0].sessionKey === 'agent:main', 'Resume message should target requester session');
+    assert(sentMessages[0].message.includes('task_dag_continue'), 'Resume message should instruct continuation');
+    assert(resumeEvents.length === 1, 'Ended hook should persist a resume_requested event');
   });
 });
 

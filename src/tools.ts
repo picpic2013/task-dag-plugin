@@ -20,6 +20,7 @@ import {
   upsertTaskBinding,
 } from './bindings.js';
 import type { PendingEvent } from './bindings.js';
+import { upsertRequesterSessionScope } from './requester-sessions.js';
 
 type RuntimeFacade = {
   sessions_spawn?: (params: any) => Promise<any>;
@@ -121,6 +122,13 @@ function extractSpawnResult(spawnResult: any): { sessionKey?: string; runId?: st
       spawnResult?.run_id ||
       spawnResult?.id,
   };
+}
+
+function getRequesterSessionKey(context: any, params?: any): string | undefined {
+  return params?.requester_session_key
+    || context?.session?.key
+    || context?.sessionKey
+    || context?.requesterSessionKey;
 }
 
 export async function claimTaskExecution(params: any, context?: any) {
@@ -313,8 +321,17 @@ export async function spawnTaskExecution(runtime: RuntimeFacade, params: any, co
     const dagIdToUse = dagId || dag.getCurrentDagId() || 'default';
     const spawnLabel = label || `task:${task_id}`;
     const spawnTaskText = task || prompt;
+    const requesterSessionKey = getRequesterSessionKey(context, params);
     if (!spawnTaskText) {
       return { error: 'task or prompt is required' };
+    }
+    if (requesterSessionKey) {
+      upsertRequesterSessionScope({
+        requester_session_key: requesterSessionKey,
+        parent_agent_id: agentId,
+        dag_id: dagIdToUse,
+        task_ids: [task_id],
+      });
     }
 
     const spawnResult = await runtime.sessions_spawn({
@@ -337,13 +354,23 @@ export async function spawnTaskExecution(runtime: RuntimeFacade, params: any, co
       saveSessionRun({
         run_id: effectiveRunId,
         child_session_key: sessionKey,
-        requester_session_key: params.requester_session_key || context?.session?.key || context?.sessionKey,
+        requester_session_key: requesterSessionKey,
         parent_agent_id: agentId,
         dag_id: dagIdToUse,
         spawn_mode: 'single_task',
         label: spawnLabel,
         active_task_ids: [task_id],
       }, { agentId, dagId: dagIdToUse });
+    }
+
+    if (requesterSessionKey) {
+      upsertRequesterSessionScope({
+        requester_session_key: requesterSessionKey,
+        parent_agent_id: agentId,
+        dag_id: dagIdToUse,
+        run_id: effectiveRunId,
+        task_ids: [task_id],
+      });
     }
 
     upsertTaskBinding({
@@ -442,6 +469,16 @@ export async function assignTasksToSession(params: any, context?: any) {
         log: { level: 'info', message: `Assigned to session ${sessionRun.child_session_key}` },
       } as any);
       assigned.push(taskId);
+    }
+
+    if (sessionRun.requester_session_key) {
+      upsertRequesterSessionScope({
+        requester_session_key: sessionRun.requester_session_key,
+        parent_agent_id: agentId,
+        dag_id: dagIdToUse,
+        run_id: sessionRun.run_id,
+        task_ids: assigned,
+      });
     }
 
     return {
@@ -616,6 +653,16 @@ export async function continueParentSession(params: any, context?: any) {
   const { agentId, dagId } = executionContext;
   const taskIds = getScopeTaskIds(params, executionContext);
   const sessionRun = getScopeSessionRun(params, executionContext);
+  const requesterSessionKey = getRequesterSessionKey(context, params);
+  if (requesterSessionKey && dagId) {
+    upsertRequesterSessionScope({
+      requester_session_key: requesterSessionKey,
+      parent_agent_id: agentId,
+      dag_id: dagId,
+      run_id: params.run_id || sessionRun?.run_id,
+      task_ids: taskIds,
+    });
+  }
   const pendingEvents = listPendingEvents({ includeConsumed: false }, executionContext)
     .filter(event => matchesContinuationScope(event, params, taskIds));
 

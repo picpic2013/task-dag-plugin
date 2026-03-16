@@ -37,7 +37,7 @@ export interface ToolOptions {
 }
 
 export interface HookHandler {
-  (event: any): Promise<any>;
+  (event: any, ctx?: any): Promise<any>;
 }
 
 export interface HookOptions {
