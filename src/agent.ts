@@ -7,6 +7,15 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import {
+  attachTaskToSessionRun,
+  completeTaskBinding,
+  getSessionRunBySessionKey,
+  listTaskBindings,
+  saveSessionRun,
+  upsertTaskBinding,
+} from './bindings.js';
+import { getCurrentDagId } from './events.js';
 
 const WORKSPACE = process.env.WORKSPACE_DIR || path.join(os.homedir(), '.openclaw', 'workspace');
 const MAPPINGS_FILE = path.join(WORKSPACE, 'tasks', 'agent-mappings.json');
@@ -198,6 +207,8 @@ interface SessionMapping {
   taskId: string;
   agentId: string;
   createdAt: string;
+  dagId?: string;
+  runId?: string;
 }
 
 interface SessionMappingsData {
@@ -236,26 +247,80 @@ function saveSessionMappings(data: SessionMappingsData): void {
 export function saveSessionMapping(
   sessionKey: string,
   taskId: string,
-  agentId: string
+  agentId: string,
+  options?: {
+    dagId?: string;
+    runId?: string;
+    requesterSessionKey?: string;
+    label?: string;
+  }
 ): void {
   const mappings = loadSessionMappings();
+  const dagId = options?.dagId || getCurrentDagId() || 'default';
   
   mappings.sessions[sessionKey] = {
     taskId,
     agentId,
-    createdAt: new Date().toISOString()
+    createdAt: new Date().toISOString(),
+    dagId,
+    runId: options?.runId
   };
   mappings.reverse[taskId] = sessionKey;
   
   saveSessionMappings(mappings);
+
+  upsertTaskBinding({
+    dag_id: dagId,
+    task_id: taskId,
+    executor_type: 'subagent',
+    executor_agent_id: agentId,
+    session_key: sessionKey,
+    run_id: options?.runId,
+    binding_status: 'active',
+  }, { dagId });
+
+  if (options?.runId) {
+    saveSessionRun({
+      run_id: options.runId,
+      child_session_key: sessionKey,
+      requester_session_key: options.requesterSessionKey,
+      parent_agent_id: agentId,
+      dag_id: dagId,
+      spawn_mode: 'single_task',
+      label: options.label,
+      active_task_ids: [taskId],
+    }, { dagId });
+  } else {
+    const existingRun = getSessionRunBySessionKey(sessionKey, { dagId });
+    if (existingRun) {
+      attachTaskToSessionRun(existingRun.run_id, taskId, { dagId });
+    }
+  }
 }
 
 /**
  * 通过 sessionKey 获取 taskId
  */
 export function getTaskBySession(sessionKey: string): string | null {
+  const currentDagId = getCurrentDagId() || 'default';
+  const bindings = listTaskBindings({ session_key: sessionKey, binding_status: 'active' }, { dagId: currentDagId });
+  if (bindings.length > 0) {
+    return bindings[0].task_id;
+  }
+
   const mappings = loadSessionMappings();
   return mappings.sessions[sessionKey]?.taskId || null;
+}
+
+export function getTasksBySession(sessionKey: string): string[] {
+  const currentDagId = getCurrentDagId() || 'default';
+  const bindings = listTaskBindings({ session_key: sessionKey }, { dagId: currentDagId });
+  if (bindings.length > 0) {
+    return bindings.map(binding => binding.task_id);
+  }
+
+  const taskId = getTaskBySession(sessionKey);
+  return taskId ? [taskId] : [];
 }
 
 /**
@@ -271,7 +336,9 @@ export function getSessionByTask(taskId: string): string | null {
  */
 export function removeSessionMapping(sessionKey: string): void {
   const mappings = loadSessionMappings();
-  const taskId = mappings.sessions[sessionKey]?.taskId;
+  const sessionInfo = mappings.sessions[sessionKey];
+  const taskId = sessionInfo?.taskId;
+  const dagId = sessionInfo?.dagId || getCurrentDagId() || 'default';
   
   delete mappings.sessions[sessionKey];
   if (taskId) {
@@ -279,6 +346,11 @@ export function removeSessionMapping(sessionKey: string): void {
   }
   
   saveSessionMappings(mappings);
+
+  const bindings = listTaskBindings({ session_key: sessionKey, binding_status: 'active' }, { dagId });
+  for (const binding of bindings) {
+    completeTaskBinding(binding.binding_id, 'released', { dagId });
+  }
 }
 
 /**

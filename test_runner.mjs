@@ -16,6 +16,7 @@ const waiter = await import('./dist/src/waiter.js');
 const notification = await import('./dist/src/notification.js');
 const dag = await import('./dist/src/dag.js');
 const types = await import('./dist/src/types.js');
+const bindings = await import('./dist/src/bindings.js');
 
 let passed = 0;
 let failed = 0;
@@ -247,6 +248,179 @@ test('validateTask accepts milestone 01 runtime metadata', () => {
   task.waiting_for = { kind: 'children', child_task_ids: ['t-child'] };
 
   assert(types.validateTask(task) === true, 'Task should validate with waiting metadata');
+});
+
+console.log('\n=== Bindings Layer ===\n');
+
+test('single task binding can be queried by task, session, and run', () => {
+  withTempWorkspace('bindings-single', () => {
+    const context = { agentId: 'main', dagId: 'dag-bind-1' };
+
+    const sessionRun = bindings.saveSessionRun({
+      run_id: 'run-1',
+      child_session_key: 'agent:worker:subagent:1',
+      requester_session_key: 'agent:main',
+      parent_agent_id: 'main',
+      dag_id: 'dag-bind-1',
+      spawn_mode: 'single_task',
+      label: 'task:t1',
+      active_task_ids: ['t1'],
+    }, context);
+
+    const binding = bindings.upsertTaskBinding({
+      dag_id: 'dag-bind-1',
+      task_id: 't1',
+      executor_type: 'subagent',
+      executor_agent_id: 'worker',
+      session_key: sessionRun.child_session_key,
+      run_id: sessionRun.run_id,
+      binding_status: 'active',
+    }, context);
+
+    assert(bindings.getSessionRunByRunId('run-1', context)?.dag_id === 'dag-bind-1', 'Run should resolve DAG');
+    assert(bindings.getSessionRunBySessionKey('agent:worker:subagent:1', context)?.run_id === 'run-1', 'Session should resolve run');
+    assert(bindings.listTaskBindings({ task_id: 't1' }, context).length === 1, 'Task should have one binding');
+    assert(bindings.getTaskBinding(binding.binding_id, context)?.task_id === 't1', 'Binding lookup should succeed');
+  });
+});
+
+test('single session can bind multiple tasks', () => {
+  withTempWorkspace('bindings-multi-task', () => {
+    const context = { agentId: 'main', dagId: 'dag-bind-2' };
+
+    bindings.saveSessionRun({
+      run_id: 'run-2',
+      child_session_key: 'agent:worker:subagent:2',
+      requester_session_key: 'agent:main',
+      parent_agent_id: 'main',
+      dag_id: 'dag-bind-2',
+      spawn_mode: 'multi_task',
+      active_task_ids: ['t1'],
+    }, context);
+
+    bindings.attachTaskToSessionRun('run-2', 't2', context);
+    bindings.upsertTaskBinding({
+      dag_id: 'dag-bind-2',
+      task_id: 't1',
+      executor_type: 'subagent',
+      executor_agent_id: 'worker',
+      session_key: 'agent:worker:subagent:2',
+      run_id: 'run-2',
+      binding_status: 'active',
+    }, context);
+    bindings.upsertTaskBinding({
+      dag_id: 'dag-bind-2',
+      task_id: 't2',
+      executor_type: 'subagent',
+      executor_agent_id: 'worker',
+      session_key: 'agent:worker:subagent:2',
+      run_id: 'run-2',
+      binding_status: 'active',
+    }, context);
+
+    const sessionRun = bindings.getSessionRunByRunId('run-2', context);
+    const sessionBindings = bindings.listTaskBindings({ session_key: 'agent:worker:subagent:2' }, context);
+
+    assert(sessionRun?.active_task_ids.length === 2, 'Run should track two active tasks');
+    assert(sessionBindings.length === 2, 'Session should expose two task bindings');
+  });
+});
+
+test('multiple sessions and tasks can coexist in the same DAG', () => {
+  withTempWorkspace('bindings-multi-session', () => {
+    const context = { agentId: 'main', dagId: 'dag-bind-3' };
+
+    bindings.saveSessionRun({
+      run_id: 'run-a',
+      child_session_key: 'agent:worker-a:subagent:1',
+      parent_agent_id: 'main',
+      dag_id: 'dag-bind-3',
+      spawn_mode: 'single_task',
+      active_task_ids: ['t1'],
+    }, context);
+    bindings.saveSessionRun({
+      run_id: 'run-b',
+      child_session_key: 'agent:worker-b:subagent:1',
+      parent_agent_id: 'main',
+      dag_id: 'dag-bind-3',
+      spawn_mode: 'single_task',
+      active_task_ids: ['t2'],
+    }, context);
+
+    bindings.upsertTaskBinding({
+      dag_id: 'dag-bind-3',
+      task_id: 't1',
+      executor_type: 'subagent',
+      executor_agent_id: 'worker-a',
+      session_key: 'agent:worker-a:subagent:1',
+      run_id: 'run-a',
+      binding_status: 'active',
+    }, context);
+    bindings.upsertTaskBinding({
+      dag_id: 'dag-bind-3',
+      task_id: 't2',
+      executor_type: 'subagent',
+      executor_agent_id: 'worker-b',
+      session_key: 'agent:worker-b:subagent:1',
+      run_id: 'run-b',
+      binding_status: 'active',
+    }, context);
+
+    assert(bindings.listTaskBindings({ run_id: 'run-a' }, context)[0]?.task_id === 't1', 'run-a should map to t1');
+    assert(bindings.listTaskBindings({ run_id: 'run-b' }, context)[0]?.task_id === 't2', 'run-b should map to t2');
+  });
+});
+
+test('pending events support replay and consumption', () => {
+  withTempWorkspace('bindings-events', () => {
+    const context = { agentId: 'main', dagId: 'dag-bind-4' };
+
+    const event = bindings.appendPendingEvent({
+      type: 'subagent_completed',
+      dag_id: 'dag-bind-4',
+      task_id: 't1',
+      session_key: 'agent:worker:subagent:4',
+      run_id: 'run-4',
+      payload: { outcome: 'ok' },
+    }, context);
+
+    assert(bindings.listPendingEvents({}, context).length === 1, 'Should load unconsumed event');
+    bindings.consumePendingEvent(event.event_id, context);
+    assert(bindings.listPendingEvents({}, context).length === 0, 'Consumed event should not appear by default');
+    assert(bindings.listPendingEvents({ includeConsumed: true }, context).length === 1, 'Consumed event should remain replayable');
+  });
+});
+
+test('bindings and runs survive reload from disk', () => {
+  withTempWorkspace('bindings-reload', (workspaceDir) => {
+    const context = { agentId: 'main', dagId: 'dag-bind-5' };
+
+    bindings.saveSessionRun({
+      run_id: 'run-5',
+      child_session_key: 'agent:worker:subagent:5',
+      parent_agent_id: 'main',
+      dag_id: 'dag-bind-5',
+      spawn_mode: 'single_task',
+      active_task_ids: ['t1'],
+    }, context);
+    bindings.upsertTaskBinding({
+      dag_id: 'dag-bind-5',
+      task_id: 't1',
+      executor_type: 'subagent',
+      executor_agent_id: 'worker',
+      session_key: 'agent:worker:subagent:5',
+      run_id: 'run-5',
+      binding_status: 'active',
+    }, context);
+
+    const taskBindingsPath = path.join(workspaceDir, 'workspace', 'tasks', 'dag-bind-5', 'task-bindings.json');
+    const sessionRunsPath = path.join(workspaceDir, 'workspace', 'tasks', 'dag-bind-5', 'session-runs.json');
+
+    assert(fs.existsSync(taskBindingsPath), 'Bindings file should exist on disk');
+    assert(fs.existsSync(sessionRunsPath), 'Session runs file should exist on disk');
+    assert(bindings.listTaskBindings({ task_id: 't1' }, context).length === 1, 'Binding should be recoverable from disk');
+    assert(bindings.getSessionRunByRunId('run-5', context)?.child_session_key === 'agent:worker:subagent:5', 'Session run should be recoverable from disk');
+  });
 });
 
 console.log(`\n=== Results: ${passed} passed, ${failed} failed ===`);
