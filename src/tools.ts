@@ -29,7 +29,7 @@ import {
   upsertTaskBinding,
 } from './bindings.js';
 import type { PendingEvent } from './bindings.js';
-import { removeTasksFromRequesterScopes, upsertRequesterSessionScope } from './requester-sessions.js';
+import { completeRequesterSessionRun, removeTasksFromRequesterScopes, upsertRequesterSessionScope } from './requester-sessions.js';
 
 type RuntimeFacade = {
   sessions_spawn?: (params: any) => Promise<any>;
@@ -786,17 +786,34 @@ function selectContinuationEventsToConsume(
   action: 'continue_waiting' | 'trigger_downstream' | 'user_reply' | 'idle',
   completionEvents: PendingEvent[],
   readyEvents: PendingEvent[],
+  resumeEvents: PendingEvent[],
 ): PendingEvent[] {
+  const uniqueEvents = new Map<string, PendingEvent>();
+  for (const event of resumeEvents) {
+    uniqueEvents.set(event.event_id, event);
+  }
   switch (action) {
     case 'continue_waiting':
-      return completionEvents;
+      for (const event of completionEvents) {
+        uniqueEvents.set(event.event_id, event);
+      }
+      return Array.from(uniqueEvents.values());
     case 'trigger_downstream':
-      return readyEvents;
+      for (const event of readyEvents) {
+        uniqueEvents.set(event.event_id, event);
+      }
+      return Array.from(uniqueEvents.values());
     case 'user_reply':
-      return [...completionEvents, ...readyEvents];
+      for (const event of completionEvents) {
+        uniqueEvents.set(event.event_id, event);
+      }
+      for (const event of readyEvents) {
+        uniqueEvents.set(event.event_id, event);
+      }
+      return Array.from(uniqueEvents.values());
     case 'idle':
     default:
-      return [];
+      return Array.from(uniqueEvents.values());
   }
 }
 
@@ -831,6 +848,7 @@ export async function continueParentSession(params: any, context?: any) {
   }
   const pendingEvents = listPendingEvents({ includeConsumed: false }, executionContext)
     .filter(event => matchesContinuationScope(event, params, taskIds));
+  const resumeEvents = pendingEvents.filter(event => event.type === 'resume_requested');
 
   const completionEvents = pendingEvents.filter(
     event =>
@@ -892,7 +910,8 @@ export async function continueParentSession(params: any, context?: any) {
   let shouldReplyToUser = false;
   const hasNewTerminalEvents = completionEvents.length > 0;
   const hasNewReadyEvents = readyEvents.length > 0;
-  const hasNewEvents = hasNewTerminalEvents || hasNewReadyEvents;
+  const hasNewResumeEvents = resumeEvents.length > 0;
+  const hasNewEvents = hasNewTerminalEvents || hasNewReadyEvents || hasNewResumeEvents;
   if (activeBindings.length > 0 && hasNewTerminalEvents) {
     action = 'continue_waiting';
     shouldReplyToUser = !!params.reply_on_partial && completionEvents.length > 0;
@@ -903,7 +922,7 @@ export async function continueParentSession(params: any, context?: any) {
     action = 'trigger_downstream';
   }
 
-  const eventsToConsume = selectContinuationEventsToConsume(action, completionEvents, readyEvents);
+  const eventsToConsume = selectContinuationEventsToConsume(action, completionEvents, readyEvents, resumeEvents);
   const eventIdsToConsume = eventsToConsume.map(event => event.event_id);
   const consumedEventIds: string[] = [];
   if (params.consume !== false) {
@@ -913,6 +932,19 @@ export async function continueParentSession(params: any, context?: any) {
         consumedEventIds.push(consumed.event_id);
       }
     }
+  }
+  const resumeRequesterSessionKey = resumeEvents.find(
+    event => typeof event.payload?.requester_session_key === 'string'
+  )?.payload?.requester_session_key as string | undefined;
+  const resolvedRequesterSessionKey = requesterSessionKey || sessionRun?.requester_session_key || resumeRequesterSessionKey;
+  if (params.consume !== false && resumeEvents.length > 0 && resolvedRequesterSessionKey) {
+    completeRequesterSessionRun({
+      requester_session_key: resolvedRequesterSessionKey,
+      parent_agent_id: agentId,
+      dag_id: dagId || dag.getCurrentDagId() || undefined,
+      run_id: params.run_id || sessionRun?.run_id,
+      task_ids: taskIds,
+    });
   }
 
   return {

@@ -24,7 +24,6 @@ import {
 } from './bindings.js';
 import * as dag from './dag.js';
 import {
-  completeRequesterSessionRun,
   findRequesterSessionScope,
   findRequesterSessionScopeByRunId,
   listRequesterSessionScopes,
@@ -472,13 +471,6 @@ export function handleSubagentEndedEvent(event: any, ctx?: HookContext, logger?:
     if (runId) {
       completeSessionRun(runId, context);
     }
-    completeRequesterSessionRun({
-      requester_session_key: context.requesterSessionKey,
-      parent_agent_id: context.agentId,
-      dag_id: context.dagId,
-      run_id: runId,
-      task_ids: taskIds,
-    });
 
     const newlyReady = isSuccess ? markNewlyReadyTasks(taskIds, context) : [];
     return {
@@ -526,15 +518,19 @@ function collectResumeInstructionsForSession(sessionKey?: string): string | null
     });
     for (const event of pendingResumeEvents) {
       const payload = event.payload || {};
+      if (payload.requester_session_key && payload.requester_session_key !== sessionKey) {
+        continue;
+      }
       const runId = typeof event.run_id === 'string' ? event.run_id : '';
       const taskIds = Array.isArray(payload.task_ids) ? payload.task_ids.join(',') : '';
-      lines.push(`Resume task DAG before replying: dag_id=${scope.dag_id}, run_id=${runId}, task_ids=${taskIds}`);
+      const readyTaskIds = Array.isArray(payload.newly_ready_task_ids) ? payload.newly_ready_task_ids.join(',') : '';
+      lines.push(`Resume task DAG before replying: dag_id=${scope.dag_id}, run_id=${runId}, task_ids=${taskIds}, newly_ready_task_ids=${readyTaskIds}`);
     }
   }
   if (lines.length === 0) {
     return null;
   }
-  return `${lines.join('\n')}\nCall task_dag_continue for each pending dag_id/run_id before replying to the user.`;
+  return `${lines.join('\n')}\nPriority order: first call task_dag_continue for each pending dag_id/run_id, then continue task scheduling, and only then consider replying to the user.`;
 }
 
 /**

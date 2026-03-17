@@ -1914,6 +1914,149 @@ test('resume_requested is persisted even when wake-up send fails', async () => {
   });
 });
 
+test('failed wake-up can still inject continuation instructions on the next parent round', async () => {
+  await withTempWorkspace('hook-before-prompt-after-send-fail', async () => {
+    dag.setCurrentAgentId('main');
+    const created = dag.createDAG('hook-before-prompt-after-send-fail', [{ id: 't1', name: 'Prompt after send fail' }]);
+    requesterSessions.upsertRequesterSessionScope({
+      requester_session_key: 'agent:main:send-fail',
+      parent_agent_id: 'main',
+      dag_id: created.id,
+      run_id: 'run-send-fail',
+      task_ids: ['t1'],
+    });
+    bindings.saveSessionRun({
+      run_id: 'run-send-fail',
+      child_session_key: 'agent:worker:subagent:send-fail',
+      child_agent_id: 'worker',
+      requester_session_key: 'agent:main:send-fail',
+      parent_agent_id: 'main',
+      dag_id: created.id,
+      spawn_mode: 'single_task',
+      active_task_ids: ['t1'],
+    }, { agentId: 'main', dagId: created.id });
+    bindings.upsertTaskBinding({
+      dag_id: created.id,
+      task_id: 't1',
+      executor_type: 'subagent',
+      executor_agent_id: 'worker',
+      session_key: 'agent:worker:subagent:send-fail',
+      run_id: 'run-send-fail',
+      binding_status: 'active',
+    }, { agentId: 'main', dagId: created.id });
+
+    const registeredHooks = {};
+    hooks.registerTaskDagHooks({
+      logger: { info() {}, warn() {}, error() {} },
+      registerTool() {},
+      registerHook(name, handler) { registeredHooks[name] = handler; },
+      runtime: {
+        sessions_spawn: async () => ({}),
+        sessions_send: async () => { throw new Error('send failed'); },
+        sessions_list: async () => ([]),
+        subagents: async () => ([]),
+      },
+      config: {},
+    });
+
+    await registeredHooks['subagent_ended']({
+      targetSessionKey: 'agent:worker:subagent:send-fail',
+      runId: 'run-send-fail',
+      outcome: 'ok',
+    }, {
+      requesterSessionKey: 'agent:main:send-fail',
+      runId: 'run-send-fail',
+      childSessionKey: 'agent:worker:subagent:send-fail',
+    });
+
+    const injected = await registeredHooks['before_prompt_build']({ prompt: '', messages: [] }, { sessionKey: 'agent:main:send-fail' });
+    assert(injected.prependContext.includes('task_dag_continue'), 'Continuation should still be injectable after wake-up send failure');
+    assert(injected.prependContext.includes('Priority order'), 'Injection should prioritize continuation before replying');
+  });
+});
+
+test('task_dag_continue consumes resume_requested and clears requester scope', async () => {
+  await withTempWorkspace('continue-consumes-resume-scope', async () => {
+    dag.setCurrentAgentId('main');
+    const created = dag.createDAG('continue-consumes-resume-scope', [{ id: 't1', name: 'Consume resume scope' }]);
+    requesterSessions.upsertRequesterSessionScope({
+      requester_session_key: 'agent:main:consume',
+      parent_agent_id: 'main',
+      dag_id: created.id,
+      run_id: 'run-consume',
+      task_ids: ['t1'],
+    });
+    bindings.saveSessionRun({
+      run_id: 'run-consume',
+      child_session_key: 'agent:worker:subagent:consume',
+      child_agent_id: 'worker',
+      requester_session_key: 'agent:main:consume',
+      parent_agent_id: 'main',
+      dag_id: created.id,
+      spawn_mode: 'single_task',
+      active_task_ids: ['t1'],
+    }, { agentId: 'main', dagId: created.id });
+    bindings.upsertTaskBinding({
+      dag_id: created.id,
+      task_id: 't1',
+      executor_type: 'subagent',
+      executor_agent_id: 'worker',
+      session_key: 'agent:worker:subagent:consume',
+      run_id: 'run-consume',
+      binding_status: 'active',
+    }, { agentId: 'main', dagId: created.id });
+
+    hooks.handleSubagentEndedEvent({
+      targetSessionKey: 'agent:worker:subagent:consume',
+      runId: 'run-consume',
+      outcome: 'ok',
+    }, {
+      requesterSessionKey: 'agent:main:consume',
+      runId: 'run-consume',
+      childSessionKey: 'agent:worker:subagent:consume',
+    }, console);
+
+    bindings.appendPendingEvent({
+      type: 'resume_requested',
+      dag_id: created.id,
+      run_id: 'run-consume',
+      dedupe_key: 'resume-consume',
+      payload: {
+        requester_session_key: 'agent:main:consume',
+        task_ids: ['t1'],
+        newly_ready_task_ids: [],
+        outcome: 'ok',
+      },
+    }, { agentId: 'main', dagId: created.id });
+
+    const first = await tools.continueParentSession({
+      run_id: 'run-consume',
+      dag_id: created.id,
+      agent_id: 'main',
+    }, {});
+    const registeredHooks = {};
+    hooks.registerTaskDagHooks({
+      logger: { info() {}, warn() {}, error() {} },
+      registerTool() {},
+      registerHook(name, handler) { registeredHooks[name] = handler; },
+      runtime: {
+        sessions_spawn: async () => ({}),
+        sessions_send: async () => ({ success: true }),
+        sessions_list: async () => ([]),
+        subagents: async () => ([]),
+      },
+      config: {},
+    });
+
+    const injectedAfterContinue = await registeredHooks['before_prompt_build']({ prompt: '', messages: [] }, { sessionKey: 'agent:main:consume' });
+    const remainingResumeEvents = bindings.listPendingEvents({ type: 'resume_requested' }, { agentId: 'main', dagId: created.id });
+
+    assert(first.consumed_event_ids.length > 0, 'Continuation should consume resume-related events');
+    assert(remainingResumeEvents.length === 0, 'Resume events should be consumed after continuation');
+    assert(injectedAfterContinue === undefined, 'Requester scope should be cleared after continuation consumes the resume');
+  });
+});
+
 test('subagent_ended hook restores previous global dag context after processing', async () => {
   await withTempWorkspace('hook-context-restore', async () => {
     dag.setCurrentAgentId('main');
