@@ -68,7 +68,7 @@ function createShortTaskDagToken(length = 10): string {
 }
 
 function buildTaskDagSpawnLabel(): string {
-  return `tdg:${createShortTaskDagToken(10)}`;
+  return `task-dag:${createShortTaskDagToken(10)}`;
 }
 
 /**

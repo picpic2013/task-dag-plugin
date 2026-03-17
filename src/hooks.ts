@@ -43,7 +43,7 @@ export function parseTaskDagLabel(label: string): { token: string } | null {
     return null;
   }
   const trimmed = label.trim();
-  const match = /^tdg:([a-z0-9]{10})$/i.exec(trimmed);
+  const match = /^task-dag:([a-z0-9]{10})$/i.exec(trimmed);
   if (!match) {
     return null;
   }
@@ -86,9 +86,6 @@ function findPreparedSpawnIntent(event: any, ctx?: HookContext): { agentId: stri
         continue;
       }
       if (requesterSessionKey && preparedIntent.requester_session_key && preparedIntent.requester_session_key !== requesterSessionKey) {
-        continue;
-      }
-      if (preparedIntent.target_agent_id && event.agentId && preparedIntent.target_agent_id !== event.agentId) {
         continue;
       }
       matches.push({
@@ -292,10 +289,6 @@ export function handleSubagentSpawnedEvent(event: any, ctx?: HookContext, logger
 
   const taskId = preparedIntent.taskId;
   taskDagInfo(logger, `subagent_spawned matched intent child=${childSessionKey} run=${event.runId || event.run_id || ctx?.runId || '(none)'} actual_agent=${agentId || '(none)'} expected_target=${preparedIntent.targetAgentId || '(none)'} expected_parent=${preparedIntent.agentId} dag=${preparedIntent.dagId} task=${taskId} intent=${preparedIntent.intentId}`);
-  if (preparedIntent.targetAgentId && agentId && preparedIntent.targetAgentId !== agentId) {
-    taskDagWarn(logger, `subagent_spawned ignored child=${childSessionKey} run=${event.runId || event.run_id || ctx?.runId || '(none)'} reason=target_agent_drift expected_target=${preparedIntent.targetAgentId} actual_agent=${agentId} dag=${preparedIntent.dagId} task=${taskId} intent=${preparedIntent.intentId}`);
-    return;
-  }
 
   const runId = event.runId || event.run_id || ctx?.runId || `run-${taskId}-${Date.now()}`;
   const requesterKey = context.requesterSessionKey || requesterSessionKey || ctx?.requesterSessionKey;
