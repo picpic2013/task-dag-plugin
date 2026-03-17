@@ -864,6 +864,50 @@ test('task_dag_reconcile closes terminal task bindings', async () => {
   });
 });
 
+test('task_dag_diagnose recommends continue when completion events are pending', async () => {
+  await withTempWorkspace('tool-diagnose-continue', async () => {
+    const created = dag.createDAG('tool-diagnose-continue', [{ id: 't1', name: 'Task 1' }]);
+    bindings.appendPendingEvent({
+      type: 'resume_requested',
+      dag_id: created.id,
+      run_id: 'run-diagnose-1',
+      payload: { task_ids: ['t1'] },
+    }, { agentId: 'main', dagId: created.id });
+
+    const result = await tools.diagnoseTaskDagState({
+      dag_id: created.id,
+      agent_id: 'main',
+    }, {});
+
+    assert(result.success === true, 'Diagnose should succeed');
+    assert(result.recommended_action === 'continue', `Diagnose should recommend continuation: ${JSON.stringify(result)}`);
+    assert(String(result.guidance || '').includes('task_dag_continue'), 'Diagnose should point callers to task_dag_continue');
+  });
+});
+
+test('task_dag_diagnose recommends wait instead of polling while subagent work is in progress', async () => {
+  await withTempWorkspace('tool-diagnose-wait', async () => {
+    const created = dag.createDAG('tool-diagnose-wait', [{ id: 't1', name: 'Task 1' }]);
+    await tools.spawnTaskExecution({}, {
+      task_id: 't1',
+      dag_id: created.id,
+      agent_id: 'main',
+      requester_session_key: 'agent:main',
+      target_agent_id: 'worker',
+      task: 'delegate',
+    }, {});
+
+    const result = await tools.diagnoseTaskDagState({
+      dag_id: created.id,
+      agent_id: 'main',
+    }, {});
+
+    assert(result.recommended_action === 'wait', `Diagnose should recommend waiting: ${JSON.stringify(result)}`);
+    assert(String(result.guidance || '').includes('Do not poll repeatedly'), 'Diagnose should discourage polling');
+    assert(String(result.repair_tool_warning || '').includes('repair tool'), 'Diagnose should clarify reconcile is not the normal waiting path');
+  });
+});
+
 test('task_dag_claim rejects missing explicit agent context', async () => {
   await withTempWorkspace('tool-claim-context-error', async () => {
     const created = dag.createDAG('tool-claim-context-error', [{ id: 't1', name: 'Claim me' }]);

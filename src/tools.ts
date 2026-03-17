@@ -645,6 +645,78 @@ export async function reconcileTaskDagState(params: any, context?: any) {
   }
 }
 
+export async function diagnoseTaskDagState(params: any, context?: any) {
+  try {
+    const { agentId, dagId } = setToolExecutionContext(params, { requireDag: true });
+    const dagData = dag.loadDAG();
+    if (!dagData) {
+      return { error: 'No DAG exists. Use createDAG first.' };
+    }
+
+    const waitingSubagentTaskIds = Object.values(dagData.tasks)
+      .filter(task => task.status === 'waiting_subagent')
+      .map(task => task.id);
+    const readyTaskIds = Object.values(dagData.tasks)
+      .filter(task => task.status === 'ready')
+      .map(task => task.id);
+    const runningTaskIds = Object.values(dagData.tasks)
+      .filter(task => task.status === 'running')
+      .map(task => task.id);
+    const activeBindings = listTaskBindings({ binding_status: 'active' }, { agentId, dagId });
+    const preparedSpawnIntents = listSpawnIntents({ status: 'prepared' }, { agentId, dagId });
+    const activeAssignmentIntents = listAssignmentIntents({ status: 'assigned' }, { agentId, dagId });
+    const pendingEvents = listPendingEvents({ includeConsumed: false }, { agentId, dagId });
+    const pendingResumeEvents = pendingEvents.filter(event => event.type === 'resume_requested');
+    const terminalPendingEvents = pendingEvents.filter(
+      event =>
+        event.type === 'subagent_completed' ||
+        event.type === 'subagent_failed' ||
+        event.type === 'task_completed' ||
+        event.type === 'task_failed'
+    );
+
+    let recommendedAction: 'continue' | 'wait' | 'execute_ready' | 'repair' | 'idle' = 'idle';
+    let recommendationReason = 'no_action_needed';
+    if (pendingResumeEvents.length > 0 || terminalPendingEvents.length > 0) {
+      recommendedAction = 'continue';
+      recommendationReason = 'new_completion_events_available';
+    } else if (preparedSpawnIntents.length > 0 || activeBindings.length > 0 || activeAssignmentIntents.length > 0) {
+      recommendedAction = 'wait';
+      recommendationReason = 'subagent_work_in_progress';
+    } else if (readyTaskIds.length > 0) {
+      recommendedAction = 'execute_ready';
+      recommendationReason = 'ready_tasks_available';
+    }
+
+    return {
+      success: true,
+      agent_id: agentId,
+      dag_id: dagId || dag.getCurrentDagId(),
+      waiting_subagent_task_ids: waitingSubagentTaskIds,
+      ready_task_ids: readyTaskIds,
+      running_task_ids: runningTaskIds,
+      active_binding_count: activeBindings.length,
+      prepared_spawn_intent_count: preparedSpawnIntents.length,
+      active_assignment_intent_count: activeAssignmentIntents.length,
+      pending_event_count: pendingEvents.length,
+      pending_resume_event_count: pendingResumeEvents.length,
+      recommended_action: recommendedAction,
+      recommendation_reason: recommendationReason,
+      guidance:
+        recommendedAction === 'continue'
+          ? 'Call task_dag_continue with the relevant run_id, session_key, task_id, or task_ids.'
+          : recommendedAction === 'wait'
+            ? 'Do not poll repeatedly. Wait for a new resume/completion event before calling task_dag_continue again.'
+            : recommendedAction === 'execute_ready'
+              ? 'Claim and execute the ready tasks or spawn subagents for them.'
+              : 'No immediate DAG action is required.',
+      repair_tool_warning: 'task_dag_reconcile is a repair tool for inconsistent state, not a normal waiting tool.',
+    };
+  } catch (error: any) {
+    return { error: error.message };
+  }
+}
+
 function getScopeSessionRun(params: any, context: { agentId: string; dagId?: string }) {
   if (params.run_id) {
     return getSessionRunByRunId(params.run_id, context);
@@ -1022,6 +1094,20 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
 
   // ========== task_dag_get_parent ==========
   // 跨 Agent 查看父 Agent 的任务状态
+  api.registerTool({
+    name: "task_dag_diagnose",
+    description: "Inspect the current DAG control-plane state and recommend whether to continue, wait, execute ready work, or repair.",
+    parameters: {
+      type: "object",
+      properties: {
+        dag_id: { type: "string", description: "DAG ID" },
+        agent_id: { type: "string", description: "Agent ID" },
+      },
+      required: ["agent_id", "dag_id"]
+    },
+    execute: async (_toolCallId, params: any) => diagnoseTaskDagState(params)
+  }, { optional: true });
+
   api.registerTool({
     name: "task_dag_get_parent",
     description: "获取父 Agent 的任务状态（子 Agent 查看父任务）",
