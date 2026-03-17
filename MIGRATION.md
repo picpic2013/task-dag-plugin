@@ -32,6 +32,7 @@ create DAG
 ```text
 create DAG
 -> task_dag_claim / task_dag_spawn / task_dag_assign
+-> agent 自己调用 sessions_spawn / sessions_send
 -> hook + bindings + requester session registry + pending events
 -> ended hook 主动唤醒 requester session
 -> task_dag_continue / task_dag_reconcile
@@ -66,7 +67,15 @@ create DAG
 
 改用：
 
-- `task_dag_spawn`
+- `task_dag_spawn` 先生成 spawn plan
+- 然后由 agent 自己调用原生 `sessions_spawn`
+
+### 替代“worker 多轮直接发消息”
+
+改用：
+
+- `task_dag_assign`
+- 然后由 agent 自己调用原生 `sessions_send`
 
 ## 数据模型
 
@@ -81,10 +90,11 @@ create DAG
 
 ## 推荐迁移顺序
 
-1. 把所有 spawn 主路径替换成 `task_dag_spawn`
+1. 把所有 spawn 主路径替换成 `task_dag_spawn -> sessions_spawn`
 2. 把状态推进替换成 `claim/progress/complete/fail`
-3. 把父会话继续逻辑替换成 `task_dag_continue`
-4. 把异常收尾替换成 `task_dag_reconcile`
+3. 把 worker 多轮分配替换成 `task_dag_assign -> sessions_send`
+4. 把父会话继续逻辑替换成 `task_dag_continue`
+5. 把异常收尾替换成 `task_dag_reconcile`
 
 ## 已知边界
 
