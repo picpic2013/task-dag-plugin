@@ -642,11 +642,8 @@ test('task_dag_spawn prepares a spawn plan and persists spawn intent', async () 
     assert(dag.getTask('t1')?.waiting_for?.kind === 'spawn_intent', 'Task should wait for spawn intent confirmation');
     assert(typeof result.intent_id === 'string', 'Spawn should return an intent id');
     assert(result.spawn_plan?.agentId === 'worker', 'Spawn plan should keep target agent');
-    assert(result.spawn_plan?.label?.startsWith('taskdag:v1:'), 'Spawn plan should use task-dag label protocol');
-    assert(result.spawn_plan?.label?.includes('agent=main'), 'Spawn plan label should encode parent agent');
-    assert(result.spawn_plan?.label?.includes(`dag=${created.id}`), 'Spawn plan label should encode dag id');
-    assert(result.spawn_plan?.label?.includes('task=t1'), 'Spawn plan label should encode task id');
-    assert(result.spawn_plan?.label?.includes(`intent=${result.intent_id}`), 'Spawn plan label should encode intent id');
+    assert(result.spawn_plan?.label?.startsWith('tdg:'), 'Spawn plan should use short task-dag label protocol');
+    assert(result.spawn_plan?.label?.length === 14, 'Spawn plan label should stay short enough for OpenClaw label limits');
     assert(bindings.listSpawnIntents({ task_id: 't1', status: 'prepared' }, { agentId: 'main', dagId: result.dag_id }).length === 1, 'Prepared spawn intent should exist');
     assert(bindings.listTaskBindings({ task_id: 't1' }, { agentId: 'main', dagId: result.dag_id }).length === 0, 'Binding should not exist before spawned hook confirmation');
     assert(bindings.listPendingEvents({ type: 'subagent_spawned' }, { agentId: 'main', dagId: result.dag_id }).length === 0, 'Spawn tool should not emit hook-owned spawn event');
@@ -1392,7 +1389,7 @@ test('subagent_spawned hook persists session context and binding metadata', asyn
     dag.setCurrentAgentId('main');
     const created = dag.createDAG('hook-spawned', [{ id: 't1', name: 'Hook task' }]);
     const intentId = 'spawn-intent-hook-1';
-    const spawnLabel = `taskdag:v1:agent=main:dag=${created.id}:task=t1:intent=${intentId}`;
+    const spawnLabel = 'tdg:abc123def0';
     const intent = bindings.saveSpawnIntent({
       intent_id: intentId,
       dag_id: created.id,
@@ -1403,6 +1400,12 @@ test('subagent_spawned hook persists session context and binding metadata', asyn
       label: spawnLabel,
       status: 'prepared',
     }, { agentId: 'main', dagId: created.id });
+    requesterSessions.upsertRequesterSessionScope({
+      requester_session_key: 'agent:main',
+      parent_agent_id: 'main',
+      dag_id: created.id,
+      task_ids: ['t1'],
+    });
     dag.updateTask('t1', {
       status: 'waiting_subagent',
       waiting_for: { kind: 'spawn_intent', spawn_intent_id: intent.intent_id },
@@ -1438,14 +1441,14 @@ test('subagent_spawned hook does not duplicate spawn metadata already created by
     dag.setCurrentAgentId('main');
     const created = dag.createDAG('hook-spawned-idempotent', [{ id: 't1', name: 'Hook task' }]);
     const context = { agentId: 'main', dagId: created.id };
-    const spawnLabel = `taskdag:v1:dag=${created.id}:task=t1`;
+    const spawnLabel = 'tdg:idempo1234';
     requesterSessions.upsertRequesterSessionScope({
       requester_session_key: 'agent:main',
       parent_agent_id: 'main',
       dag_id: created.id,
       task_ids: ['t1'],
     });
-    bindings.saveSpawnIntent({
+    const intent = bindings.saveSpawnIntent({
       dag_id: created.id,
       task_id: 't1',
       parent_agent_id: 'main',
@@ -1454,6 +1457,10 @@ test('subagent_spawned hook does not duplicate spawn metadata already created by
       label: spawnLabel,
       status: 'prepared',
     }, context);
+    dag.updateTask('t1', {
+      status: 'waiting_subagent',
+      waiting_for: { kind: 'spawn_intent', spawn_intent_id: intent.intent_id },
+    });
     bindings.saveSessionRun({
       run_id: 'run-hook-idempotent',
       child_session_key: 'agent:worker:subagent:hook-idempotent',
@@ -1516,7 +1523,7 @@ test('subagent_spawned hook does not bind runs whose actual agent drifts from th
     const created = dag.createDAG('hook-spawned-drift-agent', [{ id: 't1', name: 'Hook task' }]);
     const context = { agentId: 'main', dagId: created.id };
     const intentId = 'spawn-intent-drift-agent';
-    const spawnLabel = `taskdag:v1:agent=main:dag=${created.id}:task=t1:intent=${intentId}`;
+    const spawnLabel = 'tdg:drift12345';
     const intent = bindings.saveSpawnIntent({
       intent_id: intentId,
       dag_id: created.id,
@@ -1659,7 +1666,7 @@ test('subagent_ended hook ignores runs without task-dag bindings', async () => {
   await withTempWorkspace('hook-orphaned', async () => {
     dag.setCurrentAgentId('main');
     const created = dag.createDAG('hook-orphaned', [{ id: 't1', name: 'Orphan check' }]);
-    const spawnLabel = `taskdag:v1:dag=${created.id}:task=t1`;
+    const spawnLabel = 'tdg:idempo1234';
     bindings.saveSpawnIntent({
       dag_id: created.id,
       task_id: 't1',
@@ -2600,7 +2607,7 @@ test('openclaw-style managed spawn -> ended -> continue flow advances the DAG', 
     });
 
     assert(spawnResult.success === true, `Spawn prepare should succeed: ${JSON.stringify(spawnResult)}`);
-    assert(spawnResult.spawn_plan.label.startsWith('taskdag:v1:'), 'Managed spawn should use task-dag protocol label');
+    assert(spawnResult.spawn_plan.label.startsWith('tdg:'), 'Managed spawn should use the short task-dag label protocol');
 
     const spawned = await harness.simulateManagedSpawn({
       requesterSessionKey,

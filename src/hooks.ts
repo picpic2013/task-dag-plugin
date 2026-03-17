@@ -11,7 +11,6 @@ import {
   appendPendingEvent,
   completeSessionRun,
   completeTaskBinding,
-  getSpawnIntentById,
   listAssignmentIntents,
   listSpawnIntents,
   getSessionRunByRunId,
@@ -38,109 +37,75 @@ type HookContext = {
   childSessionKey?: string;
 };
 
-export function parseTaskDagLabel(label: string): { version: string; agent_id?: string; dag_id?: string; task_id?: string; intent_id?: string } | null {
-  if (!label?.startsWith('taskdag:')) {
+export function parseTaskDagLabel(label: string): { token: string } | null {
+  if (typeof label !== 'string') {
     return null;
   }
-
-  const parts = label.split(':');
-  if (parts.length < 2) {
+  const trimmed = label.trim();
+  const match = /^tdg:([a-z0-9]{10})$/i.exec(trimmed);
+  if (!match) {
     return null;
   }
-
-  const version = parts[1] || 'unknown';
-  const parsed: { version: string; agent_id?: string; dag_id?: string; task_id?: string; intent_id?: string } = { version };
-
-  for (const segment of parts.slice(2)) {
-    const [key, value] = segment.split('=');
-    if (!key || !value) {
-      continue;
-    }
-    if (key === 'agent') {
-      parsed.agent_id = value;
-    } else if (key === 'dag') {
-      parsed.dag_id = value;
-    } else if (key === 'task') {
-      parsed.task_id = value;
-    } else if (key === 'intent') {
-      parsed.intent_id = value;
-    }
-  }
-
-  return parsed.task_id ? parsed : null;
+  return { token: match[1].toLowerCase() };
 }
 
-function findPreparedSpawnIntent(event: any, ctx?: HookContext): { agentId: string; dagId: string; intentId: string; taskId: string; requesterSessionKey?: string; targetAgentId?: string } | null {
+function taskIsWaitingForSpawnIntent(agentId: string, dagId: string, taskId: string, intentId: string): boolean {
+  const previousAgentId = dag.getCurrentAgentId();
+  const previousDagId = dag.getCurrentDagId();
+  dag.setCurrentAgentId(agentId);
+  dag.setCurrentDagId(dagId);
+  try {
+    const task = dag.getTask(taskId);
+    return task?.status === 'waiting_subagent' && task?.waiting_for?.kind === 'spawn_intent' && task?.waiting_for?.spawn_intent_id === intentId;
+  } finally {
+    dag.setCurrentAgentId(previousAgentId);
+    if (previousDagId) {
+      dag.setCurrentDagId(previousDagId);
+    }
+  }
+}
+
+function findPreparedSpawnIntent(event: any, ctx?: HookContext): { agentId: string; dagId: string; intentId: string; taskId: string; requesterSessionKey?: string; targetAgentId?: string; collisionCount?: number } | null {
   const parsedLabel = parseTaskDagLabel(event.label || '');
-  if (!parsedLabel?.task_id) {
+  if (!parsedLabel) {
     return null;
-  }
-
-  if (parsedLabel.agent_id && parsedLabel.dag_id && parsedLabel.intent_id) {
-    const directIntent = getSpawnIntentById(parsedLabel.intent_id, {
-      agentId: parsedLabel.agent_id,
-      dagId: parsedLabel.dag_id,
-    });
-    if (directIntent && directIntent.status === 'prepared' && directIntent.task_id === parsedLabel.task_id && directIntent.label === event.label) {
-      return {
-        agentId: parsedLabel.agent_id,
-        dagId: parsedLabel.dag_id,
-        intentId: directIntent.intent_id,
-        taskId: directIntent.task_id,
-        requesterSessionKey: directIntent.requester_session_key,
-        targetAgentId: directIntent.target_agent_id,
-      };
-    }
-  }
-
-  if (parsedLabel.agent_id && parsedLabel.dag_id) {
-    const directMatch = listSpawnIntents({
-      task_id: parsedLabel.task_id,
-      label: event.label,
-      status: 'prepared',
-    }, {
-      agentId: parsedLabel.agent_id,
-      dagId: parsedLabel.dag_id,
-    })[0];
-    if (directMatch) {
-      return {
-        agentId: parsedLabel.agent_id,
-        dagId: parsedLabel.dag_id,
-        intentId: directMatch.intent_id,
-        taskId: directMatch.task_id,
-        requesterSessionKey: directMatch.requester_session_key,
-        targetAgentId: directMatch.target_agent_id,
-      };
-    }
   }
 
   const requesterSessionKey = ctx?.requesterSessionKey || event.requesterSessionKey || event.requester_session_key;
-  if (!requesterSessionKey) {
-    return null;
-  }
-
-  const candidateScopes = listRequesterSessionScopes(requesterSessionKey)
-    .filter(scope => !parsedLabel.dag_id || scope.dag_id === parsedLabel.dag_id);
+  const candidateScopes = requesterSessionKey ? listRequesterSessionScopes(requesterSessionKey) : listRequesterSessionScopes();
+  const matches: Array<{ agentId: string; dagId: string; intentId: string; taskId: string; requesterSessionKey?: string; targetAgentId?: string }> = [];
 
   for (const scope of candidateScopes) {
-    const matchingIntent = listSpawnIntents({
-      task_id: parsedLabel.task_id,
+    const preparedIntents = listSpawnIntents({
       label: event.label,
       status: 'prepared',
-    }, { agentId: scope.parent_agent_id, dagId: scope.dag_id })[0];
-    if (matchingIntent) {
-      return {
+    }, { agentId: scope.parent_agent_id, dagId: scope.dag_id });
+    for (const preparedIntent of preparedIntents) {
+      if (!taskIsWaitingForSpawnIntent(scope.parent_agent_id, scope.dag_id, preparedIntent.task_id, preparedIntent.intent_id)) {
+        continue;
+      }
+      if (requesterSessionKey && preparedIntent.requester_session_key && preparedIntent.requester_session_key !== requesterSessionKey) {
+        continue;
+      }
+      if (preparedIntent.target_agent_id && event.agentId && preparedIntent.target_agent_id !== event.agentId) {
+        continue;
+      }
+      matches.push({
         agentId: scope.parent_agent_id,
         dagId: scope.dag_id,
-        intentId: matchingIntent.intent_id,
-        taskId: matchingIntent.task_id,
-        requesterSessionKey,
-        targetAgentId: matchingIntent.target_agent_id,
-      };
+        intentId: preparedIntent.intent_id,
+        taskId: preparedIntent.task_id,
+        requesterSessionKey: preparedIntent.requester_session_key || requesterSessionKey,
+        targetAgentId: preparedIntent.target_agent_id,
+      });
     }
   }
 
-  return null;
+  if (matches.length !== 1) {
+    return matches.length > 1 ? { ...matches[0], collisionCount: matches.length } : null;
+  }
+
+  return matches[0];
 }
 
 function setHookDagContext(agentId: string, dagId: string): void {
@@ -308,31 +273,13 @@ export function handleSubagentSpawnedEvent(event: any, ctx?: HookContext, logger
   taskDagInfo(logger, `subagent_spawned received child=${childSessionKey} run=${event.runId || event.run_id || ctx?.runId || '(none)'} agent=${agentId || '(none)'} label=${label || '(none)'} requester=${ctx?.requesterSessionKey || event.requesterSessionKey || event.requester_session_key || '(none)'}`);
 
   const preparedIntent = findPreparedSpawnIntent(event, ctx);
-  if (!preparedIntent) {
+  if (!preparedIntent || preparedIntent.collisionCount) {
     const parsedLabel = parseTaskDagLabel(label || '');
     const resolvedRequesterSessionKey = ctx?.requesterSessionKey || event.requesterSessionKey || event.requester_session_key;
-    const candidateScopeCount = resolvedRequesterSessionKey ? listRequesterSessionScopes(resolvedRequesterSessionKey).length : 0;
-    let duplicateOrDriftDetails = '';
-    if (parsedLabel?.task_id && resolvedRequesterSessionKey) {
-      const candidateScopes = listRequesterSessionScopes(resolvedRequesterSessionKey)
-        .filter(scope => !parsedLabel.dag_id || scope.dag_id === parsedLabel.dag_id);
-      for (const scope of candidateScopes) {
-        const matchingSpawnedIntents = listSpawnIntents({
-          task_id: parsedLabel.task_id,
-          label: event.label,
-          status: 'spawned',
-        }, { agentId: scope.parent_agent_id, dagId: scope.dag_id });
-        const matchingBindings = listTaskBindings({
-          task_id: parsedLabel.task_id,
-          binding_status: 'active',
-        }, { agentId: scope.parent_agent_id, dagId: scope.dag_id });
-        if (matchingSpawnedIntents.length > 0 || matchingBindings.length > 0) {
-          duplicateOrDriftDetails = ` duplicate_or_drift=1 existing_spawned_intents=${matchingSpawnedIntents.length} existing_active_bindings=${matchingBindings.length} scope_agent=${scope.parent_agent_id} scope_dag=${scope.dag_id}`;
-          break;
-        }
-      }
-    }
-    taskDagWarn(logger, `subagent_spawned unmanaged child=${childSessionKey} run=${event.runId || event.run_id || ctx?.runId || '(none)'} agent=${agentId || '(none)'} label=${label || '(none)'} parsed_task=${parsedLabel?.task_id || '(none)'} parsed_dag=${parsedLabel?.dag_id || '(none)'} requester=${resolvedRequesterSessionKey || '(none)'} requester_scope_count=${candidateScopeCount}${duplicateOrDriftDetails}`);
+    const candidateScopeCount = resolvedRequesterSessionKey ? listRequesterSessionScopes(resolvedRequesterSessionKey).length : listRequesterSessionScopes().length;
+    const reason = !parsedLabel ? 'non_taskdag_label' : preparedIntent?.collisionCount ? 'ambiguous_label_collision' : 'no_matching_prepared_intent';
+    const collisionDetails = preparedIntent?.collisionCount ? ` collision_count=${preparedIntent.collisionCount}` : '';
+    taskDagWarn(logger, `subagent_spawned unmanaged child=${childSessionKey} run=${event.runId || event.run_id || ctx?.runId || '(none)'} agent=${agentId || '(none)'} label=${label || '(none)'} token=${parsedLabel?.token || '(none)'} requester=${resolvedRequesterSessionKey || '(none)'} requester_scope_count=${candidateScopeCount} reason=${reason}${collisionDetails}`);
     return;
   }
 

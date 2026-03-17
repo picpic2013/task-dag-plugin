@@ -58,8 +58,16 @@ function createSpawnIntentId(): string {
   return `spawn-intent-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-function buildTaskDagSpawnLabel(params: { agentId: string; dagId: string; taskId: string; intentId: string }): string {
-  return `taskdag:v1:agent=${params.agentId}:dag=${params.dagId}:task=${params.taskId}:intent=${params.intentId}`;
+function createShortTaskDagToken(length = 10): string {
+  let token = '';
+  while (token.length < length) {
+    token += Math.random().toString(36).slice(2);
+  }
+  return token.slice(0, length);
+}
+
+function buildTaskDagSpawnLabel(): string {
+  return `tdg:${createShortTaskDagToken(10)}`;
 }
 
 /**
@@ -403,12 +411,7 @@ export async function spawnTaskExecution(runtime: RuntimeFacade, params: any, co
     }
 
     const intentId = createSpawnIntentId();
-    const spawnLabel = buildTaskDagSpawnLabel({
-      agentId,
-      dagId: dagIdToUse,
-      taskId: task_id,
-      intentId,
-    });
+    const spawnLabel = buildTaskDagSpawnLabel();
 
     const spawnIntent = saveSpawnIntent({
       intent_id: intentId,

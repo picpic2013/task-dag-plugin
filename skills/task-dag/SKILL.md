@@ -45,7 +45,7 @@ task_dag_continue
 - `requester_session_key` 必填
 - `sessions_spawn` 必须直接使用 `spawn_plan`
 - 不要手写或覆盖 `label`
-- 协议 `label` 由插件生成，里面会携带 `agent/dag/task/intent`，用于在 hook 里把 `run_id` 绑定回 task
+- 协议 `label` 由插件生成，为短 `tdg:<10位base36>` token，用于在 hook 里把 `run_id` 绑定回 task
 
 ## 核心规则
 

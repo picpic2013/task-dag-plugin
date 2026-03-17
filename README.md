@@ -20,7 +20,7 @@ task_dag_spawn -> sessions_spawn(直接使用 spawn_plan) -> task_dag_continue
 
 不要先 `task_dag_claim` 再 `task_dag_spawn`。
 不要手写或覆盖 `spawn_plan.label`。
-协议 `label` 由插件生成，里面携带 `agent/dag/task/intent`。`subagent_spawned` 用它绑定 `run_id`，`subagent_ended` 再按 `run_id` 收口 task。
+协议 `label` 由插件生成，为短 `tdg:<10位base36>` token。`subagent_spawned` 用它命中活跃 prepared intent 并绑定 `run_id`，`subagent_ended` 再按 `run_id` 收口 task。
 
 这意味着：
 
@@ -31,7 +31,7 @@ task_dag_spawn -> sessions_spawn(直接使用 spawn_plan) -> task_dag_continue
 - `resume_requested` 是 continuation 的权威事实来源；`sessions_send` 只是唤醒优化
 - 一个子 agent 可以绑定多个 task
 - 父 agent 也可以直接 claim/complete/fail task，不必强制走子 agent
-- 普通 subagent 不会被 task-dag hook 接管；只有带 task-dag 协议 label 或已登记 session/run 的子 agent 会进入这条链路
+- 普通 subagent 不会被 task-dag hook 接管；只有带 task-dag 短协议 label 或已登记 session/run 的子 agent 会进入这条链路
 
 ## 显式上下文要求
 
