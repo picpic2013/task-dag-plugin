@@ -13,12 +13,16 @@ import {
   completeSessionRun,
   completeTaskBinding,
   listSessionRunsBySessionKey,
+  listSpawnIntents,
   getSessionRunByRunId,
   getSessionRunBySessionKey,
+  getSpawnIntentById,
   listPendingEvents,
   listTaskBindings,
   removeTaskRuntimeState,
+  saveSpawnIntent,
   saveSessionRun,
+  updateSpawnIntent,
   upsertTaskBinding,
 } from './bindings.js';
 import type { PendingEvent } from './bindings.js';
@@ -292,102 +296,75 @@ export async function spawnTaskExecution(runtime: RuntimeFacade, params: any, co
     if (transitionError) {
       return transitionError;
     }
-    if (!runtime.sessions_spawn) {
-      return { error: 'sessions_spawn is not available' };
-    }
-
     const dagIdToUse = dagId || dag.getCurrentDagId() || 'default';
-    const spawnLabel = label || `task:${task_id}`;
+    const spawnLabel = label || `taskdag:v1:dag=${dagIdToUse}:task=${task_id}`;
     const spawnTaskText = task || prompt;
     const requesterSessionKey = getRequesterSessionKey(params);
     if (!spawnTaskText) {
       return { error: 'task or prompt is required' };
     }
-    if (requesterSessionKey) {
-      upsertRequesterSessionScope({
-        requester_session_key: requesterSessionKey,
-        parent_agent_id: agentId,
+    const existingPreparedIntent = listSpawnIntents({
+      task_id: task_id,
+      status: 'prepared',
+    }, { agentId, dagId: dagIdToUse }).find(intent => intent.label === spawnLabel);
+    if (existingPreparedIntent) {
+      return {
+        error: `Task ${task_id} already has a prepared spawn intent`,
+        intent_id: existingPreparedIntent.intent_id,
         dag_id: dagIdToUse,
-        task_ids: [task_id],
-      });
+        agent_id: agentId,
+      };
     }
 
-    const spawnResult = await runtime.sessions_spawn({
-      task: spawnTaskText,
-      agentId: targetAgentId,
-      model,
-      label: spawnLabel,
-      thread,
-      mode,
-      runtime: runtimeMode,
-    });
-
-    const { sessionKey, runId } = extractSpawnResult(spawnResult);
-    if (!sessionKey && !runId) {
-      return { error: 'sessions_spawn did not return session or run identifiers', raw: spawnResult };
-    }
-
-    const effectiveRunId = runId || `run-${task_id}-${Date.now()}`;
-    if (sessionKey) {
-      saveSessionRun({
-        run_id: effectiveRunId,
-        child_session_key: sessionKey,
-        child_agent_id: targetAgentId,
-        requester_session_key: requesterSessionKey,
-        parent_agent_id: agentId,
-        dag_id: dagIdToUse,
-        spawn_mode: 'single_task',
-        label: spawnLabel,
-        active_task_ids: [task_id],
-      }, { agentId, dagId: dagIdToUse });
-    }
-
-    if (requesterSessionKey) {
-      upsertRequesterSessionScope({
-        requester_session_key: requesterSessionKey,
-        parent_agent_id: agentId,
-        dag_id: dagIdToUse,
-        run_id: effectiveRunId,
-        task_ids: [task_id],
-      });
-    }
-
-    upsertTaskBinding({
+    const spawnIntent = saveSpawnIntent({
       dag_id: dagIdToUse,
       task_id,
-      executor_type: 'subagent',
-      executor_agent_id: targetAgentId,
-      session_key: sessionKey,
-      run_id: effectiveRunId,
-      binding_status: 'active',
+      parent_agent_id: agentId,
+      requester_session_key: requesterSessionKey,
+      target_agent_id: targetAgentId,
+      label: spawnLabel,
+      status: 'prepared',
     }, { agentId, dagId: dagIdToUse });
+
+    if (requesterSessionKey) {
+      upsertRequesterSessionScope({
+        requester_session_key: requesterSessionKey,
+        parent_agent_id: agentId,
+        dag_id: dagIdToUse,
+        task_ids: [task_id],
+      });
+    }
 
     const updatedTask = dag.updateTask(task_id, {
       status: 'waiting_subagent',
       executor: {
         type: 'subagent',
         agent_id: targetAgentId,
-        session_key: sessionKey,
-        run_id: effectiveRunId,
         claimed_at: new Date().toISOString(),
       },
       waiting_for: {
-        kind: 'subagent',
-        session_key: sessionKey,
-        run_id: effectiveRunId,
+        kind: 'spawn_intent',
+        spawn_intent_id: spawnIntent.intent_id,
       },
-      log: { level: 'info', message: `Spawned subagent for ${task_id}` },
+      log: { level: 'info', message: `Prepared subagent spawn for ${task_id}` },
     } as any);
 
     return {
       success: true,
-      status: 'waiting',
+      status: 'prepared',
       task: updatedTask,
       dag_id: dagIdToUse,
       agent_id: agentId,
-      session_key: sessionKey,
-      run_id: effectiveRunId,
-      spawn: spawnResult,
+      intent_id: spawnIntent.intent_id,
+      spawn_plan: {
+        task: spawnTaskText,
+        agentId: targetAgentId,
+        model,
+        label: spawnLabel,
+        thread,
+        mode,
+        runtime: runtimeMode,
+      },
     };
   } catch (error: any) {
     return { error: error.message };
@@ -1310,7 +1287,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
 
   api.registerTool({
     name: "task_dag_spawn",
-    description: "Spawn a subagent for a task, create bindings, and move the task into waiting_subagent.",
+    description: "Prepare a subagent spawn for a task and return a sessions_spawn plan for the agent to execute.",
     parameters: {
       type: "object",
       properties: {

@@ -567,18 +567,11 @@ test('registered task_dag_claim uses runtime execute signature without losing pa
   });
 });
 
-test('task_dag_spawn creates binding and moves task into waiting_subagent', async () => {
+test('task_dag_spawn prepares a spawn plan and persists spawn intent', async () => {
   await withTempWorkspace('tool-spawn', async () => {
     const created = dag.createDAG('tool-spawn', [{ id: 't1', name: 'Spawn me' }]);
 
-    const runtime = {
-      sessions_spawn: async () => ({
-        sessionKey: 'agent:worker:subagent:spawn-1',
-        runId: 'run-spawn-1',
-      }),
-    };
-
-    const result = await tools.spawnTaskExecution(runtime, {
+    const result = await tools.spawnTaskExecution({}, {
       task_id: 't1',
       dag_id: created.id,
       agent_id: 'main',
@@ -589,10 +582,14 @@ test('task_dag_spawn creates binding and moves task into waiting_subagent', asyn
 
     assert(result.success === true, 'Spawn should succeed');
     assert(dag.getTask('t1')?.status === 'waiting_subagent', 'Task should wait on subagent');
-    assert(bindings.listTaskBindings({ task_id: 't1' }, { agentId: 'main', dagId: result.dag_id }).length === 1, 'Binding should exist');
-    assert(bindings.getSessionRunByRunId('run-spawn-1', { agentId: 'main', dagId: result.dag_id })?.child_session_key === 'agent:worker:subagent:spawn-1', 'Session run should persist');
+    assert(dag.getTask('t1')?.waiting_for?.kind === 'spawn_intent', 'Task should wait for spawn intent confirmation');
+    assert(typeof result.intent_id === 'string', 'Spawn should return an intent id');
+    assert(result.spawn_plan?.agentId === 'worker', 'Spawn plan should keep target agent');
+    assert(result.spawn_plan?.label?.startsWith('taskdag:v1:'), 'Spawn plan should use task-dag label protocol');
+    assert(bindings.listSpawnIntents({ task_id: 't1', status: 'prepared' }, { agentId: 'main', dagId: result.dag_id }).length === 1, 'Prepared spawn intent should exist');
+    assert(bindings.listTaskBindings({ task_id: 't1' }, { agentId: 'main', dagId: result.dag_id }).length === 0, 'Binding should not exist before spawned hook confirmation');
     assert(bindings.listPendingEvents({ type: 'subagent_spawned' }, { agentId: 'main', dagId: result.dag_id }).length === 0, 'Spawn tool should not emit hook-owned spawn event');
-    assert(requesterSessions.findRequesterSessionScope({ requester_session_key: 'agent:main', run_id: 'run-spawn-1' })?.dag_id === result.dag_id, 'Spawn should register requester session scope');
+    assert(requesterSessions.findRequesterSessionScope({ requester_session_key: 'agent:main', task_id: 't1' })?.dag_id === result.dag_id, 'Spawn should register requester session scope');
   });
 });
 
@@ -746,7 +743,7 @@ test('task_dag_spawn rejects terminal tasks', async () => {
   await withTempWorkspace('tool-spawn-terminal', async () => {
     const created = dag.createDAG('tool-spawn-terminal', [{ id: 't1', name: 'Done task' }]);
     dag.updateTask('t1', { status: 'done' });
-    const result = await tools.spawnTaskExecution({ sessions_spawn: async () => ({ sessionKey: 's', runId: 'r' }) }, {
+    const result = await tools.spawnTaskExecution({}, {
       task_id: 't1',
       dag_id: created.id,
       agent_id: 'main',
@@ -754,6 +751,25 @@ test('task_dag_spawn rejects terminal tasks', async () => {
       agentId: 'worker',
     }, {});
     assert(result.error?.includes('cannot spawn a subagent'), 'Done task should not spawn');
+  });
+});
+
+test('task_dag_spawn no longer depends on runtime.sessions_spawn being injected', async () => {
+  await withTempWorkspace('tool-spawn-no-runtime', async () => {
+    const created = dag.createDAG('tool-spawn-no-runtime', [{ id: 't1', name: 'Spawn me' }]);
+    const result = await tools.spawnTaskExecution({}, {
+      task_id: 't1',
+      dag_id: created.id,
+      agent_id: 'main',
+      requester_session_key: 'agent:main:requester',
+      target_agent_id: 'worker',
+      task: 'perform task 1',
+      mode: 'session',
+    }, {});
+
+    assert(result.success === true, `Spawn prepare should succeed: ${JSON.stringify(result)}`);
+    assert(result.status === 'prepared', 'Spawn should return prepared status');
+    assert(result.spawn_plan?.mode === 'session', 'Spawn plan should preserve requested mode');
   });
 });
 

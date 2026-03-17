@@ -37,10 +37,11 @@ export interface TaskExecutor {
 }
 
 export interface TaskWaitingFor {
-  kind: 'subagent' | 'children';
+  kind: 'subagent' | 'children' | 'spawn_intent';
   session_key?: string;
   run_id?: string;
   child_task_ids?: string[];
+  spawn_intent_id?: string;
 }
 
 export interface Task {
@@ -167,7 +168,7 @@ export function validateTask(task: Task): boolean {
     }
   }
   if (task.waiting_for) {
-    if (!['subagent', 'children'].includes(task.waiting_for.kind)) {
+    if (!['subagent', 'children', 'spawn_intent'].includes(task.waiting_for.kind)) {
       return false;
     }
     if (task.waiting_for.child_task_ids && !Array.isArray(task.waiting_for.child_task_ids)) {

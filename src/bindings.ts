@@ -13,6 +13,7 @@ const DAG_DIR = 'tasks';
 const TASK_BINDINGS_FILE = 'task-bindings.json';
 const SESSION_RUNS_FILE = 'session-runs.json';
 const PENDING_EVENTS_FILE = 'pending-events.jsonl';
+const SPAWN_INTENTS_FILE = 'spawn-intents.json';
 
 export type BindingStatus = 'active' | 'completed' | 'failed' | 'released';
 export type SpawnMode = 'single_task' | 'multi_task' | 'shared_worker' | 'unknown';
@@ -68,6 +69,22 @@ export interface PendingEvent {
   consumed_at?: string;
 }
 
+export type SpawnIntentStatus = 'prepared' | 'spawned' | 'cancelled';
+
+export interface SpawnIntent {
+  intent_id: string;
+  dag_id: string;
+  task_id: string;
+  parent_agent_id: string;
+  requester_session_key?: string;
+  target_agent_id?: string;
+  label: string;
+  status: SpawnIntentStatus;
+  created_at: string;
+  spawned_at?: string;
+  cancelled_at?: string;
+}
+
 interface TaskBindingsData {
   bindings: Record<string, TaskBinding>;
 }
@@ -75,6 +92,10 @@ interface TaskBindingsData {
 interface SessionRunsData {
   runs: Record<string, SessionRun>;
   by_session: Record<string, string[] | string>;
+}
+
+interface SpawnIntentsData {
+  intents: Record<string, SpawnIntent>;
 }
 
 function getStorageDirForAgent(agentId: string, dagId: string): string {
@@ -131,6 +152,10 @@ function getPendingEventsFile(agentId: string, dagId: string): string {
   return path.join(getStorageDirForAgent(agentId, dagId), PENDING_EVENTS_FILE);
 }
 
+function getSpawnIntentsFile(agentId: string, dagId: string): string {
+  return path.join(getStorageDirForAgent(agentId, dagId), SPAWN_INTENTS_FILE);
+}
+
 function loadTaskBindingsData(agentId: string, dagId: string): TaskBindingsData {
   return readJsonFile(getTaskBindingsFile(agentId, dagId), { bindings: {} });
 }
@@ -145,6 +170,14 @@ function loadSessionRunsData(agentId: string, dagId: string): SessionRunsData {
 
 function saveSessionRunsData(agentId: string, dagId: string, data: SessionRunsData): void {
   writeJsonFile(getSessionRunsFile(agentId, dagId), data);
+}
+
+function loadSpawnIntentsData(agentId: string, dagId: string): SpawnIntentsData {
+  return readJsonFile(getSpawnIntentsFile(agentId, dagId), { intents: {} });
+}
+
+function saveSpawnIntentsData(agentId: string, dagId: string, data: SpawnIntentsData): void {
+  writeJsonFile(getSpawnIntentsFile(agentId, dagId), data);
 }
 
 function getRunIdsForSession(data: SessionRunsData, sessionKey: string): string[] {
@@ -400,6 +433,79 @@ export function appendPendingEvent(
 
   appendJsonLine(getPendingEventsFile(agentId, dagId), event);
   return event;
+}
+
+export function saveSpawnIntent(
+  input: Omit<SpawnIntent, 'intent_id' | 'created_at'> & {
+    intent_id?: string;
+    created_at?: string;
+  },
+  context?: { agentId?: string; dagId?: string }
+): SpawnIntent {
+  const { agentId, dagId } = resolveContext(context?.agentId, context?.dagId);
+  const data = loadSpawnIntentsData(agentId, dagId);
+  const intent: SpawnIntent = {
+    intent_id: input.intent_id || createId('spawn-intent'),
+    dag_id: input.dag_id || dagId,
+    task_id: input.task_id,
+    parent_agent_id: input.parent_agent_id || agentId,
+    requester_session_key: input.requester_session_key,
+    target_agent_id: input.target_agent_id,
+    label: input.label,
+    status: input.status,
+    created_at: input.created_at || new Date().toISOString(),
+    spawned_at: input.spawned_at,
+    cancelled_at: input.cancelled_at,
+  };
+  data.intents[intent.intent_id] = intent;
+  saveSpawnIntentsData(agentId, dagId, data);
+  return intent;
+}
+
+export function getSpawnIntentById(
+  intentId: string,
+  context?: { agentId?: string; dagId?: string }
+): SpawnIntent | null {
+  const { agentId, dagId } = resolveContext(context?.agentId, context?.dagId);
+  return loadSpawnIntentsData(agentId, dagId).intents[intentId] || null;
+}
+
+export function listSpawnIntents(
+  filter: {
+    task_id?: string;
+    label?: string;
+    status?: SpawnIntentStatus;
+  } = {},
+  context?: { agentId?: string; dagId?: string }
+): SpawnIntent[] {
+  const { agentId, dagId } = resolveContext(context?.agentId, context?.dagId);
+  return Object.values(loadSpawnIntentsData(agentId, dagId).intents)
+    .filter(intent => {
+      if (filter.task_id && intent.task_id !== filter.task_id) return false;
+      if (filter.label && intent.label !== filter.label) return false;
+      if (filter.status && intent.status !== filter.status) return false;
+      return true;
+    })
+    .sort((a, b) => a.created_at.localeCompare(b.created_at));
+}
+
+export function updateSpawnIntent(
+  intentId: string,
+  updates: Partial<Pick<SpawnIntent, 'status' | 'spawned_at' | 'cancelled_at'>>,
+  context?: { agentId?: string; dagId?: string }
+): SpawnIntent | null {
+  const { agentId, dagId } = resolveContext(context?.agentId, context?.dagId);
+  const data = loadSpawnIntentsData(agentId, dagId);
+  const intent = data.intents[intentId];
+  if (!intent) {
+    return null;
+  }
+  data.intents[intentId] = {
+    ...intent,
+    ...updates,
+  };
+  saveSpawnIntentsData(agentId, dagId, data);
+  return data.intents[intentId];
 }
 
 export function listPendingEvents(
