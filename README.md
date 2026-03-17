@@ -20,6 +20,7 @@ task_dag_spawn -> sessions_spawn(直接使用 spawn_plan) -> task_dag_continue
 
 不要先 `task_dag_claim` 再 `task_dag_spawn`。
 不要手写或覆盖 `spawn_plan.label`。
+协议 `label` 由插件生成，里面携带 `agent/dag/task/intent`。`subagent_spawned` 用它绑定 `run_id`，`subagent_ended` 再按 `run_id` 收口 task。
 
 这意味着：
 
@@ -39,6 +40,7 @@ task_dag_spawn -> sessions_spawn(直接使用 spawn_plan) -> task_dag_continue
 - 非 `main` agent 必须显式传 `agent_id`
 - `task_dag_create` 不会再静默回退到 `main`
 - `task_dag_spawn` 是 prepare-spawn 工具；若希望父会话在子 agent 完成后继续处理，必须显式传 `requester_session_key`
+- `task_dag_spawn` 会自动生成协议 `label`；不要自定义 `label`
 - `task_dag_continue` 必须显式提供 continuation scope：
   - `run_id`
   - `session_key`
@@ -137,8 +139,8 @@ task_dag_continue agent_id="main" task_id="t1"
 task_dag_spawn agent_id="main" requester_session_key="agent:main:feishu:group:xxx" task_id="t2" task="完成分析工作并给出结论" target_agent_id="worker"
 
 # 直接使用上一步返回的 spawn_plan
-# 不要先 claim，不要手写 label
-sessions_spawn task="完成分析工作并给出结论" agentId="worker" label="taskdag:v1:dag=dag-xxx:task=t2"
+# 不要先 claim，不要手写 label，不要重写 agentId
+sessions_spawn
 
 # 父会话在被 runtime 新一轮唤醒后继续
 task_dag_continue agent_id="main" task_id="t2"
@@ -148,7 +150,7 @@ task_dag_continue agent_id="main" task_id="t2"
 
 ```bash
 task_dag_spawn agent_id="main" requester_session_key="agent:main:feishu:group:xxx" task_id="t1" task="先做第一个子任务" target_agent_id="worker"
-sessions_spawn task="先做第一个子任务" agentId="worker" mode="session" label="taskdag:v1:dag=dag-xxx:task=t1"
+sessions_spawn
 
 # 同一个 worker session 下一轮处理 t2
 # session_key 必须来自真实已存在的 worker session，不要手写猜测
@@ -185,8 +187,8 @@ task_dag_spawn
 -> 返回 spawn plan
 -> agent 调 sessions_spawn
 -> 父 agent 当前轮次返回，不阻塞等待子 agent
--> subagent_spawned hook 建 binding
--> subagent_ended hook 收尾
+-> subagent_spawned hook 用协议 label 把 run_id 绑定到 task
+-> subagent_ended hook 按 run_id 收尾
 -> plugin 写 resume_requested
 -> plugin 尝试 sessions_send 唤醒 requester session
 -> task_dag_continue 读 completion event

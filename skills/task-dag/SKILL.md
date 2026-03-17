@@ -45,6 +45,7 @@ task_dag_continue
 - `requester_session_key` 必填
 - `sessions_spawn` 必须直接使用 `spawn_plan`
 - 不要手写或覆盖 `label`
+- 协议 `label` 由插件生成，里面会携带 `agent/dag/task/intent`，用于在 hook 里把 `run_id` 绑定回 task
 
 ## 核心规则
 
@@ -53,7 +54,7 @@ task_dag_continue
 3. 子 agent 完成后的状态推进主要依赖 hook、requester session 注册表和 pending events。
 4. 非 `main` agent 必须显式传 `agent_id`。
 5. `task_dag_spawn` 若希望父会话恢复，`requester_session_key` 必填。
-6. `sessions_spawn` 的关键参数必须原样来自 `spawn_plan`。
+6. `sessions_spawn` 的关键参数必须原样来自 `spawn_plan`，尤其是 `agentId` 和 `label`。
 7. worker 多轮模式：先 `task_dag_assign`，再 `sessions_send`。
 8. `task_dag_continue` 必须显式带 scope：`run_id`、`session_key`、`task_id`、`task_ids` 之一。
 9. 父 agent 的模型是“返回后等触发”，不是“阻塞等待子 agent 完成”。
@@ -73,7 +74,7 @@ task_dag_continue agent_id="main" task_id="t1"
 
 ```bash
 task_dag_spawn agent_id="main" requester_session_key="agent:main:feishu:group:xxx" task_id="t1" task="完成这个子任务" target_agent_id="worker"
-sessions_spawn task="完成这个子任务" agentId="worker" label="taskdag:v1:dag=dag-xxx:task=t1"
+sessions_spawn  # 直接使用上一步返回的 spawn_plan，不要重写 agentId/label
 
 # 插件会在 ended hook 后主动唤醒父 session
 # 父 agent 当前轮次返回；父会话在被唤醒的新一轮里
@@ -101,8 +102,8 @@ task_dag_spawn ... label="read-frontend-readme"
 ### 一个子 agent 处理多个 task
 
 ```bash
-task_dag_spawn agent_id="main" requester_session_key="agent:main:feishu:group:xxx" task_id="t1" task="先做第一个任务" target_agent_id="worker"
-sessions_spawn task="先做第一个任务" agentId="worker" mode="session" label="taskdag:v1:dag=dag-xxx:task=t1"
+task_dag_spawn agent_id="main" requester_session_key="agent:main:feishu:group:xxx" task_id="t1" task="先做第一个任务" target_agent_id="worker" mode="session"
+sessions_spawn  # 直接使用上一步返回的 spawn_plan
 task_dag_assign agent_id="main" session_key="agent:worker:subagent:shared-1" task_ids=["t2"]
 sessions_send sessionKey="agent:worker:subagent:shared-1" message="处理 task t2"
 task_dag_continue agent_id="main" session_key="agent:worker:subagent:shared-1"

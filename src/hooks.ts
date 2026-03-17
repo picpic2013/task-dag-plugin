@@ -11,6 +11,7 @@ import {
   appendPendingEvent,
   completeSessionRun,
   completeTaskBinding,
+  getSpawnIntentById,
   listAssignmentIntents,
   listSpawnIntents,
   getSessionRunByRunId,
@@ -37,7 +38,7 @@ type HookContext = {
   childSessionKey?: string;
 };
 
-export function parseTaskDagLabel(label: string): { version: string; dag_id?: string; task_id?: string } | null {
+export function parseTaskDagLabel(label: string): { version: string; agent_id?: string; dag_id?: string; task_id?: string; intent_id?: string } | null {
   if (!label?.startsWith('taskdag:')) {
     return null;
   }
@@ -48,17 +49,21 @@ export function parseTaskDagLabel(label: string): { version: string; dag_id?: st
   }
 
   const version = parts[1] || 'unknown';
-  const parsed: { version: string; dag_id?: string; task_id?: string } = { version };
+  const parsed: { version: string; agent_id?: string; dag_id?: string; task_id?: string; intent_id?: string } = { version };
 
   for (const segment of parts.slice(2)) {
     const [key, value] = segment.split('=');
     if (!key || !value) {
       continue;
     }
-    if (key === 'dag') {
+    if (key === 'agent') {
+      parsed.agent_id = value;
+    } else if (key === 'dag') {
       parsed.dag_id = value;
     } else if (key === 'task') {
       parsed.task_id = value;
+    } else if (key === 'intent') {
+      parsed.intent_id = value;
     }
   }
 
@@ -69,6 +74,44 @@ function findPreparedSpawnIntent(event: any, ctx?: HookContext): { agentId: stri
   const parsedLabel = parseTaskDagLabel(event.label || '');
   if (!parsedLabel?.task_id) {
     return null;
+  }
+
+  if (parsedLabel.agent_id && parsedLabel.dag_id && parsedLabel.intent_id) {
+    const directIntent = getSpawnIntentById(parsedLabel.intent_id, {
+      agentId: parsedLabel.agent_id,
+      dagId: parsedLabel.dag_id,
+    });
+    if (directIntent && directIntent.status === 'prepared' && directIntent.task_id === parsedLabel.task_id && directIntent.label === event.label) {
+      return {
+        agentId: parsedLabel.agent_id,
+        dagId: parsedLabel.dag_id,
+        intentId: directIntent.intent_id,
+        taskId: directIntent.task_id,
+        requesterSessionKey: directIntent.requester_session_key,
+        targetAgentId: directIntent.target_agent_id,
+      };
+    }
+  }
+
+  if (parsedLabel.agent_id && parsedLabel.dag_id) {
+    const directMatch = listSpawnIntents({
+      task_id: parsedLabel.task_id,
+      label: event.label,
+      status: 'prepared',
+    }, {
+      agentId: parsedLabel.agent_id,
+      dagId: parsedLabel.dag_id,
+    })[0];
+    if (directMatch) {
+      return {
+        agentId: parsedLabel.agent_id,
+        dagId: parsedLabel.dag_id,
+        intentId: directMatch.intent_id,
+        taskId: directMatch.task_id,
+        requesterSessionKey: directMatch.requester_session_key,
+        targetAgentId: directMatch.target_agent_id,
+      };
+    }
   }
 
   const requesterSessionKey = ctx?.requesterSessionKey || event.requesterSessionKey || event.requester_session_key;
@@ -149,8 +192,8 @@ function getHookContextFromEndedEvent(event: any, ctx?: HookContext): { agentId:
   const requesterSessionKey = ctx?.requesterSessionKey || event.requesterSessionKey || event.requester_session_key;
   const targetSessionKey = event.targetSessionKey || event.childSessionKey || event.sessionKey || ctx?.childSessionKey;
   const scope =
-    (requesterSessionKey ? findRequesterSessionScope({ requester_session_key: requesterSessionKey, run_id: runId }) : null) ||
-    (runId ? findRequesterSessionScopeByRunId(runId) : null);
+    (runId ? findRequesterSessionScopeByRunId(runId) : null) ||
+    (requesterSessionKey ? findRequesterSessionScope({ requester_session_key: requesterSessionKey, run_id: runId }) : null);
   if (!scope && requesterSessionKey && targetSessionKey) {
     const candidateScopes = listRequesterSessionScopes(requesterSessionKey);
     const scopesWithAssignments = candidateScopes.filter(candidateScope => {

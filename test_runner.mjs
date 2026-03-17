@@ -643,6 +643,10 @@ test('task_dag_spawn prepares a spawn plan and persists spawn intent', async () 
     assert(typeof result.intent_id === 'string', 'Spawn should return an intent id');
     assert(result.spawn_plan?.agentId === 'worker', 'Spawn plan should keep target agent');
     assert(result.spawn_plan?.label?.startsWith('taskdag:v1:'), 'Spawn plan should use task-dag label protocol');
+    assert(result.spawn_plan?.label?.includes('agent=main'), 'Spawn plan label should encode parent agent');
+    assert(result.spawn_plan?.label?.includes(`dag=${created.id}`), 'Spawn plan label should encode dag id');
+    assert(result.spawn_plan?.label?.includes('task=t1'), 'Spawn plan label should encode task id');
+    assert(result.spawn_plan?.label?.includes(`intent=${result.intent_id}`), 'Spawn plan label should encode intent id');
     assert(bindings.listSpawnIntents({ task_id: 't1', status: 'prepared' }, { agentId: 'main', dagId: result.dag_id }).length === 1, 'Prepared spawn intent should exist');
     assert(bindings.listTaskBindings({ task_id: 't1' }, { agentId: 'main', dagId: result.dag_id }).length === 0, 'Binding should not exist before spawned hook confirmation');
     assert(bindings.listPendingEvents({ type: 'subagent_spawned' }, { agentId: 'main', dagId: result.dag_id }).length === 0, 'Spawn tool should not emit hook-owned spawn event');
@@ -1387,8 +1391,10 @@ test('subagent_spawned hook persists session context and binding metadata', asyn
   await withTempWorkspace('hook-spawned', async () => {
     dag.setCurrentAgentId('main');
     const created = dag.createDAG('hook-spawned', [{ id: 't1', name: 'Hook task' }]);
-    const spawnLabel = `taskdag:v1:dag=${created.id}:task=t1`;
+    const intentId = 'spawn-intent-hook-1';
+    const spawnLabel = `taskdag:v1:agent=main:dag=${created.id}:task=t1:intent=${intentId}`;
     const intent = bindings.saveSpawnIntent({
+      intent_id: intentId,
       dag_id: created.id,
       task_id: 't1',
       parent_agent_id: 'main',
@@ -1397,12 +1403,6 @@ test('subagent_spawned hook persists session context and binding metadata', asyn
       label: spawnLabel,
       status: 'prepared',
     }, { agentId: 'main', dagId: created.id });
-    requesterSessions.upsertRequesterSessionScope({
-      requester_session_key: 'agent:main',
-      parent_agent_id: 'main',
-      dag_id: created.id,
-      task_ids: ['t1'],
-    });
     dag.updateTask('t1', {
       status: 'waiting_subagent',
       waiting_for: { kind: 'spawn_intent', spawn_intent_id: intent.intent_id },
@@ -1429,6 +1429,7 @@ test('subagent_spawned hook persists session context and binding metadata', asyn
     assert(spawnedIntent?.status === 'spawned', 'Hook should upgrade spawn intent to spawned');
     assert(fs.existsSync(oldSessionMappings) === false, 'Old session mapping file should not be created');
     assert(fs.existsSync(oldHierarchy) === false, 'Old session hierarchy file should not be created');
+    assert(requesterSessions.findRequesterSessionScope({ requester_session_key: 'agent:main', run_id: 'run-hook-1' })?.dag_id === created.id, 'Hook should rebuild requester scope from intent metadata');
   });
 });
 
@@ -1514,8 +1515,10 @@ test('subagent_spawned hook does not bind runs whose actual agent drifts from th
     dag.setCurrentAgentId('main');
     const created = dag.createDAG('hook-spawned-drift-agent', [{ id: 't1', name: 'Hook task' }]);
     const context = { agentId: 'main', dagId: created.id };
-    const spawnLabel = `taskdag:v1:dag=${created.id}:task=t1`;
+    const intentId = 'spawn-intent-drift-agent';
+    const spawnLabel = `taskdag:v1:agent=main:dag=${created.id}:task=t1:intent=${intentId}`;
     const intent = bindings.saveSpawnIntent({
+      intent_id: intentId,
       dag_id: created.id,
       task_id: 't1',
       parent_agent_id: 'main',
@@ -2635,7 +2638,7 @@ test('openclaw-style managed spawn -> ended -> continue flow advances the DAG', 
   });
 });
 
-test('openclaw-style runtime simulation reproduces unmanaged custom-label failure quickly', async () => {
+test('task_dag_spawn rejects custom label overrides so hook identity stays stable', async () => {
   await withTempWorkspace('openclaw-runtime-unmanaged-label', async () => {
     const harness = createOpenClawSimulationHarness();
     const requesterSessionKey = 'agent:chexie:feishu:group:test-runtime-bad-label';
@@ -2659,40 +2662,8 @@ test('openclaw-style runtime simulation reproduces unmanaged custom-label failur
       label: 'test-dag-t1',
     });
 
-    assert(spawnResult.success === true, 'Spawn prepare still succeeds with a custom label today');
-    assert(spawnResult.spawn_plan.label === 'test-dag-t1', 'Custom label should be preserved by current tool implementation');
-
-    const spawned = await harness.simulateManagedSpawn({
-      requesterSessionKey,
-      spawnPlan: spawnResult.spawn_plan,
-    });
-
-    const continueWhileWaiting = await harness.registeredTools.task_dag_continue.execute('call-runtime-continue-bad-label', {
-      agent_id: 'chexie',
-      dag_id: createResult.dag_id,
-      run_id: spawned.runId,
-      task_id: 't1',
-    });
-
-    await harness.simulateEnded({
-      requesterSessionKey,
-      childSessionKey: spawned.childSessionKey,
-      runId: spawned.runId,
-      outcome: 'ok',
-    });
-
-    const continueAfterEnded = await harness.registeredTools.task_dag_continue.execute('call-runtime-continue-bad-label-ended', {
-      agent_id: 'chexie',
-      dag_id: createResult.dag_id,
-      run_id: spawned.runId,
-      task_id: 't1',
-    });
-
-    assert(continueWhileWaiting.active_binding_count === 0, 'Non-protocol label should fail to create a managed binding');
-    assert(continueAfterEnded.completed_task_ids.length === 0, 'Unmanaged run should not emit completion into task-dag continuation');
-    assert(continueAfterEnded.ready_task_ids.length === 0, 'Downstream task should not become ready when hook never attached');
-    assert(dag.getTask('t1')?.status === 'waiting_subagent', 'Task should remain stuck in waiting_subagent without managed hook capture');
-    assert(harness.sentMessages.length === 0, 'Unmanaged run should not wake the parent continuation channel');
+    assert(typeof spawnResult.error === 'string', 'Custom label overrides should be rejected');
+    assert(String(spawnResult.error).includes('custom label override is not allowed'), 'Rejection should explain that protocol label is mandatory');
   });
 });
 

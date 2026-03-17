@@ -54,6 +54,14 @@ function logToolError(message: string): void {
   taskDagError(toolLogger, message);
 }
 
+function createSpawnIntentId(): string {
+  return `spawn-intent-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function buildTaskDagSpawnLabel(params: { agentId: string; dagId: string; taskId: string; intentId: string }): string {
+  return `taskdag:v1:agent=${params.agentId}:dag=${params.dagId}:task=${params.taskId}:intent=${params.intentId}`;
+}
+
 /**
  * 从工具参数获取 agent ID。
  * 工具层不再假设存在 runtime session/context，只认显式参数。
@@ -370,7 +378,6 @@ export async function spawnTaskExecution(runtime: RuntimeFacade, params: any, co
       return transitionError;
     }
     const dagIdToUse = dagId || dag.getCurrentDagId() || 'default';
-    const spawnLabel = label || `taskdag:v1:dag=${dagIdToUse}:task=${task_id}`;
     const spawnTaskText = task || prompt;
     const requesterSessionKey = getRequesterSessionKey(params);
     if (!spawnTaskText) {
@@ -378,14 +385,15 @@ export async function spawnTaskExecution(runtime: RuntimeFacade, params: any, co
       return { error: 'task or prompt is required' };
     }
     if (label) {
-      logToolWarn(`task_dag_spawn custom label override dag=${dagIdToUse} task=${task_id} label=${label}`);
+      logToolWarn(`task_dag_spawn rejected custom label dag=${dagIdToUse} task=${task_id} label=${label}`);
+      return { error: 'custom label override is not allowed; use the returned spawn_plan.label unchanged' };
     }
     const existingPreparedIntent = listSpawnIntents({
       task_id: task_id,
       status: 'prepared',
-    }, { agentId, dagId: dagIdToUse }).find(intent => intent.label === spawnLabel);
+    }, { agentId, dagId: dagIdToUse })[0];
     if (existingPreparedIntent) {
-      logToolWarn(`task_dag_spawn duplicate prepared intent dag=${dagIdToUse} task=${task_id} label=${spawnLabel} intent=${existingPreparedIntent.intent_id}`);
+      logToolWarn(`task_dag_spawn duplicate prepared intent dag=${dagIdToUse} task=${task_id} label=${existingPreparedIntent.label} intent=${existingPreparedIntent.intent_id}`);
       return {
         error: `Task ${task_id} already has a prepared spawn intent`,
         intent_id: existingPreparedIntent.intent_id,
@@ -394,7 +402,16 @@ export async function spawnTaskExecution(runtime: RuntimeFacade, params: any, co
       };
     }
 
+    const intentId = createSpawnIntentId();
+    const spawnLabel = buildTaskDagSpawnLabel({
+      agentId,
+      dagId: dagIdToUse,
+      taskId: task_id,
+      intentId,
+    });
+
     const spawnIntent = saveSpawnIntent({
+      intent_id: intentId,
       dag_id: dagIdToUse,
       task_id,
       parent_agent_id: agentId,
@@ -1590,7 +1607,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
 
   api.registerTool({
     name: "task_dag_spawn",
-    description: "Send a ready task to a new subagent. Do not call task_dag_claim first. Return spawn_plan and use it unchanged in sessions_spawn.",
+    description: "Send a ready task to a new subagent. Do not call task_dag_claim first. Use the returned spawn_plan unchanged; its protocol label binds run_id back to this task.",
     parameters: {
       type: "object",
       properties: {
@@ -1602,7 +1619,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
         agentId: { type: "string", description: "Target subagent agent ID (legacy alias)" },
         target_agent_id: { type: "string", description: "Target subagent agent ID" },
         model: { type: "string", description: "Target model" },
-        label: { type: "string", description: "Spawn label" },
+        label: { type: "string", description: "Reserved. Do not pass a custom label; task-dag generates a protocol label automatically." },
         thread: { type: "boolean", description: "Thread mode" },
         mode: { type: "string", enum: ["run", "session"], description: "Spawn mode" },
         runtime: { type: "string", enum: ["subagent", "acp"], description: "Runtime kind" },
