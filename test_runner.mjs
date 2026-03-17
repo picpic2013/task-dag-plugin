@@ -1811,6 +1811,109 @@ test('registerTaskDagHooks uses runtime hook ctx and sends resume wake-up', asyn
   });
 });
 
+test('registerTaskDagHooks does not emit continuation for unmanaged ended events', async () => {
+  await withTempWorkspace('hook-register-unmanaged-ended', async () => {
+    dag.setCurrentAgentId('main');
+    const created = dag.createDAG('hook-register-unmanaged-ended', [{ id: 't1', name: 'Tracked task' }]);
+    requesterSessions.upsertRequesterSessionScope({
+      requester_session_key: 'agent:main',
+      parent_agent_id: 'main',
+      dag_id: created.id,
+      run_id: 'run-tracked',
+      task_ids: ['t1'],
+    });
+
+    const sentMessages = [];
+    const registeredHooks = {};
+    hooks.registerTaskDagHooks({
+      logger: { info() {}, warn() {}, error() {} },
+      registerTool() {},
+      registerHook(name, handler) { registeredHooks[name] = handler; },
+      runtime: {
+        sessions_spawn: async () => ({}),
+        sessions_send: async (params) => { sentMessages.push(params); return { success: true }; },
+        sessions_list: async () => ([]),
+        subagents: async () => ([]),
+      },
+      config: {},
+    });
+
+    await registeredHooks['subagent_ended']({
+      targetSessionKey: 'agent:worker:subagent:unmanaged',
+      runId: 'run-tracked',
+      outcome: 'ok',
+    }, {
+      requesterSessionKey: 'agent:main',
+      runId: 'run-tracked',
+      childSessionKey: 'agent:worker:subagent:unmanaged',
+    });
+
+    const resumeEvents = bindings.listPendingEvents({ type: 'resume_requested' }, { agentId: 'main', dagId: created.id });
+    assert(sentMessages.length === 0, 'Unmanaged ended events should not wake requester session');
+    assert(resumeEvents.length === 0, 'Unmanaged ended events should not emit resume_requested');
+  });
+});
+
+test('resume_requested is persisted even when wake-up send fails', async () => {
+  await withTempWorkspace('hook-register-resume-send-fails', async () => {
+    dag.setCurrentAgentId('main');
+    const created = dag.createDAG('hook-register-resume-send-fails', [{ id: 't1', name: 'Resume me anyway' }]);
+    requesterSessions.upsertRequesterSessionScope({
+      requester_session_key: 'agent:main',
+      parent_agent_id: 'main',
+      dag_id: created.id,
+      run_id: 'run-resume-fail',
+      task_ids: ['t1'],
+    });
+    bindings.saveSessionRun({
+      run_id: 'run-resume-fail',
+      child_session_key: 'agent:worker:subagent:resume-fail',
+      child_agent_id: 'worker',
+      requester_session_key: 'agent:main',
+      parent_agent_id: 'main',
+      dag_id: created.id,
+      spawn_mode: 'single_task',
+      active_task_ids: ['t1'],
+    }, { agentId: 'main', dagId: created.id });
+    bindings.upsertTaskBinding({
+      dag_id: created.id,
+      task_id: 't1',
+      executor_type: 'subagent',
+      executor_agent_id: 'worker',
+      session_key: 'agent:worker:subagent:resume-fail',
+      run_id: 'run-resume-fail',
+      binding_status: 'active',
+    }, { agentId: 'main', dagId: created.id });
+
+    const registeredHooks = {};
+    hooks.registerTaskDagHooks({
+      logger: { info() {}, warn() {}, error() {} },
+      registerTool() {},
+      registerHook(name, handler) { registeredHooks[name] = handler; },
+      runtime: {
+        sessions_spawn: async () => ({}),
+        sessions_send: async () => { throw new Error('send failed'); },
+        sessions_list: async () => ([]),
+        subagents: async () => ([]),
+      },
+      config: {},
+    });
+
+    await registeredHooks['subagent_ended']({
+      targetSessionKey: 'agent:worker:subagent:resume-fail',
+      runId: 'run-resume-fail',
+      outcome: 'ok',
+    }, {
+      requesterSessionKey: 'agent:main',
+      runId: 'run-resume-fail',
+      childSessionKey: 'agent:worker:subagent:resume-fail',
+    });
+
+    const resumeEvents = bindings.listPendingEvents({ type: 'resume_requested' }, { agentId: 'main', dagId: created.id });
+    assert(resumeEvents.length === 1, 'Continuation should be persisted before wake-up send succeeds');
+  });
+});
+
 test('subagent_ended hook restores previous global dag context after processing', async () => {
   await withTempWorkspace('hook-context-restore', async () => {
     dag.setCurrentAgentId('main');

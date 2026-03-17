@@ -326,6 +326,7 @@ export function handleSubagentSpawnedEvent(event: any, ctx?: HookContext, logger
 }
 
 export function handleSubagentEndedEvent(event: any, ctx?: HookContext, logger?: OpenClawPluginApi['logger']): {
+  managed_run: boolean;
   agent_id?: string;
   task_ids: string[];
   newly_ready_task_ids: string[];
@@ -337,13 +338,13 @@ export function handleSubagentEndedEvent(event: any, ctx?: HookContext, logger?:
   const targetSessionKey = event.targetSessionKey || event.childSessionKey || event.sessionKey;
   const outcome = event.outcome || 'unknown';
   if (!targetSessionKey) {
-    return { task_ids: [], newly_ready_task_ids: [], outcome };
+    return { managed_run: false, task_ids: [], newly_ready_task_ids: [], outcome };
   }
 
   const context = getHookContextFromEndedEvent(event, ctx);
   if (!context) {
     logger?.warn?.('[task-dag] Unable to resolve DAG context for subagent_ended');
-    return { task_ids: [], newly_ready_task_ids: [], outcome };
+    return { managed_run: false, task_ids: [], newly_ready_task_ids: [], outcome };
   }
 
   return withHookDagContext(context.agentId, context.dagId, () => {
@@ -353,6 +354,12 @@ export function handleSubagentEndedEvent(event: any, ctx?: HookContext, logger?:
       event.runId ||
       event.run_id ||
       fallbackRunId;
+    const matchingSessionRun =
+      (runId ? getSessionRunByRunId(runId, context) : null) ||
+      (sessionRunsByKey.length === 1 ? sessionRunsByKey[0] : null);
+    const resolvedRequesterSessionKey =
+      context.requesterSessionKey ||
+      matchingSessionRun?.requester_session_key;
     let activeBindings = listTaskBindings({ session_key: targetSessionKey, binding_status: 'active' }, context)
       .filter(binding => !runId || !binding.run_id || binding.run_id === runId);
     const activeAssignments = listAssignmentIntents({ session_key: targetSessionKey, status: 'assigned' }, context);
@@ -398,17 +405,27 @@ export function handleSubagentEndedEvent(event: any, ctx?: HookContext, logger?:
       }, context).filter(existingEvent => existingEvent.type === 'subagent_completed' || existingEvent.type === 'subagent_failed');
       if (existingCompletionEvents.length > 0) {
         return {
+          managed_run: true,
           agent_id: context.agentId,
           task_ids: existingCompletionEvents.map(existingEvent => existingEvent.task_id).filter((taskId): taskId is string => !!taskId),
           newly_ready_task_ids: [],
           outcome,
-          requester_session_key: context.requesterSessionKey,
+          requester_session_key: resolvedRequesterSessionKey,
           run_id: runId,
           dag_id: context.dagId,
         };
       }
 
-      return { agent_id: context.agentId, task_ids: [], newly_ready_task_ids: [], outcome, requester_session_key: context.requesterSessionKey, run_id: runId, dag_id: context.dagId };
+      return {
+        managed_run: false,
+        agent_id: context.agentId,
+        task_ids: [],
+        newly_ready_task_ids: [],
+        outcome,
+        requester_session_key: resolvedRequesterSessionKey,
+        run_id: runId,
+        dag_id: context.dagId,
+      };
     }
 
     const taskIds = activeBindings.map(binding => binding.task_id);
@@ -465,11 +482,12 @@ export function handleSubagentEndedEvent(event: any, ctx?: HookContext, logger?:
 
     const newlyReady = isSuccess ? markNewlyReadyTasks(taskIds, context) : [];
     return {
+      managed_run: true,
       agent_id: context.agentId,
       task_ids: taskIds,
       newly_ready_task_ids: newlyReady,
       outcome,
-      requester_session_key: context.requesterSessionKey,
+      requester_session_key: resolvedRequesterSessionKey,
       run_id: runId,
       dag_id: context.dagId,
     };
@@ -552,6 +570,10 @@ export function registerTaskDagHooks(api: OpenClawPluginApi): void {
   api.registerHook('subagent_ended', async (event: any, ctx?: HookContext) => {
     try {
       const result = handleSubagentEndedEvent(event, ctx, api.logger);
+      if (!result.managed_run) {
+        api.logger.info(`[task-dag] Ignoring unmanaged subagent_ended for ${event.targetSessionKey || event.childSessionKey}`);
+        return;
+      }
       const requesterSessionKey = result.requester_session_key || ctx?.requesterSessionKey;
       const dedupeKey = `resume_requested:${result.dag_id || 'unknown'}:${result.run_id || event.runId || event.targetSessionKey || 'no-run'}:${result.outcome}`;
       const existingResumeEvents = result.dag_id && result.agent_id
