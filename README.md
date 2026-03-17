@@ -125,7 +125,8 @@ task_dag_continue agent_id="main" task_id="t1"
 ```bash
 task_dag_spawn agent_id="main" requester_session_key="agent:main:feishu:group:xxx" task_id="t2" task="完成分析工作并给出结论" target_agent_id="worker"
 
-# agent 按返回的 plan 调用原生 sessions_spawn
+# agent 必须直接使用上一步返回的 spawn_plan 参数调用原生 sessions_spawn
+# 不要手写 label，不要自己猜 agentId/model/mode
 sessions_spawn task="完成分析工作并给出结论" agentId="worker" label="taskdag:v1:dag=dag-xxx:task=t2"
 
 # 父会话在被 runtime 新一轮唤醒后继续
@@ -139,6 +140,8 @@ task_dag_spawn agent_id="main" requester_session_key="agent:main:feishu:group:xx
 sessions_spawn task="先做第一个子任务" agentId="worker" mode="session" label="taskdag:v1:dag=dag-xxx:task=t1"
 
 # 同一个 worker session 下一轮处理 t2
+# session_key 必须来自真实已存在的 worker session，不要手写猜测
+# 推荐一轮只分配一个 task；一轮 worker run 对应一个 ended 收口
 task_dag_assign agent_id="main" session_key="agent:worker:subagent:shared-1" task_ids=["t2"]
 sessions_send sessionKey="agent:worker:subagent:shared-1" message="处理 task t2：整理第二部分结果"
 
@@ -187,6 +190,13 @@ task_dag_spawn
 -> subagent_ended 按 run + assignment 收口当前 task
 -> 父会话继续
 ```
+
+规则：
+
+- 一个 worker session 可以服务多个 task
+- 但推荐一轮只处理一个 task
+- 一个 ended 只应收口一个当前 assignment
+- 不要先 `sessions_send`，再补 `task_dag_assign`
 
 ### 多子任务汇总
 
@@ -318,6 +328,7 @@ task_dag_spawn
 - 先用 `task_dag_spawn agent_id="..." requester_session_key="..." ...`
 - 再按返回的 plan 调原生 `sessions_spawn`
 - worker 多轮模式下，先 `task_dag_assign`，再 `sessions_send`
+- 不要自己手写 task-dag label 或猜测 worker `session_key`
 - 子 agent 完成后，父会话在被唤醒的新一轮调用 `task_dag_continue`
 
 ### `tool done ok` 但业务结果仍然是错误

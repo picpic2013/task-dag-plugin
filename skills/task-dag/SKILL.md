@@ -47,6 +47,12 @@ sessions_spawn task="完成这个子任务" agentId="worker" label="taskdag:v1:d
 task_dag_continue agent_id="main" task_id="t1"
 ```
 
+要求：
+
+- `sessions_spawn` 的参数应直接来自 `task_dag_spawn` 返回的 `spawn_plan`
+- 不要手写或重组 `label`
+- 不要自己猜 `agentId`、`mode`、`model`
+
 ### 一个子 agent 处理多个 task
 
 ```bash
@@ -56,6 +62,13 @@ task_dag_assign agent_id="main" session_key="agent:worker:subagent:shared-1" tas
 sessions_send sessionKey="agent:worker:subagent:shared-1" message="处理 task t2"
 task_dag_continue agent_id="main" session_key="agent:worker:subagent:shared-1"
 ```
+
+要求：
+
+- `session_key` 必须来自真实存在的 worker session
+- 推荐一轮只给一个 task
+- 一轮 worker run 对应一个 ended 收口
+- 顺序必须是 `task_dag_assign -> sessions_send`，不要反过来
 
 ### 非 `main` agent 示例
 
@@ -154,6 +167,7 @@ task_dag_continue agent_id="chexie" dag_id="dag-xxx" task_ids=["t1","t2"]
 6. 子 agent 完成后，插件会主动向 requester session 发送 continuation 消息；父会话在被唤醒的新一轮使用 `task_dag_continue`。
 7. 调 `task_dag_continue` 时显式传 `run_id/session_key/task_id/task_ids` 之一，不要空调用。
 8. 如果 hook 或时序看起来不一致，使用 `task_dag_reconcile`。
+9. worker 模式下一次只分配一个下一轮任务，避免让同一个 ended 收口多任务。
 
 ## 反模式
 
@@ -179,6 +193,8 @@ task_dag_continue agent_id="main" task_id="t1"
 - 记住哪个 requester session 该在 completion 后被继续唤醒
 - 自己判断多个 completion 哪一个该给用户输出
 - 在 worker 多轮模式下，靠消息文本让插件自己猜“这一轮对应哪个 task”
+- 在没有 assignment 的情况下，先 `sessions_send` 再补登记
+- 手写 task-dag label 或猜测 worker `session_key`
 
 不要省略这些关键参数：
 
