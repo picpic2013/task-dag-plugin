@@ -32,7 +32,7 @@ task_dag_spawn -> sessions_spawn(直接使用 spawn_plan) -> task_dag_continue
 - `resume_requested` 是 continuation 的权威事实来源；`sessions_send` 只是唤醒优化
 - 一个子 agent 可以绑定多个 task
 - 父 agent 也可以直接 claim/complete/fail task，不必强制走子 agent
-- 普通 subagent 不会被 task-dag hook 接管；只有带 task-dag 短协议 label 或已登记 session/run 的子 agent 会进入这条链路
+- 普通 subagent 不会被 task-dag hook 接管；首轮 managed spawn 主要靠协议 `label` 命中唯一活跃 prepared intent。没有协议 `label` 的 run 不会被自动纳管。
 
 ## 显式上下文要求
 
@@ -140,7 +140,7 @@ task_dag_continue agent_id="main" task_id="t1"
 task_dag_spawn agent_id="main" requester_session_key="agent:main:feishu:group:xxx" task_id="t2" task="完成分析工作并给出结论" target_agent_id="worker"
 
 # 直接使用上一步返回的 spawn_plan
-# 不要先 claim，不要手写 label，不要重写 agentId
+# 不要先 claim，不要手写或覆盖 label
 sessions_spawn
 
 # 父会话在被 runtime 新一轮唤醒后继续
@@ -200,7 +200,7 @@ task_dag_spawn
 
 ```text
 首次 sessions_spawn(mode="session")
--> spawned hook 登记 worker session
+-> spawned hook 用协议 label 绑定首轮 task，并登记 worker session
 -> task_dag_assign 登记下一轮 assignment intent
 -> agent 调 sessions_send
 -> subagent_ended 按 run + assignment 收口当前 task
@@ -209,10 +209,11 @@ task_dag_spawn
 
 规则：
 
-- 一个 worker session 可以服务多个 task
+- 一个 worker session 可以服务多个 task，但这是多轮复用语义，不是一次 spawned 自动绑定多个 task
 - 但推荐一轮只处理一个 task
 - 一个 ended 只应收口一个当前 assignment
 - 不要先 `sessions_send`，再补 `task_dag_assign`
+- 多轮 worker 是否对应新 task，当前仍依赖显式 `task_dag_assign`，不是纯靠 hook 自动猜测
 
 ## Continuation 语义
 

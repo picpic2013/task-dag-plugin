@@ -55,7 +55,7 @@ task_dag_continue
 3. 子 agent 完成后的状态推进主要依赖 hook、requester session 注册表和 pending events。
 4. 非 `main` agent 必须显式传 `agent_id`。
 5. `task_dag_spawn` 若希望父会话恢复，`requester_session_key` 必填。
-6. `sessions_spawn` 的关键参数必须原样来自 `spawn_plan`，至少不要改 `label`。当前 hook 主要按协议 `label` 识别 task。
+6. `sessions_spawn` 的关键参数必须原样来自 `spawn_plan`，至少不要改 `label`。当前首轮 managed spawn 主要按协议 `label` 识别 task。
 7. worker 多轮模式：先 `task_dag_assign`，再 `sessions_send`。
 8. `task_dag_continue` 必须显式带 scope：`run_id`、`session_key`、`task_id`、`task_ids` 之一。
 9. 父 agent 的模型是“返回后等触发”，不是“阻塞等待子 agent 完成”。
@@ -117,6 +117,7 @@ task_dag_continue agent_id="main" session_key="agent:worker:subagent:shared-1"
 - 一轮 worker run 对应一个 ended 收口
 - 顺序必须是 `task_dag_assign -> sessions_send`，不要反过来
 - 如果最开始的 `task_dag_spawn` 没带 `requester_session_key` 或覆盖了协议 label，后续多轮 worker 也不会被正确纳管
+- 多轮 worker 的新 task 识别当前仍依赖 `task_dag_assign`，不是纯靠 hook 自动猜测
 
 ### 非 `main` agent 示例
 
@@ -257,6 +258,7 @@ sessions_spawn ... label="read-frontend-readme"
 - 看到 `spawn_plan` 后，自己再改参数
 - 子 agent 已接手后，父 agent 继续自己执行同一 task
 - 在 `no_new_events=true` 的情况下继续反复调用 `task_dag_continue`
+- 把没有协议 `label` 的普通 run 当成 task-dag managed run
 
 不要省略这些关键参数：
 
