@@ -34,9 +34,16 @@ create DAG
 -> task_dag_claim / task_dag_spawn / task_dag_assign
 -> agent 自己调用 sessions_spawn / sessions_send
 -> hook + bindings + requester session registry + pending events
--> ended hook 主动唤醒 requester session
+-> ended hook 写 resume_requested
+-> 尝试主动唤醒 requester session
 -> task_dag_continue / task_dag_reconcile
 ```
+
+补充语义：
+
+- 父 agent 不再阻塞等待子 agent 完成
+- 正确模型是：当前轮次返回，后续靠 continuation 触发父会话新一轮继续
+- `sessions_send` 是唤醒优化，不是 continuation 是否成立的前提
 
 ## 替代关系
 
@@ -104,3 +111,4 @@ create DAG
 
 - OpenClaw runtime 仍可能把 completion 直接发给用户
 - 插件无法恢复“原来的工具调用栈”，只能触发父 session 新一轮继续
+- 普通 subagent 不会被自动纳入 task-dag continuation；只有显式协议 label 或已登记 run/binding/assignment 的 managed subagent 才会进入这条链路

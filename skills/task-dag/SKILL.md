@@ -25,6 +25,8 @@ description: "Use for complex task orchestration with DAG dependencies, subagent
 8. worker 多轮模式：先 `task_dag_assign`，再由 agent 自己调用原生 `sessions_send`。
 9. `task_dag_continue` 必须显式带 continuation scope：`run_id`、`session_key`、`task_id`、`task_ids` 之一。
 10. 一旦 task 已进入 subagent 生命周期，父 agent 不应再对同一 task `claim/complete/fail`。
+11. 父 agent 的模型是“返回后等触发”，不是“阻塞等待子 agent 完成”。
+12. `resume_requested` 是 continuation 的权威事实来源；`sessions_send` 只是唤醒优化。
 
 ## 当前推荐流程
 
@@ -44,7 +46,7 @@ task_dag_spawn agent_id="main" requester_session_key="agent:main:feishu:group:xx
 sessions_spawn task="完成这个子任务" agentId="worker" label="taskdag:v1:dag=dag-xxx:task=t1"
 
 # 插件会在 ended hook 后主动唤醒父 session
-# 父会话在被唤醒的新一轮里
+# 父 agent 当前轮次返回；父会话在被唤醒的新一轮里
 task_dag_continue agent_id="main" task_id="t1"
 ```
 
@@ -179,6 +181,7 @@ task_dag_continue agent_id="chexie" dag_id="dag-xxx" task_ids=["t1","t2"]
 4. `task_dag_spawn` 返回的是 spawn plan，不是已经执行完成的 spawn；下一步要由 agent 自己调用原生 `sessions_spawn`。
 5. 如果一个 worker 要连续做多个 task，先 `task_dag_assign`，再调用原生 `sessions_send`。
 6. 子 agent 完成后，插件会主动向 requester session 发送 continuation 消息；父会话在被唤醒的新一轮使用 `task_dag_continue`。
+6.1. 即使唤醒消息没有成功发出，只要父会话后续进入新一轮，未消费的 `resume_requested` 仍会触发 continuation 注入。
 7. 调 `task_dag_continue` 时显式传 `run_id/session_key/task_id/task_ids` 之一，不要空调用。
 8. 如果 hook 或时序看起来不一致，使用 `task_dag_reconcile`。
 9. worker 模式下一次只分配一个下一轮任务，避免让同一个 ended 收口多任务。
@@ -207,6 +210,7 @@ task_dag_continue agent_id="main" task_id="t1"
 - 自己猜某个 task 属于哪个 DAG
 - 记住哪个 requester session 该在 completion 后被继续唤醒
 - 自己判断多个 completion 哪一个该给用户输出
+- 把“completion 先发给谁”误当成“能不能继续 DAG”的前提
 - 在 worker 多轮模式下，靠消息文本让插件自己猜“这一轮对应哪个 task”
 - 在没有 assignment 的情况下，先 `sessions_send` 再补登记
 - 手写 task-dag label 或猜测 worker `session_key`

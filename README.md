@@ -23,6 +23,8 @@ task_dag_spawn
 - 子 agent 完成后的收尾主要依赖 `subagent_spawned` / `subagent_ended` hook
 - 父会话继续输出不再只依赖模型记得下一轮调用 `task_dag_continue`
 - 插件会在 ended hook 后主动向 requester session 发送 continuation 消息
+- 父 agent 的正确模型是：逻辑上等待，执行上返回；后续靠 continuation 触发新一轮继续
+- `resume_requested` 是 continuation 的权威事实来源；`sessions_send` 只是唤醒优化
 - 一个子 agent 可以绑定多个 task
 - 父 agent 也可以直接 claim/complete/fail task，不必强制走子 agent
 - 普通 subagent 不会被 task-dag hook 接管；只有带 task-dag 协议 label 或已登记 session/run 的子 agent 会进入这条链路
@@ -179,9 +181,11 @@ task_dag_continue agent_id="chexie" dag_id="dag-xxx" task_ids=["t1","t2"]
 task_dag_spawn
 -> 返回 spawn plan
 -> agent 调 sessions_spawn
+-> 父 agent 当前轮次返回，不阻塞等待子 agent
 -> subagent_spawned hook 建 binding
 -> subagent_ended hook 收尾
--> plugin sessions_send 唤醒 requester session
+-> plugin 写 resume_requested
+-> plugin 尝试 sessions_send 唤醒 requester session
 -> task_dag_continue 读 completion event
 -> 父会话决定是否给用户回复
 ```
@@ -203,6 +207,16 @@ task_dag_spawn
 - 但推荐一轮只处理一个 task
 - 一个 ended 只应收口一个当前 assignment
 - 不要先 `sessions_send`，再补 `task_dag_assign`
+
+## Continuation 语义
+
+需要明确：
+
+- completion 最终先发给谁，不是 task-dag 继续执行 DAG 的前提
+- task-dag 的前提是：只要 managed subagent run ended，插件就会产出 `resume_requested`
+- `sessions_send` 成功时，父会话通常会更快被拉起
+- 即使 `sessions_send` 失败，只要父会话后续进入新一轮，`before_prompt_build` 仍会根据未消费的 `resume_requested` 注入继续指令
+- `task_dag_continue` 在消费对应 scope 后，会清理该轮 continuation 的 requester scope 与 resume 事件
 
 ### 多子任务汇总
 
@@ -363,6 +377,11 @@ task_dag_diagnose agent_id="..." dag_id="..."
 - worker 多轮模式下，先 `task_dag_assign`，再 `sessions_send`
 - 不要自己手写 task-dag label 或猜测 worker `session_key`
 - 子 agent 完成后，父会话在被唤醒的新一轮调用 `task_dag_continue`
+
+注意：
+
+- 即使 completion 已被 runtime 发到用户通道，只要这个 run 是 task-dag managed run，插件仍会尝试产出 parent continuation
+- 本插件不要求“completion 一定先发给父 agent”才能继续 DAG
 
 ### 父 agent 想接管一个已经交给 subagent 的 task
 
