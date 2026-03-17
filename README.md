@@ -86,6 +86,7 @@ task_dag_spawn
 
 事件与恢复：
 
+- `task_dag_diagnose`
 - `task_dag_poll_events`
 - `task_dag_ack_event`
 - `task_dag_continue`
@@ -119,6 +120,11 @@ task_dag_progress agent_id="main" task_id="t1" progress=50 message="已完成一
 task_dag_complete agent_id="main" task_id="t1" output_summary="调研已完成"
 task_dag_continue agent_id="main" task_id="t1"
 ```
+
+边界：
+
+- 一旦 task 已进入 subagent 生命周期（prepared spawn / active binding / active assignment），父 agent 不应再 `claim/complete/fail` 该 task
+- 这类 task 默认应由 subagent hook 或带 `session_key/run_id` 的 subagent-scoped 收口来推进
 
 ### 3. 子 agent 执行单个任务
 
@@ -206,6 +212,20 @@ task_dag_spawn
 -> 仍有未完成任务: continue_waiting
 -> 全部完成: user_reply
 ```
+
+### 诊断优先级
+
+如果你不确定当前应该继续、等待还是修复，优先使用：
+
+```bash
+task_dag_diagnose agent_id="..." dag_id="..."
+```
+
+约定：
+
+- `task_dag_diagnose` 是主诊断入口
+- `task_dag_reconcile` 是修复工具，不是正常等待工具
+- 不要把 `task_dag_poll_events`、`sessions_list`、`sessions_history` 组合成长期轮询链路
 
 ## 数据落盘
 
@@ -312,6 +332,19 @@ task_dag_spawn
 - 父 agent 单 task 收口：`task_dag_continue agent_id="..." dag_id="..." task_id="t1"`
 - 多任务 worker 收口：`task_dag_continue agent_id="..." dag_id="..." run_id="run-xxx"`
 
+### `task_dag_continue` 返回 `idle` / `no_new_events=true`
+
+原因：
+
+- 当前 scope 下没有新的 completion / ready / resume 事件
+- 这通常表示应等待新的 hook 事件，而不是继续轮询
+
+处理方式：
+
+- 不要立即再次调用 `task_dag_continue`
+- 优先等待新的 resume/completion 事件
+- 如果不确定当前是“等待”还是“修复”，先调用 `task_dag_diagnose`
+
 ### 子 agent 直接把消息发给用户，父 agent 没继续
 
 原因：
@@ -330,6 +363,19 @@ task_dag_spawn
 - worker 多轮模式下，先 `task_dag_assign`，再 `sessions_send`
 - 不要自己手写 task-dag label 或猜测 worker `session_key`
 - 子 agent 完成后，父会话在被唤醒的新一轮调用 `task_dag_continue`
+
+### 父 agent 想接管一个已经交给 subagent 的 task
+
+原因：
+
+- 这个 task 已经存在 prepared spawn、active binding 或 active assignment
+- 当前版本默认禁止父 agent 对这类 task 再次 `claim/complete/fail`
+
+处理方式：
+
+- 不要让父 agent继续执行同一 task
+- 等待 `subagent_spawned/subagent_ended` 收口
+- 若只是判断当前是否应继续，先用 `task_dag_diagnose`
 
 ### `tool done ok` 但业务结果仍然是错误
 

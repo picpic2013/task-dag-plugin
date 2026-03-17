@@ -24,6 +24,7 @@ description: "Use for complex task orchestration with DAG dependencies, subagent
 7. 单任务子 agent：先 `task_dag_spawn`，再由 agent 自己调用原生 `sessions_spawn`。
 8. worker 多轮模式：先 `task_dag_assign`，再由 agent 自己调用原生 `sessions_send`。
 9. `task_dag_continue` 必须显式带 continuation scope：`run_id`、`session_key`、`task_id`、`task_ids` 之一。
+10. 一旦 task 已进入 subagent 生命周期，父 agent 不应再对同一 task `claim/complete/fail`。
 
 ## 当前推荐流程
 
@@ -109,14 +110,16 @@ task_dag_continue agent_id="chexie" dag_id="dag-xxx" task_ids=["t1","t2"]
 
 ### 继续与恢复
 
+- `task_dag_diagnose`
+  - 首选诊断入口，判断当前应该 continue、wait、execute_ready 还是 repair
 - `task_dag_poll_events`
-  - 查看未消费事件
+  - 查看未消费事件；偏调试用途
 - `task_dag_ack_event`
   - 手工确认事件
 - `task_dag_continue`
   - 让父会话在被插件唤醒后决定继续等待、触发下游还是回复用户
 - `task_dag_reconcile`
-  - 修复 hook 时序差异、孤儿 binding、半完成状态
+  - 修复 hook 时序差异、孤儿 binding、半完成状态；不是正常等待工具
 
 ## 如何判断是否该给用户回复
 
@@ -140,6 +143,17 @@ task_dag_continue agent_id="chexie" dag_id="dag-xxx" task_ids=["t1","t2"]
 - `ready_task_ids`
 - `waiting_task_ids`
 - `summary`
+- `no_new_events`
+- `retry_not_recommended`
+- `polling_guidance`
+
+如果返回：
+
+- `action="idle"`
+- `no_new_events=true`
+
+表示当前没有新的 completion / ready / resume 事件。不要立即再次调用 `task_dag_continue`。
+这时优先等待新事件，或先调用 `task_dag_diagnose`。
 
 ## 已移除接口
 
@@ -168,6 +182,7 @@ task_dag_continue agent_id="chexie" dag_id="dag-xxx" task_ids=["t1","t2"]
 7. 调 `task_dag_continue` 时显式传 `run_id/session_key/task_id/task_ids` 之一，不要空调用。
 8. 如果 hook 或时序看起来不一致，使用 `task_dag_reconcile`。
 9. worker 模式下一次只分配一个下一轮任务，避免让同一个 ended 收口多任务。
+10. 如果不确定当前该继续、等待还是修复，先用 `task_dag_diagnose`。
 
 ## 反模式
 
@@ -195,6 +210,8 @@ task_dag_continue agent_id="main" task_id="t1"
 - 在 worker 多轮模式下，靠消息文本让插件自己猜“这一轮对应哪个 task”
 - 在没有 assignment 的情况下，先 `sessions_send` 再补登记
 - 手写 task-dag label 或猜测 worker `session_key`
+- 子 agent 已接手后，父 agent 继续自己执行同一 task
+- 在 `no_new_events=true` 的情况下继续反复调用 `task_dag_continue`
 
 不要省略这些关键参数：
 
