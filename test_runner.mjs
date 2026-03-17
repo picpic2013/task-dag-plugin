@@ -741,6 +741,57 @@ test('worker session ended consumes next-run assignment intent and closes the as
   });
 });
 
+test('worker session can end multiple runs and close one assigned task per run', async () => {
+  await withTempWorkspace('hook-ended-worker-multi-round', async () => {
+    dag.setCurrentAgentId('main');
+    const created = dag.createDAG('hook-ended-worker-multi-round', [
+      { id: 't1', name: 'Worker task 1' },
+      { id: 't2', name: 'Worker task 2' },
+    ]);
+    bindings.saveSessionRun({
+      run_id: 'run-worker-bootstrap',
+      child_session_key: 'agent:worker:subagent:worker-multi',
+      child_agent_id: 'worker',
+      requester_session_key: 'agent:main',
+      parent_agent_id: 'main',
+      dag_id: created.id,
+      spawn_mode: 'shared_worker',
+      active_task_ids: [],
+    }, { agentId: 'main', dagId: created.id });
+
+    await tools.assignTasksToSession({
+      task_ids: ['t1'],
+      dag_id: created.id,
+      agent_id: 'main',
+      session_key: 'agent:worker:subagent:worker-multi',
+    }, {});
+    const first = hooks.handleSubagentEndedEvent({
+      targetSessionKey: 'agent:worker:subagent:worker-multi',
+      runId: 'run-worker-1',
+      outcome: 'ok',
+    }, { requesterSessionKey: 'agent:main', runId: 'run-worker-1', childSessionKey: 'agent:worker:subagent:worker-multi' }, console);
+
+    await tools.assignTasksToSession({
+      task_ids: ['t2'],
+      dag_id: created.id,
+      agent_id: 'main',
+      session_key: 'agent:worker:subagent:worker-multi',
+    }, {});
+    const second = hooks.handleSubagentEndedEvent({
+      targetSessionKey: 'agent:worker:subagent:worker-multi',
+      runId: 'run-worker-2',
+      outcome: 'ok',
+    }, { requesterSessionKey: 'agent:main', runId: 'run-worker-2', childSessionKey: 'agent:worker:subagent:worker-multi' }, console);
+
+    assert(first.task_ids.includes('t1'), 'First ended should resolve the first worker task');
+    assert(second.task_ids.includes('t2'), 'Second ended should resolve the second worker task');
+    assert(dag.getTask('t1')?.status === 'done', 'First worker task should be done');
+    assert(dag.getTask('t2')?.status === 'done', 'Second worker task should be done');
+    assert(bindings.getSessionRunByRunId('run-worker-1', { agentId: 'main', dagId: created.id }) != null, 'First worker run should be recorded');
+    assert(bindings.getSessionRunByRunId('run-worker-2', { agentId: 'main', dagId: created.id }) != null, 'Second worker run should be recorded');
+  });
+});
+
 test('task_dag_poll_events and ack_event expose deterministic event consumption', async () => {
   await withTempWorkspace('tool-events', async () => {
     const created = dag.createDAG('tool-events', [{ id: 't1', name: 'Events task' }]);
