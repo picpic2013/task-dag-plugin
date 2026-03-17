@@ -815,7 +815,10 @@ export async function continueParentSession(params: any, context?: any) {
 
   let action: 'continue_waiting' | 'trigger_downstream' | 'user_reply' | 'idle' = 'idle';
   let shouldReplyToUser = false;
-  if (activeBindings.length > 0) {
+  const hasNewTerminalEvents = completionEvents.length > 0;
+  const hasNewReadyEvents = readyEvents.length > 0;
+  const hasNewEvents = hasNewTerminalEvents || hasNewReadyEvents;
+  if (activeBindings.length > 0 && hasNewTerminalEvents) {
     action = 'continue_waiting';
     shouldReplyToUser = !!params.reply_on_partial && completionEvents.length > 0;
   } else if (completionEvents.length > 0 || (params.force_summary === true && allScopedTasksTerminal)) {
@@ -839,6 +842,8 @@ export async function continueParentSession(params: any, context?: any) {
 
   return {
     action,
+    no_new_events: !hasNewEvents,
+    retry_not_recommended: !hasNewEvents,
     should_reply_to_user: shouldReplyToUser,
     agent_id: agentId,
     dag_id: dagId || dag.getCurrentDagId(),
@@ -864,7 +869,13 @@ export async function continueParentSession(params: any, context?: any) {
           ? 'downstream_tasks_ready'
           : action === 'user_reply'
             ? 'new_terminal_updates'
-            : 'no_new_updates',
+            : activeBindings.length > 0
+              ? 'awaiting_subagent_events'
+              : 'no_new_updates',
+    polling_guidance:
+      !hasNewEvents
+        ? 'Do not call task_dag_continue again until a new resume/completion event arrives.'
+        : undefined,
   };
 }
 

@@ -1172,6 +1172,46 @@ test('task_dag_continue rejects ambiguous session_key when multiple runs exist',
   });
 });
 
+test('task_dag_continue discourages polling when no new events have arrived', async () => {
+  await withTempWorkspace('tool-continue-no-new-events', async () => {
+    const created = dag.createDAG('tool-continue-no-new-events', [{ id: 't1', name: 'Task 1' }]);
+    bindings.saveSessionRun({
+      run_id: 'run-no-events-1',
+      child_session_key: 'agent:worker:subagent:no-events',
+      child_agent_id: 'worker',
+      parent_agent_id: 'main',
+      dag_id: created.id,
+      spawn_mode: 'single_task',
+      active_task_ids: ['t1'],
+    }, { agentId: 'main', dagId: created.id });
+    bindings.upsertTaskBinding({
+      dag_id: created.id,
+      task_id: 't1',
+      executor_type: 'subagent',
+      executor_agent_id: 'worker',
+      session_key: 'agent:worker:subagent:no-events',
+      run_id: 'run-no-events-1',
+      binding_status: 'active',
+    }, { agentId: 'main', dagId: created.id });
+    dag.updateTask('t1', {
+      status: 'waiting_subagent',
+      executor: { type: 'subagent', agent_id: 'worker', session_key: 'agent:worker:subagent:no-events', run_id: 'run-no-events-1' },
+      waiting_for: { kind: 'subagent', session_key: 'agent:worker:subagent:no-events', run_id: 'run-no-events-1' },
+    });
+
+    const result = await tools.continueParentSession({
+      dag_id: created.id,
+      agent_id: 'main',
+      run_id: 'run-no-events-1',
+    }, {});
+
+    assert(result.action === 'idle', `No-new-event continuation should stay idle: ${JSON.stringify(result)}`);
+    assert(result.no_new_events === true, 'Continuation should explicitly report no new events');
+    assert(result.retry_not_recommended === true, 'Continuation should discourage immediate retry');
+    assert(String(result.polling_guidance || '').includes('Do not call task_dag_continue again'), 'Continuation should include polling guidance');
+  });
+});
+
 console.log('\n=== Hook Flow ===\n');
 
 test('subagent_spawned hook persists session context and binding metadata', async () => {
@@ -1563,6 +1603,7 @@ test('task_dag_continue waits for remaining subtasks before final reply', async 
     const partial = await tools.continueParentSession({ run_id: 'run-continue-2', dag_id: created.id, agent_id: 'main' }, {});
     const remainingReadyEvents = bindings.listPendingEvents({ type: 'task_ready' }, { agentId: 'main', dagId: created.id });
     assert(partial.action === 'continue_waiting', 'Partial completion should keep waiting');
+    assert(partial.no_new_events === false, 'Partial completion should still count as a new event');
     assert(partial.should_reply_to_user === false, 'Partial completion should not reply by default');
     assert(partial.completed_task_ids.includes('t1'), 'Partial completion should report completed task');
     assert(partial.waiting_task_ids.includes('t2'), 'Remaining task should still be waiting');
