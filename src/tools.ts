@@ -11,6 +11,7 @@ import {
   attachTaskToSessionRun,
   consumePendingEvent,
   completeSessionRun,
+  listAssignmentIntents,
   completeTaskBinding,
   listSessionRunsBySessionKey,
   listSpawnIntents,
@@ -20,8 +21,10 @@ import {
   listPendingEvents,
   listTaskBindings,
   removeTaskRuntimeState,
+  saveAssignmentIntent,
   saveSpawnIntent,
   saveSessionRun,
+  updateAssignmentIntent,
   updateSpawnIntent,
   upsertTaskBinding,
 } from './bindings.js';
@@ -381,8 +384,74 @@ export async function assignTasksToSession(params: any, context?: any) {
     }
 
     const sessionRunsByKey = session_key ? listSessionRunsBySessionKey(session_key, { agentId, dagId: dagIdToUse }) : [];
+    if (!run_id && session_key && task_ids.length === 1) {
+      const resolvedSessionRun =
+        getSessionRunBySessionKey(session_key, { agentId, dagId: dagIdToUse }) ||
+        sessionRunsByKey[0] ||
+        null;
+      if (!resolvedSessionRun) {
+        return { error: 'session run not found for the provided session_key or run_id' };
+      }
+      const activeAssignments = listAssignmentIntents({ session_key, status: 'assigned' }, { agentId, dagId: dagIdToUse });
+      if (activeAssignments.length > 0) {
+        return { error: 'session already has an active assignment intent; wait for the current run to end before assigning another task' };
+      }
+      const taskId = task_ids[0];
+      const taskResult = getTaskOrError(taskId);
+      if ('error' in taskResult) {
+        return taskResult;
+      }
+      const transitionError = ensureTaskStatus(taskResult.task, 'be assigned to a worker session', ['ready']);
+      if (transitionError) {
+        return transitionError;
+      }
+      const resolvedExecutorAgentId = executor_agent_id || resolvedSessionRun.child_agent_id;
+      if (!resolvedExecutorAgentId) {
+        return { error: 'executor_agent_id is required when the session run has no child_agent_id' };
+      }
+      const assignmentIntent = saveAssignmentIntent({
+        dag_id: dagIdToUse,
+        task_id: taskId,
+        parent_agent_id: agentId,
+        requester_session_key: resolvedSessionRun.requester_session_key,
+        session_key,
+        executor_agent_id: resolvedExecutorAgentId,
+        status: 'assigned',
+      }, { agentId, dagId: dagIdToUse });
+      dag.updateTask(taskId, {
+        status: 'waiting_subagent',
+        executor: {
+          type: 'subagent',
+          agent_id: resolvedExecutorAgentId,
+          session_key,
+          claimed_at: new Date().toISOString(),
+        },
+        waiting_for: {
+          kind: 'subagent',
+          session_key,
+        },
+        log: { level: 'info', message: `Assigned to worker session ${session_key} for its next run` },
+      } as any);
+      if (resolvedSessionRun.requester_session_key) {
+        upsertRequesterSessionScope({
+          requester_session_key: resolvedSessionRun.requester_session_key,
+          parent_agent_id: agentId,
+          dag_id: dagIdToUse,
+          task_ids: [taskId],
+        });
+      }
+      return {
+        success: true,
+        status: 'assigned',
+        session_key,
+        assigned_task_ids: [taskId],
+        assignment_intent_id: assignmentIntent.intent_id,
+        agent_id: agentId,
+        dag_id: dagIdToUse,
+      };
+    }
     if (!run_id && session_key && sessionRunsByKey.length > 1) {
-      return { error: 'Multiple runs exist for this session_key. Provide run_id explicitly.' };
+      return { error: 'Multiple runs exist for this session_key. Provide run_id explicitly unless assigning exactly one next-run worker task.' };
     }
     const sessionRun =
       (run_id ? getSessionRunByRunId(run_id, { agentId, dagId: dagIdToUse }) : null) ||

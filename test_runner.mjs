@@ -651,7 +651,10 @@ test('task_dag_assign rejects session runs without child agent metadata unless e
 
 test('task_dag_assign rejects ambiguous session_key when multiple runs share the same session', async () => {
   await withTempWorkspace('tool-assign-ambiguous-session', async () => {
-    const created = dag.createDAG('tool-assign-ambiguous-session', [{ id: 't1', name: 'Task 1' }]);
+    const created = dag.createDAG('tool-assign-ambiguous-session', [
+      { id: 't1', name: 'Task 1' },
+      { id: 't2', name: 'Task 2' },
+    ]);
     for (const runId of ['run-amb-a', 'run-amb-b']) {
       bindings.saveSessionRun({
         run_id: runId,
@@ -665,13 +668,76 @@ test('task_dag_assign rejects ambiguous session_key when multiple runs share the
     }
 
     const result = await tools.assignTasksToSession({
-      task_ids: ['t1'],
+      task_ids: ['t1', 't2'],
       dag_id: created.id,
       agent_id: 'main',
       session_key: 'agent:worker:subagent:shared-assign',
     }, {});
 
     assert(result.error?.includes('Multiple runs exist for this session_key'), 'Assign should reject ambiguous session-only selection');
+  });
+});
+
+test('task_dag_assign creates a next-run assignment intent for worker sessions', async () => {
+  await withTempWorkspace('tool-assign-worker-next-run', async () => {
+    const created = dag.createDAG('tool-assign-worker-next-run', [{ id: 't1', name: 'Task 1' }]);
+    bindings.saveSessionRun({
+      run_id: 'run-worker-bootstrap',
+      child_session_key: 'agent:worker:subagent:worker-shared',
+      child_agent_id: 'worker',
+      requester_session_key: 'agent:main',
+      parent_agent_id: 'main',
+      dag_id: created.id,
+      spawn_mode: 'shared_worker',
+      active_task_ids: [],
+    }, { agentId: 'main', dagId: created.id });
+
+    const result = await tools.assignTasksToSession({
+      task_ids: ['t1'],
+      dag_id: created.id,
+      agent_id: 'main',
+      session_key: 'agent:worker:subagent:worker-shared',
+    }, {});
+
+    assert(result.success === true, 'Worker assignment should succeed');
+    assert(result.status === 'assigned', 'Worker assignment should stay pending until the next run ends');
+    assert(typeof result.assignment_intent_id === 'string', 'Worker assignment should return assignment intent id');
+    assert(bindings.listAssignmentIntents({ session_key: 'agent:worker:subagent:worker-shared', status: 'assigned' }, { agentId: 'main', dagId: created.id }).length === 1, 'Worker assignment should persist one active assignment intent');
+    assert(bindings.listTaskBindings({ task_id: 't1' }, { agentId: 'main', dagId: created.id }).length === 0, 'Worker next-run assignment should not create a binding before ended');
+  });
+});
+
+test('worker session ended consumes next-run assignment intent and closes the assigned task', async () => {
+  await withTempWorkspace('hook-ended-worker-assignment', async () => {
+    dag.setCurrentAgentId('main');
+    const created = dag.createDAG('hook-ended-worker-assignment', [{ id: 't1', name: 'Worker task' }]);
+    bindings.saveSessionRun({
+      run_id: 'run-worker-bootstrap',
+      child_session_key: 'agent:worker:subagent:worker-ended',
+      child_agent_id: 'worker',
+      requester_session_key: 'agent:main',
+      parent_agent_id: 'main',
+      dag_id: created.id,
+      spawn_mode: 'shared_worker',
+      active_task_ids: [],
+    }, { agentId: 'main', dagId: created.id });
+    await tools.assignTasksToSession({
+      task_ids: ['t1'],
+      dag_id: created.id,
+      agent_id: 'main',
+      session_key: 'agent:worker:subagent:worker-ended',
+    }, {});
+
+    const result = hooks.handleSubagentEndedEvent({
+      targetSessionKey: 'agent:worker:subagent:worker-ended',
+      runId: 'run-worker-next',
+      outcome: 'ok',
+    }, { requesterSessionKey: 'agent:main', runId: 'run-worker-next', childSessionKey: 'agent:worker:subagent:worker-ended' }, console);
+
+    assert(result.task_ids.includes('t1'), 'Ended hook should resolve the assigned task from worker intent');
+    assert(dag.getTask('t1')?.status === 'done', 'Assigned worker task should be closed on ended');
+    assert(bindings.listAssignmentIntents({ session_key: 'agent:worker:subagent:worker-ended', status: 'assigned' }, { agentId: 'main', dagId: created.id }).length === 0, 'Assignment intent should be consumed');
+    assert(bindings.listTaskBindings({ task_id: 't1', run_id: 'run-worker-next' }, { agentId: 'main', dagId: created.id }).length === 1, 'Ended hook should synthesize a binding for the completed worker run');
   });
 });
 

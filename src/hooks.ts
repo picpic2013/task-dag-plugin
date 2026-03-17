@@ -10,6 +10,7 @@ import {
   appendPendingEvent,
   completeSessionRun,
   completeTaskBinding,
+  listAssignmentIntents,
   listSpawnIntents,
   getSessionRunByRunId,
   getSessionRunBySessionKey,
@@ -18,6 +19,7 @@ import {
   listTaskBindings,
   saveSessionRun,
   updateSpawnIntent,
+  updateAssignmentIntent,
   upsertTaskBinding,
 } from './bindings.js';
 import * as dag from './dag.js';
@@ -144,9 +146,29 @@ function getHookContextFromSpawnEvent(event: any, ctx?: HookContext): { agentId:
 function getHookContextFromEndedEvent(event: any, ctx?: HookContext): { agentId: string; dagId: string; requesterSessionKey?: string } | null {
   const runId = event.runId || event.run_id || ctx?.runId;
   const requesterSessionKey = ctx?.requesterSessionKey || event.requesterSessionKey || event.requester_session_key;
+  const targetSessionKey = event.targetSessionKey || event.childSessionKey || event.sessionKey || ctx?.childSessionKey;
   const scope =
     (requesterSessionKey ? findRequesterSessionScope({ requester_session_key: requesterSessionKey, run_id: runId }) : null) ||
     (runId ? findRequesterSessionScopeByRunId(runId) : null);
+  if (!scope && requesterSessionKey && targetSessionKey) {
+    const candidateScopes = listRequesterSessionScopes(requesterSessionKey);
+    for (const candidateScope of candidateScopes) {
+      const activeAssignments = listAssignmentIntents({
+        session_key: targetSessionKey,
+        status: 'assigned',
+      }, {
+        agentId: candidateScope.parent_agent_id,
+        dagId: candidateScope.dag_id,
+      });
+      if (activeAssignments.length > 0) {
+        return {
+          agentId: candidateScope.parent_agent_id,
+          dagId: candidateScope.dag_id,
+          requesterSessionKey,
+        };
+      }
+    }
+  }
   const dagId = scope?.dag_id || event.dagId || event.dag_id;
   const parentAgentId = scope?.parent_agent_id || event.parentAgentId || event.parent_agent_id;
 
@@ -331,8 +353,42 @@ export function handleSubagentEndedEvent(event: any, ctx?: HookContext, logger?:
       event.runId ||
       event.run_id ||
       fallbackRunId;
-    const activeBindings = listTaskBindings({ session_key: targetSessionKey, binding_status: 'active' }, context)
+    let activeBindings = listTaskBindings({ session_key: targetSessionKey, binding_status: 'active' }, context)
       .filter(binding => !runId || !binding.run_id || binding.run_id === runId);
+    const activeAssignments = listAssignmentIntents({ session_key: targetSessionKey, status: 'assigned' }, context);
+
+    if (activeBindings.length === 0 && activeAssignments.length === 1) {
+      const assignment = activeAssignments[0];
+      const sessionTemplate = sessionRunsByKey[0];
+      if (runId && !getSessionRunByRunId(runId, context) && sessionTemplate) {
+        saveSessionRun({
+          run_id: runId,
+          child_session_key: targetSessionKey,
+          child_agent_id: sessionTemplate.child_agent_id,
+          requester_session_key: sessionTemplate.requester_session_key,
+          parent_agent_id: context.agentId,
+          dag_id: context.dagId,
+          spawn_mode: 'shared_worker',
+          label: sessionTemplate.label,
+          active_task_ids: [assignment.task_id],
+        }, context);
+      }
+      const synthesizedBinding = upsertTaskBinding({
+        dag_id: context.dagId,
+        task_id: assignment.task_id,
+        executor_type: 'subagent',
+        executor_agent_id: assignment.executor_agent_id,
+        session_key: targetSessionKey,
+        run_id: runId,
+        binding_status: 'active',
+      }, context);
+      updateAssignmentIntent(assignment.intent_id, {
+        status: 'consumed',
+        consumed_at: new Date().toISOString(),
+        run_id: runId,
+      }, context);
+      activeBindings = [synthesizedBinding];
+    }
 
     if (activeBindings.length === 0) {
       const existingCompletionEvents = listPendingEvents({

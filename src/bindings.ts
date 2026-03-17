@@ -14,6 +14,7 @@ const TASK_BINDINGS_FILE = 'task-bindings.json';
 const SESSION_RUNS_FILE = 'session-runs.json';
 const PENDING_EVENTS_FILE = 'pending-events.jsonl';
 const SPAWN_INTENTS_FILE = 'spawn-intents.json';
+const ASSIGNMENT_INTENTS_FILE = 'assignment-intents.json';
 
 export type BindingStatus = 'active' | 'completed' | 'failed' | 'released';
 export type SpawnMode = 'single_task' | 'multi_task' | 'shared_worker' | 'unknown';
@@ -85,6 +86,23 @@ export interface SpawnIntent {
   cancelled_at?: string;
 }
 
+export type AssignmentIntentStatus = 'assigned' | 'consumed' | 'cancelled';
+
+export interface AssignmentIntent {
+  intent_id: string;
+  dag_id: string;
+  task_id: string;
+  parent_agent_id: string;
+  requester_session_key?: string;
+  session_key: string;
+  executor_agent_id?: string;
+  status: AssignmentIntentStatus;
+  created_at: string;
+  consumed_at?: string;
+  cancelled_at?: string;
+  run_id?: string;
+}
+
 interface TaskBindingsData {
   bindings: Record<string, TaskBinding>;
 }
@@ -96,6 +114,10 @@ interface SessionRunsData {
 
 interface SpawnIntentsData {
   intents: Record<string, SpawnIntent>;
+}
+
+interface AssignmentIntentsData {
+  intents: Record<string, AssignmentIntent>;
 }
 
 function getStorageDirForAgent(agentId: string, dagId: string): string {
@@ -156,6 +178,10 @@ function getSpawnIntentsFile(agentId: string, dagId: string): string {
   return path.join(getStorageDirForAgent(agentId, dagId), SPAWN_INTENTS_FILE);
 }
 
+function getAssignmentIntentsFile(agentId: string, dagId: string): string {
+  return path.join(getStorageDirForAgent(agentId, dagId), ASSIGNMENT_INTENTS_FILE);
+}
+
 function loadTaskBindingsData(agentId: string, dagId: string): TaskBindingsData {
   return readJsonFile(getTaskBindingsFile(agentId, dagId), { bindings: {} });
 }
@@ -178,6 +204,14 @@ function loadSpawnIntentsData(agentId: string, dagId: string): SpawnIntentsData 
 
 function saveSpawnIntentsData(agentId: string, dagId: string, data: SpawnIntentsData): void {
   writeJsonFile(getSpawnIntentsFile(agentId, dagId), data);
+}
+
+function loadAssignmentIntentsData(agentId: string, dagId: string): AssignmentIntentsData {
+  return readJsonFile(getAssignmentIntentsFile(agentId, dagId), { intents: {} });
+}
+
+function saveAssignmentIntentsData(agentId: string, dagId: string, data: AssignmentIntentsData): void {
+  writeJsonFile(getAssignmentIntentsFile(agentId, dagId), data);
 }
 
 function getRunIdsForSession(data: SessionRunsData, sessionKey: string): string[] {
@@ -508,6 +542,74 @@ export function updateSpawnIntent(
   return data.intents[intentId];
 }
 
+export function saveAssignmentIntent(
+  input: Omit<AssignmentIntent, 'intent_id' | 'created_at'> & {
+    intent_id?: string;
+    created_at?: string;
+  },
+  context?: { agentId?: string; dagId?: string }
+): AssignmentIntent {
+  const { agentId, dagId } = resolveContext(context?.agentId, context?.dagId);
+  const data = loadAssignmentIntentsData(agentId, dagId);
+  const intent: AssignmentIntent = {
+    intent_id: input.intent_id || createId('assignment-intent'),
+    dag_id: input.dag_id || dagId,
+    task_id: input.task_id,
+    parent_agent_id: input.parent_agent_id || agentId,
+    requester_session_key: input.requester_session_key,
+    session_key: input.session_key,
+    executor_agent_id: input.executor_agent_id,
+    status: input.status,
+    created_at: input.created_at || new Date().toISOString(),
+    consumed_at: input.consumed_at,
+    cancelled_at: input.cancelled_at,
+    run_id: input.run_id,
+  };
+  data.intents[intent.intent_id] = intent;
+  saveAssignmentIntentsData(agentId, dagId, data);
+  return intent;
+}
+
+export function listAssignmentIntents(
+  filter: {
+    task_id?: string;
+    session_key?: string;
+    run_id?: string;
+    status?: AssignmentIntentStatus;
+  } = {},
+  context?: { agentId?: string; dagId?: string }
+): AssignmentIntent[] {
+  const { agentId, dagId } = resolveContext(context?.agentId, context?.dagId);
+  return Object.values(loadAssignmentIntentsData(agentId, dagId).intents)
+    .filter(intent => {
+      if (filter.task_id && intent.task_id !== filter.task_id) return false;
+      if (filter.session_key && intent.session_key !== filter.session_key) return false;
+      if (filter.run_id && intent.run_id !== filter.run_id) return false;
+      if (filter.status && intent.status !== filter.status) return false;
+      return true;
+    })
+    .sort((a, b) => a.created_at.localeCompare(b.created_at));
+}
+
+export function updateAssignmentIntent(
+  intentId: string,
+  updates: Partial<Pick<AssignmentIntent, 'status' | 'consumed_at' | 'cancelled_at' | 'run_id'>>,
+  context?: { agentId?: string; dagId?: string }
+): AssignmentIntent | null {
+  const { agentId, dagId } = resolveContext(context?.agentId, context?.dagId);
+  const data = loadAssignmentIntentsData(agentId, dagId);
+  const intent = data.intents[intentId];
+  if (!intent) {
+    return null;
+  }
+  data.intents[intentId] = {
+    ...intent,
+    ...updates,
+  };
+  saveAssignmentIntentsData(agentId, dagId, data);
+  return data.intents[intentId];
+}
+
 export function listPendingEvents(
   filter: {
     type?: PendingEventType;
@@ -559,12 +661,14 @@ export function removeTaskRuntimeState(
   removed_binding_ids: string[];
   affected_run_ids: string[];
   removed_event_ids: string[];
+  removed_assignment_intent_ids: string[];
 } {
   const { agentId, dagId } = resolveContext(context?.agentId, context?.dagId);
   const taskIdSet = new Set(taskIds);
   const bindingsData = loadTaskBindingsData(agentId, dagId);
   const runsData = loadSessionRunsData(agentId, dagId);
   const eventsData = loadPendingEventsData(agentId, dagId);
+  const assignmentIntentsData = loadAssignmentIntentsData(agentId, dagId);
 
   const removedBindingIds: string[] = [];
   const affectedRunIds = new Set<string>();
@@ -607,6 +711,14 @@ export function removeTaskRuntimeState(
 
   saveTaskBindingsData(agentId, dagId, bindingsData);
   saveSessionRunsData(agentId, dagId, runsData);
+  const removedAssignmentIntentIds: string[] = [];
+  for (const [intentId, intent] of Object.entries(assignmentIntentsData.intents)) {
+    if (taskIdSet.has(intent.task_id)) {
+      removedAssignmentIntentIds.push(intentId);
+      delete assignmentIntentsData.intents[intentId];
+    }
+  }
+  saveAssignmentIntentsData(agentId, dagId, assignmentIntentsData);
   const pendingEventsFile = getPendingEventsFile(agentId, dagId);
   ensureDir(path.dirname(pendingEventsFile));
   fs.writeFileSync(pendingEventsFile, remainingEvents.map(event => JSON.stringify(event)).join('\n') + (remainingEvents.length > 0 ? '\n' : ''));
@@ -615,5 +727,6 @@ export function removeTaskRuntimeState(
     removed_binding_ids: removedBindingIds,
     affected_run_ids: Array.from(affectedRunIds),
     removed_event_ids: removedEventIds,
+    removed_assignment_intent_ids: removedAssignmentIntentIds,
   };
 }
