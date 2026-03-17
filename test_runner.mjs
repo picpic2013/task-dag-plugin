@@ -606,7 +606,7 @@ test('task_dag_assign binds multiple tasks to the same session run', async () =>
       child_agent_id: 'worker',
       parent_agent_id: 'main',
       dag_id: created.id,
-      spawn_mode: 'shared_worker',
+      spawn_mode: 'multi_task',
       active_task_ids: ['t1'],
     }, { agentId: 'main', dagId: created.id });
 
@@ -622,6 +622,33 @@ test('task_dag_assign binds multiple tasks to the same session run', async () =>
     assert(result.assigned_task_ids.length === 2, 'Two tasks should be assigned');
     assert(bindings.getSessionRunByRunId('run-assign-1', { agentId: 'main', dagId: created.id })?.active_task_ids.length === 2, 'Run should track both tasks');
     assert(dag.getTask('t2')?.executor?.agent_id === 'worker', 'Assigned task should inherit child agent identity');
+  });
+});
+
+test('shared_worker run rejects assigning multiple tasks in one round', async () => {
+  await withTempWorkspace('tool-assign-shared-worker-single-only', async () => {
+    const created = dag.createDAG('tool-assign-shared-worker-single-only', [
+      { id: 't1', name: 'Task 1' },
+      { id: 't2', name: 'Task 2' },
+    ]);
+    bindings.saveSessionRun({
+      run_id: 'run-shared-worker-1',
+      child_session_key: 'agent:worker:subagent:shared-worker-1',
+      child_agent_id: 'worker',
+      parent_agent_id: 'main',
+      dag_id: created.id,
+      spawn_mode: 'shared_worker',
+      active_task_ids: [],
+    }, { agentId: 'main', dagId: created.id });
+
+    const result = await tools.assignTasksToSession({
+      task_ids: ['t1', 't2'],
+      dag_id: created.id,
+      agent_id: 'main',
+      run_id: 'run-shared-worker-1',
+    }, {});
+
+    assert(result.error?.includes('exactly one task per run'), 'shared_worker runs should reject multi-task assignment');
   });
 });
 

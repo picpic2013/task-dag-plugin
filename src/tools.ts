@@ -513,6 +513,9 @@ export async function assignTasksToSession(params: any, context?: any) {
     if (!resolvedExecutorAgentId) {
       return { error: 'executor_agent_id is required when the session run has no child_agent_id' };
     }
+    if (sessionRun.spawn_mode === 'shared_worker' && task_ids.length !== 1) {
+      return { error: 'shared_worker sessions accept exactly one task per run; use one assignment per worker round' };
+    }
     for (const taskId of task_ids) {
       const taskResult = getTaskOrError(taskId);
       if ('error' in taskResult) {
