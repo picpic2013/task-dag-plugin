@@ -2057,6 +2057,242 @@ test('task_dag_continue consumes resume_requested and clears requester scope', a
   });
 });
 
+test('concurrent runs keep independent continuation scopes for the same requester session', async () => {
+  await withTempWorkspace('concurrent-resume-scopes', async () => {
+    dag.setCurrentAgentId('main');
+    const created = dag.createDAG('concurrent-resume-scopes', [
+      { id: 't1', name: 'Task 1' },
+      { id: 't2', name: 'Task 2' },
+    ]);
+
+    for (const [taskId, runId, sessionKey] of [
+      ['t1', 'run-concurrent-1', 'agent:worker:subagent:concurrent-1'],
+      ['t2', 'run-concurrent-2', 'agent:worker:subagent:concurrent-2'],
+    ]) {
+      requesterSessions.upsertRequesterSessionScope({
+        requester_session_key: 'agent:main:concurrent',
+        parent_agent_id: 'main',
+        dag_id: created.id,
+        run_id: runId,
+        task_ids: [taskId],
+      });
+      bindings.saveSessionRun({
+        run_id: runId,
+        child_session_key: sessionKey,
+        child_agent_id: 'worker',
+        requester_session_key: 'agent:main:concurrent',
+        parent_agent_id: 'main',
+        dag_id: created.id,
+        spawn_mode: 'single_task',
+        active_task_ids: [taskId],
+      }, { agentId: 'main', dagId: created.id });
+      bindings.upsertTaskBinding({
+        dag_id: created.id,
+        task_id: taskId,
+        executor_type: 'subagent',
+        executor_agent_id: 'worker',
+        session_key: sessionKey,
+        run_id: runId,
+        binding_status: 'active',
+      }, { agentId: 'main', dagId: created.id });
+    }
+
+    const registeredHooks = {};
+    hooks.registerTaskDagHooks({
+      logger: { info() {}, warn() {}, error() {} },
+      registerTool() {},
+      registerHook(name, handler) { registeredHooks[name] = handler; },
+      runtime: {
+        sessions_spawn: async () => ({}),
+        sessions_send: async () => ({ success: true }),
+        sessions_list: async () => ([]),
+        subagents: async () => ([]),
+      },
+      config: {},
+    });
+
+    await registeredHooks['subagent_ended']({
+      targetSessionKey: 'agent:worker:subagent:concurrent-1',
+      runId: 'run-concurrent-1',
+      outcome: 'ok',
+    }, {
+      requesterSessionKey: 'agent:main:concurrent',
+      runId: 'run-concurrent-1',
+      childSessionKey: 'agent:worker:subagent:concurrent-1',
+    });
+    await registeredHooks['subagent_ended']({
+      targetSessionKey: 'agent:worker:subagent:concurrent-2',
+      runId: 'run-concurrent-2',
+      outcome: 'ok',
+    }, {
+      requesterSessionKey: 'agent:main:concurrent',
+      runId: 'run-concurrent-2',
+      childSessionKey: 'agent:worker:subagent:concurrent-2',
+    });
+
+    const injected = await registeredHooks['before_prompt_build']({ prompt: '', messages: [] }, { sessionKey: 'agent:main:concurrent' });
+    const resumeEvents = bindings.listPendingEvents({ type: 'resume_requested' }, { agentId: 'main', dagId: created.id });
+
+    assert(resumeEvents.length === 2, 'Concurrent completed runs should keep two independent continuation scopes');
+    assert(injected.prependContext.includes('run-concurrent-1'), 'Injected continuation should mention the first run');
+    assert(injected.prependContext.includes('run-concurrent-2'), 'Injected continuation should mention the second run');
+  });
+});
+
+test('continuing one concurrent run leaves the other continuation scope pending', async () => {
+  await withTempWorkspace('concurrent-resume-consume-one', async () => {
+    dag.setCurrentAgentId('main');
+    const created = dag.createDAG('concurrent-resume-consume-one', [
+      { id: 't1', name: 'Task 1' },
+      { id: 't2', name: 'Task 2' },
+    ]);
+
+    for (const [taskId, runId, sessionKey] of [
+      ['t1', 'run-concurrent-a', 'agent:worker:subagent:concurrent-a'],
+      ['t2', 'run-concurrent-b', 'agent:worker:subagent:concurrent-b'],
+    ]) {
+      requesterSessions.upsertRequesterSessionScope({
+        requester_session_key: 'agent:main:concurrent-step',
+        parent_agent_id: 'main',
+        dag_id: created.id,
+        run_id: runId,
+        task_ids: [taskId],
+      });
+      bindings.saveSessionRun({
+        run_id: runId,
+        child_session_key: sessionKey,
+        child_agent_id: 'worker',
+        requester_session_key: 'agent:main:concurrent-step',
+        parent_agent_id: 'main',
+        dag_id: created.id,
+        spawn_mode: 'single_task',
+        active_task_ids: [taskId],
+      }, { agentId: 'main', dagId: created.id });
+      bindings.upsertTaskBinding({
+        dag_id: created.id,
+        task_id: taskId,
+        executor_type: 'subagent',
+        executor_agent_id: 'worker',
+        session_key: sessionKey,
+        run_id: runId,
+        binding_status: 'active',
+      }, { agentId: 'main', dagId: created.id });
+    }
+
+    const registeredHooks = {};
+    hooks.registerTaskDagHooks({
+      logger: { info() {}, warn() {}, error() {} },
+      registerTool() {},
+      registerHook(name, handler) { registeredHooks[name] = handler; },
+      runtime: {
+        sessions_spawn: async () => ({}),
+        sessions_send: async () => ({ success: true }),
+        sessions_list: async () => ([]),
+        subagents: async () => ([]),
+      },
+      config: {},
+    });
+
+    for (const [runId, sessionKey] of [
+      ['run-concurrent-a', 'agent:worker:subagent:concurrent-a'],
+      ['run-concurrent-b', 'agent:worker:subagent:concurrent-b'],
+    ]) {
+      await registeredHooks['subagent_ended']({
+        targetSessionKey: sessionKey,
+        runId,
+        outcome: 'ok',
+      }, {
+        requesterSessionKey: 'agent:main:concurrent-step',
+        runId,
+        childSessionKey: sessionKey,
+      });
+    }
+
+    const first = await tools.continueParentSession({
+      run_id: 'run-concurrent-a',
+      dag_id: created.id,
+      agent_id: 'main',
+    }, {});
+    const remainingResumeEvents = bindings.listPendingEvents({ type: 'resume_requested' }, { agentId: 'main', dagId: created.id });
+    const injectedAfterFirst = await registeredHooks['before_prompt_build']({ prompt: '', messages: [] }, { sessionKey: 'agent:main:concurrent-step' });
+
+    assert(first.completed_task_ids.includes('t1'), 'First continuation should consume the selected run');
+    assert(remainingResumeEvents.length === 1, 'The other concurrent continuation scope should remain pending');
+    assert(remainingResumeEvents[0].run_id === 'run-concurrent-b', 'The remaining scope should belong to the untouched run');
+    assert(injectedAfterFirst.prependContext.includes('run-concurrent-b'), 'Next prompt injection should still surface the remaining run');
+    assert(!injectedAfterFirst.prependContext.includes('run-concurrent-a'), 'Consumed run should disappear from later prompt injection');
+  });
+});
+
+test('duplicate ended events with changed outcome still dedupe at run scope', async () => {
+  await withTempWorkspace('resume-dedupe-run-scope', async () => {
+    dag.setCurrentAgentId('main');
+    const created = dag.createDAG('resume-dedupe-run-scope', [{ id: 't1', name: 'Dedup run scope' }]);
+    requesterSessions.upsertRequesterSessionScope({
+      requester_session_key: 'agent:main:dedupe-run',
+      parent_agent_id: 'main',
+      dag_id: created.id,
+      run_id: 'run-dedupe-run',
+      task_ids: ['t1'],
+    });
+    bindings.saveSessionRun({
+      run_id: 'run-dedupe-run',
+      child_session_key: 'agent:worker:subagent:dedupe-run',
+      child_agent_id: 'worker',
+      requester_session_key: 'agent:main:dedupe-run',
+      parent_agent_id: 'main',
+      dag_id: created.id,
+      spawn_mode: 'single_task',
+      active_task_ids: ['t1'],
+    }, { agentId: 'main', dagId: created.id });
+    bindings.upsertTaskBinding({
+      dag_id: created.id,
+      task_id: 't1',
+      executor_type: 'subagent',
+      executor_agent_id: 'worker',
+      session_key: 'agent:worker:subagent:dedupe-run',
+      run_id: 'run-dedupe-run',
+      binding_status: 'active',
+    }, { agentId: 'main', dagId: created.id });
+
+    const registeredHooks = {};
+    hooks.registerTaskDagHooks({
+      logger: { info() {}, warn() {}, error() {} },
+      registerTool() {},
+      registerHook(name, handler) { registeredHooks[name] = handler; },
+      runtime: {
+        sessions_spawn: async () => ({}),
+        sessions_send: async () => ({ success: true }),
+        sessions_list: async () => ([]),
+        subagents: async () => ([]),
+      },
+      config: {},
+    });
+
+    await registeredHooks['subagent_ended']({
+      targetSessionKey: 'agent:worker:subagent:dedupe-run',
+      runId: 'run-dedupe-run',
+      outcome: 'error',
+    }, {
+      requesterSessionKey: 'agent:main:dedupe-run',
+      runId: 'run-dedupe-run',
+      childSessionKey: 'agent:worker:subagent:dedupe-run',
+    });
+    await registeredHooks['subagent_ended']({
+      targetSessionKey: 'agent:worker:subagent:dedupe-run',
+      runId: 'run-dedupe-run',
+      outcome: 'ok',
+    }, {
+      requesterSessionKey: 'agent:main:dedupe-run',
+      runId: 'run-dedupe-run',
+      childSessionKey: 'agent:worker:subagent:dedupe-run',
+    });
+
+    const resumeEvents = bindings.listPendingEvents({ type: 'resume_requested', includeConsumed: true }, { agentId: 'main', dagId: created.id });
+    assert(resumeEvents.length === 1, 'Resume dedupe should be scoped to the run, not duplicated by outcome changes');
+  });
+});
+
 test('subagent_ended hook restores previous global dag context after processing', async () => {
   await withTempWorkspace('hook-context-restore', async () => {
     dag.setCurrentAgentId('main');

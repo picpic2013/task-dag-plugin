@@ -571,7 +571,7 @@ export function registerTaskDagHooks(api: OpenClawPluginApi): void {
         return;
       }
       const requesterSessionKey = result.requester_session_key || ctx?.requesterSessionKey;
-      const dedupeKey = `resume_requested:${result.dag_id || 'unknown'}:${result.run_id || event.runId || event.targetSessionKey || 'no-run'}:${result.outcome}`;
+      const dedupeKey = `resume_requested:${result.dag_id || 'unknown'}:${result.run_id || event.runId || event.targetSessionKey || 'no-run'}`;
       const existingResumeEvents = result.dag_id && result.agent_id
         ? listPendingEvents({ dedupe_key: dedupeKey, includeConsumed: true }, { agentId: result.agent_id, dagId: result.dag_id })
         : [];
