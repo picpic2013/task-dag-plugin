@@ -7,6 +7,7 @@
 import type { OpenClawPluginApi } from "./plugin-sdk.js";
 import * as dag from './dag.js';
 import { taskDagError, taskDagInfo, taskDagWarn } from './utils/task-dag-logger.js';
+import { configureTaskDagRuntime } from './config.js';
 import {
   appendPendingEvent,
   attachTaskToSessionRun,
@@ -1058,6 +1059,7 @@ export async function continueParentSession(params: any, context?: any) {
 }
 
 export function registerTaskDagTools(api: OpenClawPluginApi) {
+  configureTaskDagRuntime(api.config || {});
   toolLogger.info = api.logger.info.bind(api.logger);
   toolLogger.warn = api.logger.warn.bind(api.logger);
   toolLogger.error = api.logger.error.bind(api.logger);

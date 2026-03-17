@@ -7,6 +7,7 @@
 import type { OpenClawPluginApi } from "./plugin-sdk.js";
 import { addEvent } from './events.js';
 import { taskDagError, taskDagInfo, taskDagWarn } from './utils/task-dag-logger.js';
+import { configureTaskDagRuntime } from './config.js';
 import {
   appendPendingEvent,
   completeSessionRun,
@@ -609,6 +610,7 @@ function collectResumeInstructionsForSession(sessionKey?: string): string | null
  * 注册 Task DAG Hooks
  */
 export function registerTaskDagHooks(api: OpenClawPluginApi): void {
+  configureTaskDagRuntime(api.config || {});
   // 注册 gateway:startup 钩子（可选）
   api.registerHook(
     'gateway:startup',

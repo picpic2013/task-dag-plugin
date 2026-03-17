@@ -5,10 +5,13 @@
  */
 import { registerTaskDagTools } from "./src/tools.js";
 import { registerTaskDagHooks } from "./src/hooks.js";
+import { configureTaskDagRuntime } from "./src/config.js";
 
 export default function register(api: any) {
   api.logger.info("Task DAG plugin loaded!");
   
+  configureTaskDagRuntime(api.config || {});
+
   // 注册所有 DAG 工具
   registerTaskDagTools(api);
   

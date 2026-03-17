@@ -46,6 +46,7 @@ task_dag_continue
 - `sessions_spawn` 必须直接使用 `spawn_plan`
 - 不要手写或覆盖 `label`
 - 协议 `label` 由插件生成，为短 `tdg:<10位base36>` token，用于在 hook 里把 `run_id` 绑定回 task
+- 同一 task 的 binding 次数有安全上限，配置项 `maxBindingAttempts`，默认 `3`；超过上限会直接报错，避免脏状态反复重绑。
 
 ## 核心规则
 

@@ -7,6 +7,7 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { getTaskDagMaxBindingAttempts } from './config.js';
 const DEFAULT_WORKSPACE = path.join(os.homedir(), '.openclaw');
 const WORKSPACE_PREFIX = 'workspace-';
 const DAG_DIR = 'tasks';
@@ -254,6 +255,15 @@ function createId(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+export function getTaskBindingAttemptCount(
+  taskId: string,
+  context?: { agentId?: string; dagId?: string }
+): number {
+  const { agentId, dagId } = resolveContext(context?.agentId, context?.dagId);
+  const data = loadTaskBindingsData(agentId, dagId);
+  return Object.values(data.bindings).filter(binding => binding.task_id === taskId).length;
+}
+
 export function upsertTaskBinding(
   input: Omit<TaskBinding, 'binding_id' | 'claimed_at'> & {
     binding_id?: string;
@@ -264,6 +274,14 @@ export function upsertTaskBinding(
   const { agentId, dagId } = resolveContext(context?.agentId, context?.dagId);
   const data = loadTaskBindingsData(agentId, dagId);
   const bindingId = input.binding_id || createId('binding');
+  const existingBinding = input.binding_id ? data.bindings[input.binding_id] : null;
+  if (!existingBinding) {
+    const maxBindingAttempts = getTaskDagMaxBindingAttempts();
+    const bindingAttempts = Object.values(data.bindings).filter(binding => binding.task_id === input.task_id).length;
+    if (bindingAttempts >= maxBindingAttempts) {
+      throw new Error(`Task ${input.task_id} exceeded max binding attempts (${maxBindingAttempts})`);
+    }
+  }
   const binding: TaskBinding = {
     binding_id: bindingId,
     dag_id: input.dag_id || dagId,

@@ -14,6 +14,11 @@
       "autoProceed": {
         "type": "boolean",
         "default": false
+      },
+      "maxBindingAttempts": {
+        "type": "integer",
+        "minimum": 1,
+        "default": 3
       }
     }
   }

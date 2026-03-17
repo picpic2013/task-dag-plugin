@@ -2890,6 +2890,70 @@ test('deprecated tools are no longer registered', async () => {
   assert(!registeredTools['task_dag_notify'], 'task_dag_notify should be removed');
 });
 
+test('binding attempt limit rejects the fourth binding for the same task by default', () => {
+  withTempWorkspace('binding-attempt-limit', () => {
+    dag.createDAG('binding-limit', [{ id: 't1', name: 'Task 1', assigned_agent: 'parent' }]);
+    dag.setCurrentAgentId('chexie');
+    dag.setCurrentDagId('binding-limit');
+
+    bindings.upsertTaskBinding({
+      dag_id: 'binding-limit',
+      task_id: 't1',
+      executor_type: 'parent',
+      binding_status: 'active',
+    }, { agentId: 'chexie', dagId: 'binding-limit' });
+    bindings.upsertTaskBinding({
+      dag_id: 'binding-limit',
+      task_id: 't1',
+      executor_type: 'parent',
+      binding_status: 'completed',
+    }, { agentId: 'chexie', dagId: 'binding-limit' });
+    bindings.upsertTaskBinding({
+      dag_id: 'binding-limit',
+      task_id: 't1',
+      executor_type: 'subagent',
+      binding_status: 'failed',
+    }, { agentId: 'chexie', dagId: 'binding-limit' });
+
+    let failedWith = '';
+    try {
+      bindings.upsertTaskBinding({
+        dag_id: 'binding-limit',
+        task_id: 't1',
+        executor_type: 'subagent',
+        binding_status: 'active',
+      }, { agentId: 'chexie', dagId: 'binding-limit' });
+    } catch (error) {
+      failedWith = error.message;
+    }
+
+    assert(failedWith.includes('exceeded max binding attempts (3)'), 'Fourth binding should be rejected by default');
+  });
+});
+
+test('binding attempt limit does not count updates to the same binding id as a new attempt', () => {
+  withTempWorkspace('binding-attempt-update', () => {
+    const first = bindings.upsertTaskBinding({
+      dag_id: 'dag-1',
+      task_id: 't1',
+      executor_type: 'parent',
+      binding_status: 'active',
+    }, { agentId: 'chexie', dagId: 'dag-1' });
+
+    bindings.upsertTaskBinding({
+      binding_id: first.binding_id,
+      dag_id: 'dag-1',
+      task_id: 't1',
+      executor_type: 'parent',
+      binding_status: 'completed',
+      claimed_at: first.claimed_at,
+    }, { agentId: 'chexie', dagId: 'dag-1' });
+
+    assert(bindings.getTaskBindingAttemptCount('t1', { agentId: 'chexie', dagId: 'dag-1' }) === 1, 'Updating same binding id should keep attempt count at 1');
+  });
+});
+
+
 for (const { name, fn } of tests) {
   try {
     await fn();
@@ -2903,3 +2967,4 @@ for (const { name, fn } of tests) {
 
 console.log(`\n=== Results: ${passed} passed, ${failed} failed ===`);
 process.exit(failed > 0 ? 1 : 0);
+

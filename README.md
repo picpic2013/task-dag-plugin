@@ -21,6 +21,7 @@ task_dag_spawn -> sessions_spawn(直接使用 spawn_plan) -> task_dag_continue
 不要先 `task_dag_claim` 再 `task_dag_spawn`。
 不要手写或覆盖 `spawn_plan.label`。
 协议 `label` 由插件生成，为短 `tdg:<10位base36>` token。`subagent_spawned` 用它命中活跃 prepared intent 并绑定 `run_id`，`subagent_ended` 再按 `run_id` 收口 task。
+- 同一 task 的 binding 次数有安全上限，配置项 `maxBindingAttempts`，默认 `3`；超过上限会直接报错，避免脏状态反复重绑。
 
 这意味着：
 
