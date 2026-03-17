@@ -188,6 +188,44 @@ function getHookContextFromEndedEvent(event: any, ctx?: HookContext): { agentId:
   return { agentId: parentAgentId, dagId, requesterSessionKey };
 }
 
+function buildEndedUnmanagedDiagnostic(event: any, ctx?: HookContext): string {
+  const runId = event.runId || event.run_id || ctx?.runId;
+  const requesterSessionKey = ctx?.requesterSessionKey || event.requesterSessionKey || event.requester_session_key;
+  const targetSessionKey = event.targetSessionKey || event.childSessionKey || event.sessionKey || ctx?.childSessionKey;
+  const requesterScopeCount = requesterSessionKey ? listRequesterSessionScopes(requesterSessionKey).length : 0;
+  const runScope = runId ? findRequesterSessionScopeByRunId(runId) : null;
+  let assignmentScopeCount = 0;
+  if (requesterSessionKey && targetSessionKey) {
+    assignmentScopeCount = listRequesterSessionScopes(requesterSessionKey).filter(candidateScope => {
+      const activeAssignments = listAssignmentIntents({
+        session_key: targetSessionKey,
+        status: 'assigned',
+      }, {
+        agentId: candidateScope.parent_agent_id,
+        dagId: candidateScope.dag_id,
+      });
+      return activeAssignments.length > 0;
+    }).length;
+  }
+
+  let reason = 'no_matching_scope';
+  if (!requesterSessionKey && !runId) {
+    reason = 'missing_requester_and_run';
+  } else if (runId && runScope) {
+    reason = 'run_scope_found_but_context_unresolved';
+  } else if (assignmentScopeCount > 1) {
+    reason = 'ambiguous_assignment_scopes';
+  } else if (assignmentScopeCount === 1) {
+    reason = 'assignment_scope_found_but_context_unresolved';
+  } else if (requesterSessionKey && requesterScopeCount > 1) {
+    reason = 'multiple_requester_scopes_without_run_match';
+  } else if (requesterSessionKey && requesterScopeCount === 1) {
+    reason = 'single_requester_scope_without_run_or_assignment_match';
+  }
+
+  return `reason=${reason} requester=${requesterSessionKey || '(none)'} run=${runId || '(none)'} target_session=${targetSessionKey || '(none)'} requester_scope_count=${requesterScopeCount} assignment_scope_count=${assignmentScopeCount} run_scope_dag=${runScope?.dag_id || '(none)'}`;
+}
+
 function markNewlyReadyTasks(sourceTaskIds: string[], context: { agentId: string; dagId: string }): string[] {
   const dagData = dag.loadDAG();
   if (!dagData) {
@@ -264,7 +302,7 @@ export function handleSubagentSpawnedEvent(event: any, ctx?: HookContext, logger
   const taskId = preparedIntent.taskId;
   taskDagInfo(logger, `subagent_spawned matched intent child=${childSessionKey} run=${event.runId || event.run_id || ctx?.runId || '(none)'} actual_agent=${agentId || '(none)'} expected_target=${preparedIntent.targetAgentId || '(none)'} expected_parent=${preparedIntent.agentId} dag=${preparedIntent.dagId} task=${taskId} intent=${preparedIntent.intentId}`);
   if (preparedIntent.targetAgentId && agentId && preparedIntent.targetAgentId !== agentId) {
-    taskDagWarn(logger, `subagent_spawned target agent drift child=${childSessionKey} run=${event.runId || event.run_id || ctx?.runId || '(none)'} expected_target=${preparedIntent.targetAgentId} actual_agent=${agentId} dag=${preparedIntent.dagId} task=${taskId} intent=${preparedIntent.intentId}`);
+    taskDagWarn(logger, `subagent_spawned ignored child=${childSessionKey} run=${event.runId || event.run_id || ctx?.runId || '(none)'} reason=target_agent_drift expected_target=${preparedIntent.targetAgentId} actual_agent=${agentId} dag=${preparedIntent.dagId} task=${taskId} intent=${preparedIntent.intentId}`);
     return;
   }
 
@@ -381,7 +419,7 @@ export function handleSubagentEndedEvent(event: any, ctx?: HookContext, logger?:
 
   const context = getHookContextFromEndedEvent(event, ctx);
   if (!context) {
-    taskDagWarn(logger, `subagent_ended unmanaged child=${targetSessionKey} run=${event.runId || event.run_id || ctx?.runId || '(none)'} outcome=${outcome} requester=${ctx?.requesterSessionKey || event.requesterSessionKey || event.requester_session_key || '(none)'}`);
+    taskDagWarn(logger, `subagent_ended unmanaged child=${targetSessionKey} outcome=${outcome} ${buildEndedUnmanagedDiagnostic(event, ctx)}`);
     return { managed_run: false, task_ids: [], newly_ready_task_ids: [], outcome };
   }
 
@@ -457,7 +495,7 @@ export function handleSubagentEndedEvent(event: any, ctx?: HookContext, logger?:
         };
       }
 
-      taskDagWarn(logger, `subagent_ended no active binding child=${targetSessionKey} run=${runId || '(none)'} dag=${context.dagId} requester=${resolvedRequesterSessionKey || '(none)'}`);
+      taskDagWarn(logger, `subagent_ended ignored child=${targetSessionKey} run=${runId || '(none)'} reason=no_active_binding dag=${context.dagId} requester=${resolvedRequesterSessionKey || '(none)'} session_runs=${sessionRunsByKey.length} active_assignments=${activeAssignments.length}`);
       return {
         managed_run: false,
         agent_id: context.agentId,
