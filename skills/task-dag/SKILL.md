@@ -13,20 +13,50 @@ description: "Use for complex task orchestration with DAG dependencies, subagent
 - 需要在子 agent 完成后，让父会话继续处理并可能继续给用户发消息
 - 需要尽量减少对模型记忆协议的依赖
 
-## 核心原则
+## 先选执行模式
 
-1. 优先使用插件提供的高层工具，不要自己拼低层协议。
+一个 `ready` task 只能走下面两条路中的一条，不要混用：
+
+### 模式 A：父 agent 自己执行
+
+```bash
+task_dag_claim
+task_dag_progress
+task_dag_complete
+```
+
+含义：
+
+- `claim` 之后 task 会变成 `running`
+- 这条路不应该再调用 `task_dag_spawn`
+
+### 模式 B：交给子 agent 执行
+
+```bash
+task_dag_spawn
+sessions_spawn   # 直接使用 spawn_plan
+task_dag_continue
+```
+
+含义：
+
+- 不要先 `task_dag_claim`
+- `task_dag_spawn` 只接受 `ready` task
+- `requester_session_key` 必填
+- `sessions_spawn` 必须直接使用 `spawn_plan`
+- 不要手写或覆盖 `label`
+
+## 核心规则
+
+1. 父执行用 `claim`；子执行用 `spawn`。不要对同一个 task 先 `claim` 再 `spawn`。
 2. 父会话的“继续”使用 `task_dag_continue`，不是恢复旧工具调用。
 3. 子 agent 完成后的状态推进主要依赖 hook、requester session 注册表和 pending events。
-4. 不要使用已经移除的旧接口：`task_dag_wait`、`task_dag_update`、`task_dag_notify`。
-5. 工具层不依赖隐式 runtime session context；非 `main` agent 必须显式传 `agent_id`。
-6. `task_dag_spawn` 是 prepare-spawn 工具；若需要父会话恢复，必须显式传 `requester_session_key`。
-7. 单任务子 agent：先 `task_dag_spawn`，再由 agent 自己调用原生 `sessions_spawn`。
-8. worker 多轮模式：先 `task_dag_assign`，再由 agent 自己调用原生 `sessions_send`。
-9. `task_dag_continue` 必须显式带 continuation scope：`run_id`、`session_key`、`task_id`、`task_ids` 之一。
-10. 一旦 task 已进入 subagent 生命周期，父 agent 不应再对同一 task `claim/complete/fail`。
-11. 父 agent 的模型是“返回后等触发”，不是“阻塞等待子 agent 完成”。
-12. `resume_requested` 是 continuation 的权威事实来源；`sessions_send` 只是唤醒优化。
+4. 非 `main` agent 必须显式传 `agent_id`。
+5. `task_dag_spawn` 若希望父会话恢复，`requester_session_key` 必填。
+6. `sessions_spawn` 的关键参数必须原样来自 `spawn_plan`。
+7. worker 多轮模式：先 `task_dag_assign`，再 `sessions_send`。
+8. `task_dag_continue` 必须显式带 scope：`run_id`、`session_key`、`task_id`、`task_ids` 之一。
+9. 父 agent 的模型是“返回后等触发”，不是“阻塞等待子 agent 完成”。
 
 ## 当前推荐流程
 
@@ -52,9 +82,21 @@ task_dag_continue agent_id="main" task_id="t1"
 
 要求：
 
-- `sessions_spawn` 的参数应直接来自 `task_dag_spawn` 返回的 `spawn_plan`
-- 不要手写或重组 `label`
-- 不要自己猜 `agentId`、`mode`、`model`
+- 必须传 `requester_session_key`
+- 不要先 `task_dag_claim`
+- `sessions_spawn` 直接使用 `spawn_plan`
+- 不要手写 `label`
+
+错误示例：
+
+```bash
+task_dag_claim ...
+task_dag_spawn ...
+```
+
+```bash
+task_dag_spawn ... label="read-frontend-readme"
+```
 
 ### 一个子 agent 处理多个 task
 
@@ -72,6 +114,7 @@ task_dag_continue agent_id="main" session_key="agent:worker:subagent:shared-1"
 - 推荐一轮只给一个 task
 - 一轮 worker run 对应一个 ended 收口
 - 顺序必须是 `task_dag_assign -> sessions_send`，不要反过来
+- 如果最开始的 `task_dag_spawn` 没带 `requester_session_key` 或覆盖了协议 label，后续多轮 worker 也不会被正确纳管
 
 ### 非 `main` agent 示例
 
@@ -172,35 +215,29 @@ task_dag_continue agent_id="chexie" dag_id="dag-xxx" task_ids=["t1","t2"]
 - `task_dag_complete`
 - `task_dag_fail`
 
-## 推荐实践
+## 最短规则
 
 1. 创建 DAG 后，先看 `task_dag_ready`。
-1.1. 创建 DAG 时显式传 `agent_id`；不要假设会自动继承当前 agent。
-2. 父 agent 能自己完成的 task，就直接 claim/progress/complete。
-3. 只有确实需要并行或隔离执行时，才用 `task_dag_spawn`，并显式传 `requester_session_key`。
-4. `task_dag_spawn` 返回的是 spawn plan，不是已经执行完成的 spawn；下一步要由 agent 自己调用原生 `sessions_spawn`。
-5. 如果一个 worker 要连续做多个 task，先 `task_dag_assign`，再调用原生 `sessions_send`。
-6. 子 agent 完成后，插件会主动向 requester session 发送 continuation 消息；父会话在被唤醒的新一轮使用 `task_dag_continue`。
-6.1. 即使唤醒消息没有成功发出，只要父会话后续进入新一轮，未消费的 `resume_requested` 仍会触发 continuation 注入。
-7. 调 `task_dag_continue` 时显式传 `run_id/session_key/task_id/task_ids` 之一，不要空调用。
-8. 如果 hook 或时序看起来不一致，使用 `task_dag_reconcile`。
-9. worker 模式下一次只分配一个下一轮任务，避免让同一个 ended 收口多任务。
-10. 如果不确定当前该继续、等待还是修复，先用 `task_dag_diagnose`。
+2. 要自己做：`claim -> progress -> complete`。
+3. 要交给子 agent：`spawn -> sessions_spawn -> continue`。
+4. 不要对同一个 task 同时走两条路。
+5. `spawn` 时必须传 `requester_session_key`，并且不要改 `spawn_plan`。
 
 ## 反模式
 
 不要这样做：
 
 ```bash
-sessions_spawn task="..." label="task:t1"
+task_dag_claim ...
+task_dag_spawn ...
 ```
 
-应改为：
+```bash
+task_dag_spawn ... label="read-frontend-readme"
+```
 
 ```bash
-task_dag_spawn agent_id="main" requester_session_key="agent:main:feishu:group:xxx" task_id="t1" task="..."
-sessions_spawn task="..." agentId="worker" label="taskdag:v1:dag=dag-xxx:task=t1"
-task_dag_continue agent_id="main" task_id="t1"
+sessions_spawn ... label="read-frontend-readme"
 ```
 
 不要把这些职责压给模型记忆：
@@ -214,6 +251,8 @@ task_dag_continue agent_id="main" task_id="t1"
 - 在 worker 多轮模式下，靠消息文本让插件自己猜“这一轮对应哪个 task”
 - 在没有 assignment 的情况下，先 `sessions_send` 再补登记
 - 手写 task-dag label 或猜测 worker `session_key`
+- 省略 `requester_session_key`
+- 看到 `spawn_plan` 后，自己再改参数
 - 子 agent 已接手后，父 agent 继续自己执行同一 task
 - 在 `no_new_events=true` 的情况下继续反复调用 `task_dag_continue`
 

@@ -6,6 +6,7 @@
 
 import type { OpenClawPluginApi } from "./plugin-sdk.js";
 import * as dag from './dag.js';
+import { taskDagError, taskDagInfo, taskDagWarn } from './utils/task-dag-logger.js';
 import {
   appendPendingEvent,
   attachTaskToSessionRun,
@@ -34,6 +35,24 @@ import { completeRequesterSessionRun, removeTasksFromRequesterScopes, upsertRequ
 type RuntimeFacade = {
   sessions_spawn?: (params: any) => Promise<any>;
 };
+
+const toolLogger: Pick<OpenClawPluginApi['logger'], 'info' | 'warn' | 'error'> = {
+  info() {},
+  warn() {},
+  error() {},
+};
+
+function logToolInfo(message: string): void {
+  taskDagInfo(toolLogger, message);
+}
+
+function logToolWarn(message: string): void {
+  taskDagWarn(toolLogger, message);
+}
+
+function logToolError(message: string): void {
+  taskDagError(toolLogger, message);
+}
 
 /**
  * 从工具参数获取 agent ID。
@@ -339,12 +358,15 @@ export async function spawnTaskExecution(runtime: RuntimeFacade, params: any, co
   try {
     const { agentId, dagId } = setToolExecutionContext(contextParams, { requireDag: true });
     const { task_id, task, prompt, model, label, thread, mode, runtime: runtimeMode } = params;
+    logToolInfo(`task_dag_spawn start agent=${agentId} dag=${dagId || dag.getCurrentDagId() || 'default'} task=${task_id} target_agent=${targetAgentId || '(inherit)'} requester=${getRequesterSessionKey(params) || '(none)'}`);
     const taskResult = getTaskOrError(task_id);
     if ('error' in taskResult) {
+      logToolWarn(`task_dag_spawn task not found dag=${dagId || dag.getCurrentDagId() || 'default'} task=${task_id}`);
       return taskResult;
     }
     const transitionError = ensureTaskStatus(taskResult.task, 'spawn a subagent', ['ready']);
     if (transitionError) {
+      logToolWarn(`task_dag_spawn rejected dag=${dagId || dag.getCurrentDagId() || 'default'} task=${task_id} status=${taskResult.task.status}`);
       return transitionError;
     }
     const dagIdToUse = dagId || dag.getCurrentDagId() || 'default';
@@ -352,13 +374,18 @@ export async function spawnTaskExecution(runtime: RuntimeFacade, params: any, co
     const spawnTaskText = task || prompt;
     const requesterSessionKey = getRequesterSessionKey(params);
     if (!spawnTaskText) {
+      logToolWarn(`task_dag_spawn missing prompt dag=${dagIdToUse} task=${task_id}`);
       return { error: 'task or prompt is required' };
+    }
+    if (label) {
+      logToolWarn(`task_dag_spawn custom label override dag=${dagIdToUse} task=${task_id} label=${label}`);
     }
     const existingPreparedIntent = listSpawnIntents({
       task_id: task_id,
       status: 'prepared',
     }, { agentId, dagId: dagIdToUse }).find(intent => intent.label === spawnLabel);
     if (existingPreparedIntent) {
+      logToolWarn(`task_dag_spawn duplicate prepared intent dag=${dagIdToUse} task=${task_id} label=${spawnLabel} intent=${existingPreparedIntent.intent_id}`);
       return {
         error: `Task ${task_id} already has a prepared spawn intent`,
         intent_id: existingPreparedIntent.intent_id,
@@ -399,6 +426,7 @@ export async function spawnTaskExecution(runtime: RuntimeFacade, params: any, co
       },
       log: { level: 'info', message: `Prepared subagent spawn for ${task_id}` },
     } as any);
+    logToolInfo(`task_dag_spawn prepared dag=${dagIdToUse} task=${task_id} intent=${spawnIntent.intent_id} label=${spawnLabel} target_agent=${targetAgentId || '(inherit)'} runtime=${runtimeMode || 'subagent'} mode=${mode || 'run'}`);
 
     return {
       success: true,
@@ -418,6 +446,7 @@ export async function spawnTaskExecution(runtime: RuntimeFacade, params: any, co
       },
     };
   } catch (error: any) {
+    logToolError(`task_dag_spawn failed task=${params?.task_id || '(unknown)'} error=${error.message}`);
     return { error: error.message };
   }
 }
@@ -427,7 +456,9 @@ export async function assignTasksToSession(params: any, context?: any) {
     const { agentId, dagId } = setToolExecutionContext(params, { requireDag: true });
     const dagIdToUse = dagId || dag.getCurrentDagId() || 'default';
     const { task_ids, session_key, run_id, executor_agent_id } = params;
+    logToolInfo(`task_dag_assign start agent=${agentId} dag=${dagIdToUse} tasks=${Array.isArray(task_ids) ? task_ids.join(',') : '(invalid)'} session=${session_key || '(none)'} run=${run_id || '(none)'}`);
     if (!Array.isArray(task_ids) || task_ids.length === 0) {
+      logToolWarn(`task_dag_assign rejected dag=${dagIdToUse} reason=empty_task_ids`);
       return { error: 'task_ids must be a non-empty array' };
     }
 
@@ -438,10 +469,12 @@ export async function assignTasksToSession(params: any, context?: any) {
         sessionRunsByKey[0] ||
         null;
       if (!resolvedSessionRun) {
+        logToolWarn(`task_dag_assign next-run failed dag=${dagIdToUse} session=${session_key} reason=session_run_not_found`);
         return { error: 'session run not found for the provided session_key or run_id' };
       }
       const activeAssignments = listAssignmentIntents({ session_key, status: 'assigned' }, { agentId, dagId: dagIdToUse });
       if (activeAssignments.length > 0) {
+        logToolWarn(`task_dag_assign next-run rejected dag=${dagIdToUse} session=${session_key} reason=active_assignment_exists`);
         return { error: 'session already has an active assignment intent; wait for the current run to end before assigning another task' };
       }
       const taskId = task_ids[0];
@@ -455,6 +488,7 @@ export async function assignTasksToSession(params: any, context?: any) {
       }
       const resolvedExecutorAgentId = executor_agent_id || resolvedSessionRun.child_agent_id;
       if (!resolvedExecutorAgentId) {
+        logToolWarn(`task_dag_assign next-run missing executor agent dag=${dagIdToUse} session=${session_key}`);
         return { error: 'executor_agent_id is required when the session run has no child_agent_id' };
       }
       const assignmentIntent = saveAssignmentIntent({
@@ -488,6 +522,7 @@ export async function assignTasksToSession(params: any, context?: any) {
           task_ids: [taskId],
         });
       }
+      logToolInfo(`task_dag_assign next-run prepared dag=${dagIdToUse} session=${session_key} task=${taskId} intent=${assignmentIntent.intent_id}`);
       return {
         success: true,
         status: 'assigned',
@@ -499,21 +534,25 @@ export async function assignTasksToSession(params: any, context?: any) {
       };
     }
     if (!run_id && session_key && sessionRunsByKey.length > 1) {
+      logToolWarn(`task_dag_assign ambiguous session dag=${dagIdToUse} session=${session_key}`);
       return { error: 'Multiple runs exist for this session_key. Provide run_id explicitly unless assigning exactly one next-run worker task.' };
     }
     const sessionRun =
       (run_id ? getSessionRunByRunId(run_id, { agentId, dagId: dagIdToUse }) : null) ||
       (session_key ? getSessionRunBySessionKey(session_key, { agentId, dagId: dagIdToUse }) : null);
     if (!sessionRun) {
+      logToolWarn(`task_dag_assign failed dag=${dagIdToUse} session=${session_key || '(none)'} run=${run_id || '(none)'} reason=session_run_not_found`);
       return { error: 'session run not found for the provided session_key or run_id' };
     }
 
     const assigned: string[] = [];
     const resolvedExecutorAgentId = executor_agent_id || sessionRun.child_agent_id;
     if (!resolvedExecutorAgentId) {
+      logToolWarn(`task_dag_assign missing executor agent dag=${dagIdToUse} run=${sessionRun.run_id}`);
       return { error: 'executor_agent_id is required when the session run has no child_agent_id' };
     }
     if (sessionRun.spawn_mode === 'shared_worker' && task_ids.length !== 1) {
+      logToolWarn(`task_dag_assign shared_worker rejected dag=${dagIdToUse} run=${sessionRun.run_id} task_count=${task_ids.length}`);
       return { error: 'shared_worker sessions accept exactly one task per run; use one assignment per worker round' };
     }
     for (const taskId of task_ids) {
@@ -564,6 +603,7 @@ export async function assignTasksToSession(params: any, context?: any) {
         task_ids: assigned,
       });
     }
+    logToolInfo(`task_dag_assign attached dag=${dagIdToUse} run=${sessionRun.run_id} session=${sessionRun.child_session_key} tasks=${assigned.join(',')}`);
 
     return {
       success: true,
@@ -574,6 +614,7 @@ export async function assignTasksToSession(params: any, context?: any) {
       dag_id: dagIdToUse,
     };
   } catch (error: any) {
+    logToolError(`task_dag_assign failed error=${error.message}`);
     return { error: error.message };
   }
 }
@@ -617,6 +658,7 @@ export async function reconcileTaskDagState(params: any, context?: any) {
     const { agentId, dagId } = setToolExecutionContext(params, { requireDag: true });
     const dagData = dag.loadDAG();
     if (!dagData) {
+      logToolWarn(`task_dag_reconcile rejected agent=${agentId} dag=${dagId || '(none)'} reason=no_dag`);
       return { error: 'No DAG exists. Use createDAG first.' };
     }
 
@@ -633,14 +675,17 @@ export async function reconcileTaskDagState(params: any, context?: any) {
       }
     }
 
-    return {
+    const result = {
       success: true,
       reconciled,
       agent_id: agentId,
       dag_id: dagId || dag.getCurrentDagId(),
       stats: dag.getStats(),
     };
+    logToolInfo(`task_dag_reconcile result agent=${agentId} dag=${result.dag_id || '(none)'} actions=${reconciled.map(item => `${item.task_id}:${item.action}`).join(',') || '(none)'}`);
+    return result;
   } catch (error: any) {
+    logToolError(`task_dag_reconcile failed error=${error.message}`);
     return { error: error.message };
   }
 }
@@ -822,10 +867,13 @@ export async function continueParentSession(params: any, context?: any) {
   try {
     executionContext = setToolExecutionContext(params, { requireDag: true });
   } catch (error: any) {
+    logToolWarn(`task_dag_continue rejected reason=${error.message}`);
     return { error: error.message };
   }
   const { agentId, dagId } = executionContext;
+  logToolInfo(`task_dag_continue start agent=${agentId} dag=${dagId || dag.getCurrentDagId() || '(none)'} run=${params.run_id || '(none)'} session=${params.session_key || '(none)'} task=${params.task_id || '(none)'} tasks=${Array.isArray(params.task_ids) ? params.task_ids.join(',') : '(none)'}`);
   if (!params.run_id && !params.session_key && !params.task_id && (!Array.isArray(params.task_ids) || params.task_ids.length === 0)) {
+    logToolWarn(`task_dag_continue rejected agent=${agentId} dag=${dagId || dag.getCurrentDagId() || '(none)'} reason=missing_scope`);
     return { error: 'Explicit continuation scope is required. Provide run_id, session_key, task_id, or task_ids.' };
   }
   let sessionRun;
@@ -834,6 +882,7 @@ export async function continueParentSession(params: any, context?: any) {
     sessionRun = getScopeSessionRun(params, executionContext);
     taskIds = getScopeTaskIds(params, executionContext);
   } catch (error: any) {
+    logToolWarn(`task_dag_continue rejected agent=${agentId} dag=${dagId || dag.getCurrentDagId() || '(none)'} reason=${error.message}`);
     return { error: error.message };
   }
   const requesterSessionKey = getRequesterSessionKey(params);
@@ -947,7 +996,7 @@ export async function continueParentSession(params: any, context?: any) {
     });
   }
 
-  return {
+  const result = {
     action,
     no_new_events: !hasNewEvents,
     retry_not_recommended: !hasNewEvents,
@@ -984,10 +1033,15 @@ export async function continueParentSession(params: any, context?: any) {
         ? 'Do not call task_dag_continue again until a new resume/completion event arrives.'
         : undefined,
   };
+  logToolInfo(`task_dag_continue result agent=${agentId} dag=${result.dag_id || '(none)'} action=${result.action} run=${result.run_id || '(none)'} completed=${result.completed_task_ids.join(',') || '(none)'} failed=${result.failed_task_ids.join(',') || '(none)'} ready=${result.ready_task_ids.join(',') || '(none)'} waiting=${result.waiting_task_ids.join(',') || '(none)'} active_bindings=${result.active_binding_count} new_events=${!result.no_new_events}`);
+  return result;
 }
 
 export function registerTaskDagTools(api: OpenClawPluginApi) {
-  api.logger.info('[task-dag] Registering tools...');
+  toolLogger.info = api.logger.info.bind(api.logger);
+  toolLogger.warn = api.logger.warn.bind(api.logger);
+  toolLogger.error = api.logger.error.bind(api.logger);
+  taskDagInfo(api.logger, 'Registering tools...');
 
   // ========== task_dag_create ==========
   api.registerTool({
@@ -1460,7 +1514,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
 
   api.registerTool({
     name: "task_dag_claim",
-    description: "Claim a task for execution by the current agent or a subagent session.",
+    description: "Start executing a ready task yourself. This sets the task to running. Do not use before task_dag_spawn.",
     parameters: {
       type: "object",
       properties: {
@@ -1480,7 +1534,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
 
   api.registerTool({
     name: "task_dag_progress",
-    description: "Report deterministic task progress and emit a pending progress event.",
+    description: "Report progress for a task you are already executing.",
     parameters: {
       type: "object",
       properties: {
@@ -1499,7 +1553,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
 
   api.registerTool({
     name: "task_dag_complete",
-    description: "Mark a task complete and close its active bindings.",
+    description: "Finish a task you are already executing and close its active bindings.",
     parameters: {
       type: "object",
       properties: {
@@ -1518,7 +1572,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
 
   api.registerTool({
     name: "task_dag_fail",
-    description: "Mark a task failed and close its active bindings.",
+    description: "Fail a task you are already executing and close its active bindings.",
     parameters: {
       type: "object",
       properties: {
@@ -1536,7 +1590,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
 
   api.registerTool({
     name: "task_dag_spawn",
-    description: "Prepare a subagent spawn for a task and return a sessions_spawn plan for the agent to execute.",
+    description: "Send a ready task to a new subagent. Do not call task_dag_claim first. Return spawn_plan and use it unchanged in sessions_spawn.",
     parameters: {
       type: "object",
       properties: {
@@ -1561,7 +1615,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
 
   api.registerTool({
     name: "task_dag_assign",
-    description: "Assign one or more tasks to an existing subagent session or run.",
+    description: "Send the next ready task to an existing subagent session. Use for worker multi-round flow, not for parent execution.",
     parameters: {
       type: "object",
       properties: {
@@ -1577,7 +1631,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
     execute: async (_toolCallId, params: any) => assignTasksToSession(params)
   }, { optional: false });
 
-  api.logger.info('[task-dag] All tools registered');
+  taskDagInfo(api.logger, 'All tools registered');
 
   api.registerTool({
     name: "task_dag_poll_events",
@@ -1600,7 +1654,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
 
   api.registerTool({
     name: "task_dag_continue",
-    description: "Build a parent-session continuation summary after auto-announce and decide whether to wait, trigger downstream work, or reply to the user.",
+    description: "After subagent work ends, continue the parent DAG flow: wait, trigger downstream tasks, or reply.",
     parameters: {
       type: "object",
       properties: {

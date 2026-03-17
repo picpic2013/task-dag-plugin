@@ -6,7 +6,8 @@
   "type": "module",
   "scripts": {
     "build": "tsc",
-    "dev": "tsc --watch"
+    "dev": "tsc --watch",
+    "test": "node test_runner.mjs"
   },
   "devDependencies": {
     "@types/node": "^25.5.0",

@@ -42,6 +42,63 @@ function withTempWorkspace(name, fn) {
   return fn(workspaceDir);
 }
 
+function createOpenClawSimulationHarness() {
+  const registeredTools = {};
+  const registeredHooks = {};
+  const sentMessages = [];
+  let runCounter = 0;
+
+  const api = {
+    logger: { info() {}, warn() {}, error() {} },
+    registerTool(tool) { registeredTools[tool.name] = tool; },
+    registerHook(name, handler) { registeredHooks[name] = handler; },
+    runtime: {
+      sessions_send: async (params) => {
+        sentMessages.push(params);
+        return { success: true };
+      },
+    },
+    config: {},
+  };
+
+  tools.registerTaskDagTools(api);
+  hooks.registerTaskDagHooks(api);
+
+  return {
+    registeredTools,
+    registeredHooks,
+    sentMessages,
+    async simulateManagedSpawn({ requesterSessionKey, spawnPlan }) {
+      runCounter += 1;
+      const agentId = spawnPlan.agentId || 'worker';
+      const childSessionKey = `agent:${agentId}:subagent:sim-${runCounter}`;
+      const runId = `run-sim-${runCounter}`;
+      await registeredHooks.subagent_spawned({
+        childSessionKey,
+        agentId,
+        label: spawnPlan.label,
+        runId,
+      }, {
+        requesterSessionKey,
+        runId,
+        childSessionKey,
+      });
+      return { childSessionKey, runId, agentId };
+    },
+    async simulateEnded({ requesterSessionKey, childSessionKey, runId, outcome = 'ok' }) {
+      await registeredHooks.subagent_ended({
+        targetSessionKey: childSessionKey,
+        runId,
+        outcome,
+      }, {
+        requesterSessionKey,
+        runId,
+        childSessionKey,
+      });
+    },
+  };
+}
+
 console.log('\n=== Notification Module ===\n');
 
 test('add and peek notification', () => {
@@ -819,6 +876,47 @@ test('worker session can end multiple runs and close one assigned task per run',
   });
 });
 
+test('worker session ended does not guess a task when multiple active assignment scopes exist', async () => {
+  await withTempWorkspace('hook-ended-worker-ambiguous-assignment-scope', async () => {
+    dag.setCurrentAgentId('main');
+    const createdA = dag.createDAG('hook-ended-worker-ambiguous-assignment-scope-a', [{ id: 't1', name: 'Worker task A' }]);
+    const createdB = dag.createDAG('hook-ended-worker-ambiguous-assignment-scope-b', [{ id: 't1', name: 'Worker task B' }]);
+
+    for (const created of [createdA, createdB]) {
+      bindings.saveSessionRun({
+        run_id: `run-worker-bootstrap-${created.id}`,
+        child_session_key: 'agent:worker:subagent:worker-shared-ambiguous',
+        child_agent_id: 'worker',
+        requester_session_key: 'agent:main',
+        parent_agent_id: 'main',
+        dag_id: created.id,
+        spawn_mode: 'shared_worker',
+        active_task_ids: [],
+      }, { agentId: 'main', dagId: created.id });
+      await tools.assignTasksToSession({
+        task_ids: ['t1'],
+        dag_id: created.id,
+        agent_id: 'main',
+        session_key: 'agent:worker:subagent:worker-shared-ambiguous',
+      }, {});
+    }
+
+    const result = hooks.handleSubagentEndedEvent({
+      targetSessionKey: 'agent:worker:subagent:worker-shared-ambiguous',
+      runId: 'run-worker-ambiguous',
+      outcome: 'ok',
+    }, { requesterSessionKey: 'agent:main', runId: 'run-worker-ambiguous', childSessionKey: 'agent:worker:subagent:worker-shared-ambiguous' }, console);
+
+    assert(result.managed_run === false, 'Ended hook should reject ambiguous worker assignment scopes');
+    assert(result.task_ids.length === 0, 'Ended hook should not guess a task across multiple scopes');
+
+    dag.setCurrentDagId(createdA.id);
+    assert(dag.getTask('t1')?.status === 'waiting_subagent', 'First ambiguous task should remain waiting');
+    dag.setCurrentDagId(createdB.id);
+    assert(dag.getTask('t1')?.status === 'waiting_subagent', 'Second ambiguous task should remain waiting');
+  });
+});
+
 test('task_dag_poll_events and ack_event expose deterministic event consumption', async () => {
   await withTempWorkspace('tool-events', async () => {
     const created = dag.createDAG('tool-events', [{ id: 't1', name: 'Events task' }]);
@@ -1408,6 +1506,46 @@ test('subagent_spawned hook ignores non task-dag labels', async () => {
 
     assert(bindings.getSessionRunByRunId('run-hook-plain', { agentId: 'main', dagId: created.id }) == null, 'Plain labels should not create task-dag session runs');
     assert(bindings.listPendingEvents({ type: 'subagent_spawned' }, { agentId: 'main', dagId: created.id }).length === 0, 'Plain labels should not emit task-dag spawn events');
+  });
+});
+
+test('subagent_spawned hook does not bind runs whose actual agent drifts from the prepared target', async () => {
+  await withTempWorkspace('hook-spawned-drift-agent', async () => {
+    dag.setCurrentAgentId('main');
+    const created = dag.createDAG('hook-spawned-drift-agent', [{ id: 't1', name: 'Hook task' }]);
+    const context = { agentId: 'main', dagId: created.id };
+    const spawnLabel = `taskdag:v1:dag=${created.id}:task=t1`;
+    const intent = bindings.saveSpawnIntent({
+      dag_id: created.id,
+      task_id: 't1',
+      parent_agent_id: 'main',
+      requester_session_key: 'agent:main',
+      target_agent_id: 'worker',
+      label: spawnLabel,
+      status: 'prepared',
+    }, context);
+    requesterSessions.upsertRequesterSessionScope({
+      requester_session_key: 'agent:main',
+      parent_agent_id: 'main',
+      dag_id: created.id,
+      task_ids: ['t1'],
+    });
+    dag.updateTask('t1', {
+      status: 'waiting_subagent',
+      waiting_for: { kind: 'spawn_intent', spawn_intent_id: intent.intent_id },
+    });
+
+    hooks.handleSubagentSpawnedEvent({
+      childSessionKey: 'agent:chexie:subagent:drifted',
+      agentId: 'chexie',
+      label: spawnLabel,
+      runId: 'run-hook-drift',
+    }, { requesterSessionKey: 'agent:main', runId: 'run-hook-drift', childSessionKey: 'agent:chexie:subagent:drifted' }, console);
+
+    assert(bindings.getSessionRunByRunId('run-hook-drift', context) == null, 'Agent drift should not create a managed session run');
+    assert(bindings.listTaskBindings({ task_id: 't1' }, context).length === 0, 'Agent drift should not create a task binding');
+    assert(bindings.listPendingEvents({ type: 'subagent_spawned' }, context).length === 0, 'Agent drift should not emit a spawned event');
+    assert(bindings.getSpawnIntentById(intent.intent_id, context)?.status === 'prepared', 'Prepared intent should remain prepared when target drift is rejected');
   });
 });
 
@@ -2428,6 +2566,133 @@ test('subagent_ended hook does not guess run_id when one session key has multipl
     }, { requesterSessionKey: 'agent:main', childSessionKey: 'agent:worker:subagent:shared-ended' }, console);
 
     assert(result.task_ids.length === 0, 'Ended hook should not close tasks when session-only lookup is ambiguous');
+  });
+});
+
+console.log('\n=== OpenClaw Runtime Simulation ===\n');
+
+test('openclaw-style managed spawn -> ended -> continue flow advances the DAG', async () => {
+  await withTempWorkspace('openclaw-runtime-managed-flow', async () => {
+    const harness = createOpenClawSimulationHarness();
+    const requesterSessionKey = 'agent:chexie:feishu:group:test-runtime';
+    const createResult = await harness.registeredTools.task_dag_create.execute('call-runtime-create', {
+      agent_id: 'chexie',
+      name: 'runtime-managed',
+      tasks: [
+        { id: 't1', name: 'Read README', assigned_agent: 'subagent' },
+        { id: 't2', name: 'Follow-up', assigned_agent: 'parent', dependencies: ['t1'] },
+      ],
+    });
+
+    assert(createResult.success === true, `DAG create should succeed: ${JSON.stringify(createResult)}`);
+
+    const spawnResult = await harness.registeredTools.task_dag_spawn.execute('call-runtime-spawn', {
+      agent_id: 'chexie',
+      dag_id: createResult.dag_id,
+      task_id: 't1',
+      prompt: 'Read the README and summarize it',
+      requester_session_key: requesterSessionKey,
+      target_agent_id: 'chexie',
+      runtime: 'subagent',
+    });
+
+    assert(spawnResult.success === true, `Spawn prepare should succeed: ${JSON.stringify(spawnResult)}`);
+    assert(spawnResult.spawn_plan.label.startsWith('taskdag:v1:'), 'Managed spawn should use task-dag protocol label');
+
+    const spawned = await harness.simulateManagedSpawn({
+      requesterSessionKey,
+      spawnPlan: spawnResult.spawn_plan,
+    });
+
+    const continueWhileWaiting = await harness.registeredTools.task_dag_continue.execute('call-runtime-continue-wait', {
+      agent_id: 'chexie',
+      dag_id: createResult.dag_id,
+      run_id: spawned.runId,
+    });
+
+    assert(continueWhileWaiting.active_binding_count === 1, 'Managed spawned run should create one active binding');
+    assert(continueWhileWaiting.waiting_task_ids.includes('t1'), 'Parent continuation should see t1 as waiting');
+    assert(continueWhileWaiting.continuation_reason === 'awaiting_subagent_events', 'Continuation should report waiting for subagent events');
+
+    await harness.simulateEnded({
+      requesterSessionKey,
+      childSessionKey: spawned.childSessionKey,
+      runId: spawned.runId,
+      outcome: 'ok',
+    });
+
+    const continueAfterEnded = await harness.registeredTools.task_dag_continue.execute('call-runtime-continue-ended', {
+      agent_id: 'chexie',
+      dag_id: createResult.dag_id,
+      run_id: spawned.runId,
+    });
+
+    assert(continueAfterEnded.completed_task_ids.includes('t1'), 'Ended run should mark t1 completed');
+    assert(dag.getTask('t2')?.status === 'ready', 'Downstream task should become ready in DAG state');
+    assert(continueAfterEnded.action === 'user_reply', `Run-scoped continuation should summarize terminal updates first: ${JSON.stringify(continueAfterEnded)}`);
+    assert(harness.sentMessages.length === 1, 'Ended hook should send one wake-up message to requester session');
+    assert(harness.sentMessages[0].sessionKey === requesterSessionKey, 'Wake-up should target requester session');
+  });
+});
+
+test('openclaw-style runtime simulation reproduces unmanaged custom-label failure quickly', async () => {
+  await withTempWorkspace('openclaw-runtime-unmanaged-label', async () => {
+    const harness = createOpenClawSimulationHarness();
+    const requesterSessionKey = 'agent:chexie:feishu:group:test-runtime-bad-label';
+    const createResult = await harness.registeredTools.task_dag_create.execute('call-runtime-create-bad-label', {
+      agent_id: 'chexie',
+      name: 'runtime-unmanaged',
+      tasks: [
+        { id: 't1', name: 'Read README', assigned_agent: 'subagent' },
+        { id: 't2', name: 'Follow-up', assigned_agent: 'parent', dependencies: ['t1'] },
+      ],
+    });
+
+    const spawnResult = await harness.registeredTools.task_dag_spawn.execute('call-runtime-spawn-bad-label', {
+      agent_id: 'chexie',
+      dag_id: createResult.dag_id,
+      task_id: 't1',
+      prompt: 'Read the README and summarize it',
+      requester_session_key: requesterSessionKey,
+      target_agent_id: 'chexie',
+      runtime: 'subagent',
+      label: 'test-dag-t1',
+    });
+
+    assert(spawnResult.success === true, 'Spawn prepare still succeeds with a custom label today');
+    assert(spawnResult.spawn_plan.label === 'test-dag-t1', 'Custom label should be preserved by current tool implementation');
+
+    const spawned = await harness.simulateManagedSpawn({
+      requesterSessionKey,
+      spawnPlan: spawnResult.spawn_plan,
+    });
+
+    const continueWhileWaiting = await harness.registeredTools.task_dag_continue.execute('call-runtime-continue-bad-label', {
+      agent_id: 'chexie',
+      dag_id: createResult.dag_id,
+      run_id: spawned.runId,
+      task_id: 't1',
+    });
+
+    await harness.simulateEnded({
+      requesterSessionKey,
+      childSessionKey: spawned.childSessionKey,
+      runId: spawned.runId,
+      outcome: 'ok',
+    });
+
+    const continueAfterEnded = await harness.registeredTools.task_dag_continue.execute('call-runtime-continue-bad-label-ended', {
+      agent_id: 'chexie',
+      dag_id: createResult.dag_id,
+      run_id: spawned.runId,
+      task_id: 't1',
+    });
+
+    assert(continueWhileWaiting.active_binding_count === 0, 'Non-protocol label should fail to create a managed binding');
+    assert(continueAfterEnded.completed_task_ids.length === 0, 'Unmanaged run should not emit completion into task-dag continuation');
+    assert(continueAfterEnded.ready_task_ids.length === 0, 'Downstream task should not become ready when hook never attached');
+    assert(dag.getTask('t1')?.status === 'waiting_subagent', 'Task should remain stuck in waiting_subagent without managed hook capture');
+    assert(harness.sentMessages.length === 0, 'Unmanaged run should not wake the parent continuation channel');
   });
 });
 

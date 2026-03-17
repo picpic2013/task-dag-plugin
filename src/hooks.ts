@@ -6,6 +6,7 @@
 
 import type { OpenClawPluginApi } from "./plugin-sdk.js";
 import { addEvent } from './events.js';
+import { taskDagError, taskDagInfo, taskDagWarn } from './utils/task-dag-logger.js';
 import {
   appendPendingEvent,
   completeSessionRun,
@@ -64,7 +65,7 @@ export function parseTaskDagLabel(label: string): { version: string; dag_id?: st
   return parsed.task_id ? parsed : null;
 }
 
-function findPreparedSpawnIntent(event: any, ctx?: HookContext): { agentId: string; dagId: string; intentId: string; taskId: string; requesterSessionKey?: string } | null {
+function findPreparedSpawnIntent(event: any, ctx?: HookContext): { agentId: string; dagId: string; intentId: string; taskId: string; requesterSessionKey?: string; targetAgentId?: string } | null {
   const parsedLabel = parseTaskDagLabel(event.label || '');
   if (!parsedLabel?.task_id) {
     return null;
@@ -91,6 +92,7 @@ function findPreparedSpawnIntent(event: any, ctx?: HookContext): { agentId: stri
         intentId: matchingIntent.intent_id,
         taskId: matchingIntent.task_id,
         requesterSessionKey,
+        targetAgentId: matchingIntent.target_agent_id,
       };
     }
   }
@@ -151,7 +153,7 @@ function getHookContextFromEndedEvent(event: any, ctx?: HookContext): { agentId:
     (runId ? findRequesterSessionScopeByRunId(runId) : null);
   if (!scope && requesterSessionKey && targetSessionKey) {
     const candidateScopes = listRequesterSessionScopes(requesterSessionKey);
-    for (const candidateScope of candidateScopes) {
+    const scopesWithAssignments = candidateScopes.filter(candidateScope => {
       const activeAssignments = listAssignmentIntents({
         session_key: targetSessionKey,
         status: 'assigned',
@@ -159,13 +161,14 @@ function getHookContextFromEndedEvent(event: any, ctx?: HookContext): { agentId:
         agentId: candidateScope.parent_agent_id,
         dagId: candidateScope.dag_id,
       });
-      if (activeAssignments.length > 0) {
-        return {
-          agentId: candidateScope.parent_agent_id,
-          dagId: candidateScope.dag_id,
-          requesterSessionKey,
-        };
-      }
+      return activeAssignments.length > 0;
+    });
+    if (scopesWithAssignments.length === 1) {
+      return {
+        agentId: scopesWithAssignments[0].parent_agent_id,
+        dagId: scopesWithAssignments[0].dag_id,
+        requesterSessionKey,
+      };
     }
   }
   const dagId = scope?.dag_id || event.dagId || event.dag_id;
@@ -217,22 +220,53 @@ function markNewlyReadyTasks(sourceTaskIds: string[], context: { agentId: string
 export function handleSubagentSpawnedEvent(event: any, ctx?: HookContext, logger?: OpenClawPluginApi['logger']): void {
   const { childSessionKey, agentId, label, requesterSessionKey } = event;
   if (!childSessionKey) {
+    taskDagWarn(logger, 'subagent_spawned missing childSessionKey');
     return;
   }
 
+  taskDagInfo(logger, `subagent_spawned received child=${childSessionKey} run=${event.runId || event.run_id || ctx?.runId || '(none)'} agent=${agentId || '(none)'} label=${label || '(none)'} requester=${ctx?.requesterSessionKey || event.requesterSessionKey || event.requester_session_key || '(none)'}`);
+
   const preparedIntent = findPreparedSpawnIntent(event, ctx);
   if (!preparedIntent) {
-    logger?.info?.(`[task-dag] Ignoring non task-dag subagent_spawned label: ${label || '(none)'}`);
+    const parsedLabel = parseTaskDagLabel(label || '');
+    const resolvedRequesterSessionKey = ctx?.requesterSessionKey || event.requesterSessionKey || event.requester_session_key;
+    const candidateScopeCount = resolvedRequesterSessionKey ? listRequesterSessionScopes(resolvedRequesterSessionKey).length : 0;
+    let duplicateOrDriftDetails = '';
+    if (parsedLabel?.task_id && resolvedRequesterSessionKey) {
+      const candidateScopes = listRequesterSessionScopes(resolvedRequesterSessionKey)
+        .filter(scope => !parsedLabel.dag_id || scope.dag_id === parsedLabel.dag_id);
+      for (const scope of candidateScopes) {
+        const matchingSpawnedIntents = listSpawnIntents({
+          task_id: parsedLabel.task_id,
+          label: event.label,
+          status: 'spawned',
+        }, { agentId: scope.parent_agent_id, dagId: scope.dag_id });
+        const matchingBindings = listTaskBindings({
+          task_id: parsedLabel.task_id,
+          binding_status: 'active',
+        }, { agentId: scope.parent_agent_id, dagId: scope.dag_id });
+        if (matchingSpawnedIntents.length > 0 || matchingBindings.length > 0) {
+          duplicateOrDriftDetails = ` duplicate_or_drift=1 existing_spawned_intents=${matchingSpawnedIntents.length} existing_active_bindings=${matchingBindings.length} scope_agent=${scope.parent_agent_id} scope_dag=${scope.dag_id}`;
+          break;
+        }
+      }
+    }
+    taskDagWarn(logger, `subagent_spawned unmanaged child=${childSessionKey} run=${event.runId || event.run_id || ctx?.runId || '(none)'} agent=${agentId || '(none)'} label=${label || '(none)'} parsed_task=${parsedLabel?.task_id || '(none)'} parsed_dag=${parsedLabel?.dag_id || '(none)'} requester=${resolvedRequesterSessionKey || '(none)'} requester_scope_count=${candidateScopeCount}${duplicateOrDriftDetails}`);
     return;
   }
 
   const context = getHookContextFromSpawnEvent(event, ctx);
   if (!context) {
-    logger?.warn?.('[task-dag] Unable to resolve DAG context for subagent_spawned');
+    taskDagWarn(logger, `subagent_spawned matched intent but missing context child=${childSessionKey} run=${event.runId || event.run_id || ctx?.runId || '(none)'} intent=${preparedIntent.intentId} task=${preparedIntent.taskId} dag=${preparedIntent.dagId}`);
     return;
   }
 
   const taskId = preparedIntent.taskId;
+  taskDagInfo(logger, `subagent_spawned matched intent child=${childSessionKey} run=${event.runId || event.run_id || ctx?.runId || '(none)'} actual_agent=${agentId || '(none)'} expected_target=${preparedIntent.targetAgentId || '(none)'} expected_parent=${preparedIntent.agentId} dag=${preparedIntent.dagId} task=${taskId} intent=${preparedIntent.intentId}`);
+  if (preparedIntent.targetAgentId && agentId && preparedIntent.targetAgentId !== agentId) {
+    taskDagWarn(logger, `subagent_spawned target agent drift child=${childSessionKey} run=${event.runId || event.run_id || ctx?.runId || '(none)'} expected_target=${preparedIntent.targetAgentId} actual_agent=${agentId} dag=${preparedIntent.dagId} task=${taskId} intent=${preparedIntent.intentId}`);
+    return;
+  }
 
   const runId = event.runId || event.run_id || ctx?.runId || `run-${taskId}-${Date.now()}`;
   const requesterKey = context.requesterSessionKey || requesterSessionKey || ctx?.requesterSessionKey;
@@ -321,6 +355,8 @@ export function handleSubagentSpawnedEvent(event: any, ctx?: HookContext, logger
       requester_session_key: requesterKey,
       details: `Sub-agent started for task ${taskId}`,
     });
+
+    taskDagInfo(logger, `subagent_spawned bound child=${childSessionKey} run=${runId} dag=${context.dagId} task=${taskId} agent=${agentId || '(none)'} requester=${requesterKey || '(none)'}`);
   });
 }
 
@@ -337,12 +373,15 @@ export function handleSubagentEndedEvent(event: any, ctx?: HookContext, logger?:
   const targetSessionKey = event.targetSessionKey || event.childSessionKey || event.sessionKey;
   const outcome = event.outcome || 'unknown';
   if (!targetSessionKey) {
+    taskDagWarn(logger, 'subagent_ended missing targetSessionKey');
     return { managed_run: false, task_ids: [], newly_ready_task_ids: [], outcome };
   }
 
+  taskDagInfo(logger, `subagent_ended received child=${targetSessionKey} run=${event.runId || event.run_id || ctx?.runId || '(none)'} outcome=${outcome} requester=${ctx?.requesterSessionKey || event.requesterSessionKey || event.requester_session_key || '(none)'}`);
+
   const context = getHookContextFromEndedEvent(event, ctx);
   if (!context) {
-    logger?.warn?.('[task-dag] Unable to resolve DAG context for subagent_ended');
+    taskDagWarn(logger, `subagent_ended unmanaged child=${targetSessionKey} run=${event.runId || event.run_id || ctx?.runId || '(none)'} outcome=${outcome} requester=${ctx?.requesterSessionKey || event.requesterSessionKey || event.requester_session_key || '(none)'}`);
     return { managed_run: false, task_ids: [], newly_ready_task_ids: [], outcome };
   }
 
@@ -362,6 +401,7 @@ export function handleSubagentEndedEvent(event: any, ctx?: HookContext, logger?:
     let activeBindings = listTaskBindings({ session_key: targetSessionKey, binding_status: 'active' }, context)
       .filter(binding => !runId || !binding.run_id || binding.run_id === runId);
     const activeAssignments = listAssignmentIntents({ session_key: targetSessionKey, status: 'assigned' }, context);
+    taskDagInfo(logger, `subagent_ended context child=${targetSessionKey} run=${runId || '(none)'} dag=${context.dagId} agent=${context.agentId} session_runs=${sessionRunsByKey.length} active_bindings=${activeBindings.length} active_assignments=${activeAssignments.length}`);
 
     if (activeBindings.length === 0 && activeAssignments.length === 1) {
       const assignment = activeAssignments[0];
@@ -394,6 +434,7 @@ export function handleSubagentEndedEvent(event: any, ctx?: HookContext, logger?:
         run_id: runId,
       }, context);
       activeBindings = [synthesizedBinding];
+      taskDagInfo(logger, `subagent_ended synthesized binding child=${targetSessionKey} run=${runId || '(none)'} dag=${context.dagId} task=${assignment.task_id} assignment=${assignment.intent_id}`);
     }
 
     if (activeBindings.length === 0) {
@@ -403,6 +444,7 @@ export function handleSubagentEndedEvent(event: any, ctx?: HookContext, logger?:
         includeConsumed: true,
       }, context).filter(existingEvent => existingEvent.type === 'subagent_completed' || existingEvent.type === 'subagent_failed');
       if (existingCompletionEvents.length > 0) {
+        taskDagInfo(logger, `subagent_ended replay-only child=${targetSessionKey} run=${runId || '(none)'} dag=${context.dagId} completion_events=${existingCompletionEvents.length}`);
         return {
           managed_run: true,
           agent_id: context.agentId,
@@ -415,6 +457,7 @@ export function handleSubagentEndedEvent(event: any, ctx?: HookContext, logger?:
         };
       }
 
+      taskDagWarn(logger, `subagent_ended no active binding child=${targetSessionKey} run=${runId || '(none)'} dag=${context.dagId} requester=${resolvedRequesterSessionKey || '(none)'}`);
       return {
         managed_run: false,
         agent_id: context.agentId,
@@ -473,6 +516,7 @@ export function handleSubagentEndedEvent(event: any, ctx?: HookContext, logger?:
     }
 
     const newlyReady = isSuccess ? markNewlyReadyTasks(taskIds, context) : [];
+    taskDagInfo(logger, `subagent_ended managed child=${targetSessionKey} run=${runId || '(none)'} dag=${context.dagId} tasks=${taskIds.join(',') || '(none)'} newly_ready=${newlyReady.join(',') || '(none)'} outcome=${outcome}`);
     return {
       managed_run: true,
       agent_id: context.agentId,
@@ -541,7 +585,7 @@ export function registerTaskDagHooks(api: OpenClawPluginApi): void {
   api.registerHook(
     'gateway:startup',
     async () => {
-      api.logger.info('[task-dag] Gateway started, hooks ready');
+      taskDagInfo(api.logger, 'Gateway started, hooks ready');
     },
     {
       name: 'task-dag.startup',
@@ -553,9 +597,9 @@ export function registerTaskDagHooks(api: OpenClawPluginApi): void {
   api.registerHook('subagent_spawned', async (event: any, ctx?: HookContext) => {
     try {
       handleSubagentSpawnedEvent(event, ctx, api.logger);
-      api.logger.info(`[task-dag] Processed subagent_spawned for ${event.childSessionKey}`);
+      taskDagInfo(api.logger, `Processed subagent_spawned child=${event.childSessionKey || '(none)'} run=${event.runId || event.run_id || ctx?.runId || '(none)'}`);
     } catch (error) {
-      api.logger.error(`[task-dag] Error in subagent_spawned: ${error}`);
+      taskDagError(api.logger, `Error in subagent_spawned: ${error}`);
     }
   }, {
     name: 'task-dag.subagent-spawned',
@@ -567,7 +611,7 @@ export function registerTaskDagHooks(api: OpenClawPluginApi): void {
     try {
       const result = handleSubagentEndedEvent(event, ctx, api.logger);
       if (!result.managed_run) {
-        api.logger.info(`[task-dag] Ignoring unmanaged subagent_ended for ${event.targetSessionKey || event.childSessionKey}`);
+        taskDagInfo(api.logger, `Ignoring unmanaged subagent_ended for ${event.targetSessionKey || event.childSessionKey}`);
         return;
       }
       const requesterSessionKey = result.requester_session_key || ctx?.requesterSessionKey;
@@ -589,15 +633,16 @@ export function registerTaskDagHooks(api: OpenClawPluginApi): void {
           },
         }, { agentId: result.agent_id, dagId: result.dag_id });
         if (api.runtime.sessions_send) {
+          taskDagInfo(api.logger, `subagent_ended wake-up send requester=${requesterSessionKey} dag=${result.dag_id} run=${result.run_id || event.runId || '(none)'} tasks=${result.task_ids.join(',') || '(none)'}`);
           await api.runtime.sessions_send({
             sessionKey: requesterSessionKey,
             message: buildResumeMessage(result),
           });
         }
       }
-      api.logger.info(`[task-dag] Processed subagent_ended for ${event.targetSessionKey || event.childSessionKey}, tasks=${result.task_ids.join(',')}`);
+      taskDagInfo(api.logger, `Processed subagent_ended child=${event.targetSessionKey || event.childSessionKey || '(none)'} run=${result.run_id || event.runId || '(none)'} managed=${result.managed_run} tasks=${result.task_ids.join(',') || '(none)'}`);
     } catch (error) {
-      api.logger.error(`[task-dag] Error in subagent_ended: ${error}`);
+      taskDagError(api.logger, `Error in subagent_ended: ${error}`);
     }
   }, {
     name: 'task-dag.subagent-ended',
@@ -615,7 +660,7 @@ export function registerTaskDagHooks(api: OpenClawPluginApi): void {
     description: '在父会话恢复轮次前注入 task_dag_continue 指令',
   });
   
-  api.logger.info('[task-dag] Hooks + subagent hooks registered');
+  taskDagInfo(api.logger, 'Hooks + subagent hooks registered');
 }
 
 /**
