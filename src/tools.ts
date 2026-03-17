@@ -116,6 +116,42 @@ function getRequesterSessionKey(params?: any): string | undefined {
   return params?.requester_session_key;
 }
 
+function hasActiveSubagentOwnership(taskId: string, context: { agentId: string; dagId?: string }): boolean {
+  const activeBindings = listTaskBindings({ task_id: taskId, binding_status: 'active' }, context);
+  if (activeBindings.length > 0) {
+    return true;
+  }
+  const activeSpawnIntents = listSpawnIntents({ task_id: taskId }, context)
+    .filter(intent => intent.status === 'prepared' || intent.status === 'spawned');
+  if (activeSpawnIntents.length > 0) {
+    return true;
+  }
+  const activeAssignments = listAssignmentIntents({ task_id: taskId, status: 'assigned' }, context);
+  return activeAssignments.length > 0;
+}
+
+function shouldAllowSubagentLifecycleMutation(params: any, task: any): boolean {
+  if (params?.force_override === true) {
+    return true;
+  }
+  if (params?.session_key || params?.run_id) {
+    return true;
+  }
+  if (task?.executor?.type === 'subagent') {
+    return false;
+  }
+  return true;
+}
+
+function rejectParentTakeover(taskId: string, action: string) {
+  return {
+    error: `Task ${taskId} is currently owned by a subagent lifecycle and cannot ${action} from the parent agent without force_override`,
+    task_id: taskId,
+    owner: 'subagent',
+    action,
+  };
+}
+
 export async function claimTaskExecution(params: any, context?: any) {
   try {
     const { agentId, dagId } = setToolExecutionContext(params, { requireDag: true });
@@ -123,6 +159,9 @@ export async function claimTaskExecution(params: any, context?: any) {
     const taskResult = getTaskOrError(task_id);
     if ('error' in taskResult) {
       return taskResult;
+    }
+    if (executor_type === 'parent' && hasActiveSubagentOwnership(task_id, { agentId, dagId })) {
+      return rejectParentTakeover(task_id, 'be claimed');
     }
     const transitionError = ensureTaskStatus(taskResult.task, 'be claimed', ['ready']);
     if (transitionError) {
@@ -168,6 +207,9 @@ export async function reportTaskProgress(params: any, context?: any) {
     }
 
     const current = taskResult.task;
+    if (hasActiveSubagentOwnership(task_id, { agentId, dagId }) && !shouldAllowSubagentLifecycleMutation(params, current)) {
+      return rejectParentTakeover(task_id, 'report progress');
+    }
     const transitionError = ensureTaskStatus(current, 'report progress', ['running', 'waiting_subagent']);
     if (transitionError) {
       return transitionError;
@@ -219,6 +261,9 @@ export async function completeTaskExecution(params: any, context?: any) {
     if ('error' in taskResult) {
       return taskResult;
     }
+    if (hasActiveSubagentOwnership(task_id, { agentId, dagId }) && !shouldAllowSubagentLifecycleMutation(params, taskResult.task)) {
+      return rejectParentTakeover(task_id, 'be completed');
+    }
     const transitionError = ensureTaskStatus(taskResult.task, 'be completed', ['running', 'waiting_subagent']);
     if (transitionError) {
       return transitionError;
@@ -254,6 +299,9 @@ export async function failTaskExecution(params: any, context?: any) {
     const taskResult = getTaskOrError(task_id);
     if ('error' in taskResult) {
       return taskResult;
+    }
+    if (hasActiveSubagentOwnership(task_id, { agentId, dagId }) && !shouldAllowSubagentLifecycleMutation(params, taskResult.task)) {
+      return rejectParentTakeover(task_id, 'fail');
     }
     const transitionError = ensureTaskStatus(taskResult.task, 'fail', ['running', 'waiting_subagent']);
     if (transitionError) {

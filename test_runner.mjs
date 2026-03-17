@@ -927,6 +927,85 @@ test('task_dag_complete rejects non-running tasks', async () => {
   });
 });
 
+test('parent agent cannot claim a task once subagent spawn intent exists', async () => {
+  await withTempWorkspace('tool-claim-subagent-owned', async () => {
+    const created = dag.createDAG('tool-claim-subagent-owned', [{ id: 't1', name: 'Task 1' }]);
+    await tools.spawnTaskExecution({}, {
+      task_id: 't1',
+      dag_id: created.id,
+      agent_id: 'main',
+      requester_session_key: 'agent:main',
+      target_agent_id: 'worker',
+      task: 'delegate',
+    }, {});
+
+    const result = await tools.claimTaskExecution({
+      task_id: 't1',
+      dag_id: created.id,
+      agent_id: 'main',
+      executor_type: 'parent',
+    }, {});
+
+    assert(result.error?.includes('subagent lifecycle'), 'Parent claim should be rejected once a subagent owns the task');
+  });
+});
+
+test('parent agent cannot complete a waiting subagent task without override metadata', async () => {
+  await withTempWorkspace('tool-complete-subagent-owned', async () => {
+    const created = dag.createDAG('tool-complete-subagent-owned', [{ id: 't1', name: 'Task 1' }]);
+    await tools.spawnTaskExecution({}, {
+      task_id: 't1',
+      dag_id: created.id,
+      agent_id: 'main',
+      requester_session_key: 'agent:main',
+      target_agent_id: 'worker',
+      task: 'delegate',
+    }, {});
+
+    const result = await tools.completeTaskExecution({
+      task_id: 't1',
+      dag_id: created.id,
+      agent_id: 'main',
+      output_summary: 'forced by parent',
+    }, {});
+
+    assert(result.error?.includes('subagent lifecycle'), 'Parent complete should be rejected while subagent ownership is active');
+  });
+});
+
+test('subagent-scoped completion is still allowed while task is waiting_subagent', async () => {
+  await withTempWorkspace('tool-complete-subagent-owned-run', async () => {
+    const created = dag.createDAG('tool-complete-subagent-owned-run', [{ id: 't1', name: 'Task 1' }]);
+    const spawn = await tools.spawnTaskExecution({}, {
+      task_id: 't1',
+      dag_id: created.id,
+      agent_id: 'main',
+      requester_session_key: 'agent:main',
+      target_agent_id: 'worker',
+      task: 'delegate',
+    }, {});
+
+    hooks.handleSubagentSpawnedEvent({
+      childSessionKey: 'agent:worker:subagent:claim-owned',
+      agentId: 'worker',
+      label: spawn.spawn_plan.label,
+      runId: 'run-owned-1',
+    }, { requesterSessionKey: 'agent:main', runId: 'run-owned-1', childSessionKey: 'agent:worker:subagent:claim-owned' }, console);
+
+    const result = await tools.completeTaskExecution({
+      task_id: 't1',
+      dag_id: created.id,
+      agent_id: 'main',
+      session_key: 'agent:worker:subagent:claim-owned',
+      run_id: 'run-owned-1',
+      output_summary: 'worker done',
+    }, {});
+
+    assert(result.success === true, `Subagent-scoped completion should remain allowed: ${JSON.stringify(result)}`);
+    assert(dag.getTask('t1')?.status === 'done', 'Subagent-scoped completion should close the task');
+  });
+});
+
 test('registered task_dag_complete uses runtime execute signature without losing params', async () => {
   await withTempWorkspace('tool-complete-runtime-signature', async () => {
     const created = dag.createDAG('tool-complete-runtime-signature', [{ id: 't1', name: 'Task 1' }]);
