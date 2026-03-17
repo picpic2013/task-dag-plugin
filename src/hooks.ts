@@ -10,12 +10,14 @@ import {
   appendPendingEvent,
   completeSessionRun,
   completeTaskBinding,
+  listSpawnIntents,
   getSessionRunByRunId,
   getSessionRunBySessionKey,
   listSessionRunsBySessionKey,
   listPendingEvents,
   listTaskBindings,
   saveSessionRun,
+  updateSpawnIntent,
   upsertTaskBinding,
 } from './bindings.js';
 import * as dag from './dag.js';
@@ -33,30 +35,65 @@ type HookContext = {
   childSessionKey?: string;
 };
 
-/**
- * 解析 sessions_spawn 的 label 获取 taskId
- * 
- * 支持格式：
- * - task:t1      → t1
- * - task_id=t1   → t1
- * - t1           → t1
- * - my-agent     → null (普通 label)
- */
-export function parseTaskLabel(label: string): string | null {
-  if (!label) return null;
-  
-  // 匹配 task:t1 格式 (处理逗号分隔的额外内容)
-  const match1 = label.match(/^task:([^,]+)/i);
-  if (match1) return match1[1].trim();
-  
-  // 匹配 task_id=t1 或 task-id=t1 格式
-  const match2 = label.match(/^task[_-]?id[=:]([^,]+)/i);
-  if (match2) return match2[1].trim();
-  
-  // 匹配纯 task ID 格式 (t1, task-1 等)
-  const match3 = label.match(/^(t\d+|[a-z]+-\d+)$/i);
-  if (match3) return match3[1];
-  
+export function parseTaskDagLabel(label: string): { version: string; dag_id?: string; task_id?: string } | null {
+  if (!label?.startsWith('taskdag:')) {
+    return null;
+  }
+
+  const parts = label.split(':');
+  if (parts.length < 2) {
+    return null;
+  }
+
+  const version = parts[1] || 'unknown';
+  const parsed: { version: string; dag_id?: string; task_id?: string } = { version };
+
+  for (const segment of parts.slice(2)) {
+    const [key, value] = segment.split('=');
+    if (!key || !value) {
+      continue;
+    }
+    if (key === 'dag') {
+      parsed.dag_id = value;
+    } else if (key === 'task') {
+      parsed.task_id = value;
+    }
+  }
+
+  return parsed.task_id ? parsed : null;
+}
+
+function findPreparedSpawnIntent(event: any, ctx?: HookContext): { agentId: string; dagId: string; intentId: string; taskId: string; requesterSessionKey?: string } | null {
+  const parsedLabel = parseTaskDagLabel(event.label || '');
+  if (!parsedLabel?.task_id) {
+    return null;
+  }
+
+  const requesterSessionKey = ctx?.requesterSessionKey || event.requesterSessionKey || event.requester_session_key;
+  if (!requesterSessionKey) {
+    return null;
+  }
+
+  const candidateScopes = listRequesterSessionScopes(requesterSessionKey)
+    .filter(scope => !parsedLabel.dag_id || scope.dag_id === parsedLabel.dag_id);
+
+  for (const scope of candidateScopes) {
+    const matchingIntent = listSpawnIntents({
+      task_id: parsedLabel.task_id,
+      label: event.label,
+      status: 'prepared',
+    }, { agentId: scope.parent_agent_id, dagId: scope.dag_id })[0];
+    if (matchingIntent) {
+      return {
+        agentId: scope.parent_agent_id,
+        dagId: scope.dag_id,
+        intentId: matchingIntent.intent_id,
+        taskId: matchingIntent.task_id,
+        requesterSessionKey,
+      };
+    }
+  }
+
   return null;
 }
 
@@ -80,12 +117,19 @@ function withHookDagContext<T>(agentId: string, dagId: string, fn: () => T): T {
 }
 
 function getHookContextFromSpawnEvent(event: any, ctx?: HookContext): { agentId: string; dagId: string; requesterSessionKey?: string } | null {
-  const taskId = parseTaskLabel(event.label);
+  const preparedIntent = findPreparedSpawnIntent(event, ctx);
+  if (preparedIntent) {
+    return {
+      agentId: preparedIntent.agentId,
+      dagId: preparedIntent.dagId,
+      requesterSessionKey: preparedIntent.requesterSessionKey,
+    };
+  }
+
   const requesterSessionKey = ctx?.requesterSessionKey || event.requesterSessionKey || event.requester_session_key;
   const scope = requesterSessionKey ? findRequesterSessionScope({
     requester_session_key: requesterSessionKey,
     run_id: event.runId || event.run_id || ctx?.runId,
-    task_id: taskId || undefined,
   }) : null;
   const dagId = scope?.dag_id || event.dagId || event.dag_id;
   const parentAgentId = scope?.parent_agent_id || event.parentAgentId || event.parent_agent_id;
@@ -155,17 +199,19 @@ export function handleSubagentSpawnedEvent(event: any, ctx?: HookContext, logger
     return;
   }
 
+  const preparedIntent = findPreparedSpawnIntent(event, ctx);
+  if (!preparedIntent) {
+    logger?.info?.(`[task-dag] Ignoring non task-dag subagent_spawned label: ${label || '(none)'}`);
+    return;
+  }
+
   const context = getHookContextFromSpawnEvent(event, ctx);
   if (!context) {
     logger?.warn?.('[task-dag] Unable to resolve DAG context for subagent_spawned');
     return;
   }
 
-  const taskId = parseTaskLabel(label);
-  if (!taskId) {
-    logger?.info?.(`[task-dag] No taskId in label: ${label}`);
-    return;
-  }
+  const taskId = preparedIntent.taskId;
 
   const runId = event.runId || event.run_id || ctx?.runId || `run-${taskId}-${Date.now()}`;
   const requesterKey = context.requesterSessionKey || requesterSessionKey || ctx?.requesterSessionKey;
@@ -202,7 +248,7 @@ export function handleSubagentSpawnedEvent(event: any, ctx?: HookContext, logger
     }
 
     const task = dag.getTask(taskId);
-    if (task?.status === 'ready') {
+    if (task?.status === 'ready' || task?.waiting_for?.kind === 'spawn_intent') {
       dag.updateTask(taskId, {
         status: 'waiting_subagent',
         executor: {
@@ -219,6 +265,11 @@ export function handleSubagentSpawnedEvent(event: any, ctx?: HookContext, logger
         },
       } as any);
     }
+
+    updateSpawnIntent(preparedIntent.intentId, {
+      status: 'spawned',
+      spawned_at: new Date().toISOString(),
+    }, context);
 
     if (requesterKey) {
       upsertRequesterSessionScope({
@@ -237,7 +288,7 @@ export function handleSubagentSpawnedEvent(event: any, ctx?: HookContext, logger
       session_key: childSessionKey,
       run_id: runId,
       dedupe_key: `subagent_spawned:${context.dagId}:${taskId}:${runId}`,
-      payload: { requester_session_key: requesterKey, label, agent_id: agentId },
+      payload: { requester_session_key: requesterKey, label, agent_id: agentId, intent_id: preparedIntent.intentId },
     }, context);
 
     addEvent({
@@ -280,7 +331,8 @@ export function handleSubagentEndedEvent(event: any, ctx?: HookContext, logger?:
       event.runId ||
       event.run_id ||
       fallbackRunId;
-    const activeBindings = listTaskBindings({ session_key: targetSessionKey, binding_status: 'active' }, context);
+    const activeBindings = listTaskBindings({ session_key: targetSessionKey, binding_status: 'active' }, context)
+      .filter(binding => !runId || !binding.run_id || binding.run_id === runId);
 
     if (activeBindings.length === 0) {
       const existingCompletionEvents = listPendingEvents({
@@ -300,21 +352,6 @@ export function handleSubagentEndedEvent(event: any, ctx?: HookContext, logger?:
         };
       }
 
-      appendPendingEvent({
-        type: 'binding_orphaned',
-        dag_id: context.dagId,
-        session_key: targetSessionKey,
-        run_id: runId,
-        dedupe_key: `binding_orphaned:${context.dagId}:${targetSessionKey}:${runId || 'no-run'}:${outcome}`,
-        payload: { outcome },
-      } as any, context);
-      addEvent({
-        event: 'binding_orphaned',
-        session_key: targetSessionKey,
-        run_id: runId,
-        outcome,
-        details: `No active bindings found for session ${targetSessionKey}`,
-      });
       return { agent_id: context.agentId, task_ids: [], newly_ready_task_ids: [], outcome, requester_session_key: context.requesterSessionKey, run_id: runId, dag_id: context.dagId };
     }
 

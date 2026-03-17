@@ -982,24 +982,38 @@ test('subagent_spawned hook persists session context and binding metadata', asyn
   await withTempWorkspace('hook-spawned', async () => {
     dag.setCurrentAgentId('main');
     const created = dag.createDAG('hook-spawned', [{ id: 't1', name: 'Hook task' }]);
+    const spawnLabel = `taskdag:v1:dag=${created.id}:task=t1`;
+    const intent = bindings.saveSpawnIntent({
+      dag_id: created.id,
+      task_id: 't1',
+      parent_agent_id: 'main',
+      requester_session_key: 'agent:main',
+      target_agent_id: 'worker',
+      label: spawnLabel,
+      status: 'prepared',
+    }, { agentId: 'main', dagId: created.id });
     requesterSessions.upsertRequesterSessionScope({
       requester_session_key: 'agent:main',
       parent_agent_id: 'main',
       dag_id: created.id,
-      run_id: 'run-hook-1',
       task_ids: ['t1'],
+    });
+    dag.updateTask('t1', {
+      status: 'waiting_subagent',
+      waiting_for: { kind: 'spawn_intent', spawn_intent_id: intent.intent_id },
     });
 
     hooks.handleSubagentSpawnedEvent({
       childSessionKey: 'agent:worker:subagent:hook-1',
       agentId: 'worker',
-      label: 'task:t1',
+      label: spawnLabel,
       runId: 'run-hook-1',
     }, { requesterSessionKey: 'agent:main', runId: 'run-hook-1', childSessionKey: 'agent:worker:subagent:hook-1' }, console);
 
     const run = bindings.getSessionRunByRunId('run-hook-1', { agentId: 'main', dagId: created.id });
     const taskBindings = bindings.listTaskBindings({ task_id: 't1' }, { agentId: 'main', dagId: created.id });
     const pendingEvents = bindings.listPendingEvents({ type: 'subagent_spawned' }, { agentId: 'main', dagId: created.id });
+    const spawnedIntent = bindings.getSpawnIntentById(intent.intent_id, { agentId: 'main', dagId: created.id });
     const oldSessionMappings = path.join(process.env.WORKSPACE_DIR, 'workspace', 'tasks', 'session-mappings.json');
     const oldHierarchy = path.join(process.env.WORKSPACE_DIR, 'workspace', 'tasks', 'session-hierarchy.json');
 
@@ -1007,6 +1021,7 @@ test('subagent_spawned hook persists session context and binding metadata', asyn
     assert(run?.parent_agent_id === 'main', 'Session run should persist parent agent, not child agent');
     assert(taskBindings.length >= 1, 'Hook should create task binding');
     assert(pendingEvents.length === 1, 'Hook should emit pending spawn event');
+    assert(spawnedIntent?.status === 'spawned', 'Hook should upgrade spawn intent to spawned');
     assert(fs.existsSync(oldSessionMappings) === false, 'Old session mapping file should not be created');
     assert(fs.existsSync(oldHierarchy) === false, 'Old session hierarchy file should not be created');
   });
@@ -1017,13 +1032,22 @@ test('subagent_spawned hook does not duplicate spawn metadata already created by
     dag.setCurrentAgentId('main');
     const created = dag.createDAG('hook-spawned-idempotent', [{ id: 't1', name: 'Hook task' }]);
     const context = { agentId: 'main', dagId: created.id };
+    const spawnLabel = `taskdag:v1:dag=${created.id}:task=t1`;
     requesterSessions.upsertRequesterSessionScope({
       requester_session_key: 'agent:main',
       parent_agent_id: 'main',
       dag_id: created.id,
-      run_id: 'run-hook-idempotent',
       task_ids: ['t1'],
     });
+    bindings.saveSpawnIntent({
+      dag_id: created.id,
+      task_id: 't1',
+      parent_agent_id: 'main',
+      requester_session_key: 'agent:main',
+      target_agent_id: 'worker',
+      label: spawnLabel,
+      status: 'prepared',
+    }, context);
     bindings.saveSessionRun({
       run_id: 'run-hook-idempotent',
       child_session_key: 'agent:worker:subagent:hook-idempotent',
@@ -1032,7 +1056,7 @@ test('subagent_spawned hook does not duplicate spawn metadata already created by
       parent_agent_id: 'main',
       dag_id: created.id,
       spawn_mode: 'single_task',
-      label: 'task:t1',
+      label: spawnLabel,
       active_task_ids: ['t1'],
     }, context);
     bindings.upsertTaskBinding({
@@ -1048,12 +1072,35 @@ test('subagent_spawned hook does not duplicate spawn metadata already created by
     hooks.handleSubagentSpawnedEvent({
       childSessionKey: 'agent:worker:subagent:hook-idempotent',
       agentId: 'worker',
-      label: 'task:t1',
+      label: spawnLabel,
       runId: 'run-hook-idempotent',
     }, { requesterSessionKey: 'agent:main', runId: 'run-hook-idempotent', childSessionKey: 'agent:worker:subagent:hook-idempotent' }, console);
 
     assert(bindings.listTaskBindings({ task_id: 't1' }, context).length === 1, 'Hook should not create duplicate bindings');
     assert(bindings.listPendingEvents({ type: 'subagent_spawned' }, context).length === 1, 'Hook should keep a single spawn lifecycle event');
+  });
+});
+
+test('subagent_spawned hook ignores non task-dag labels', async () => {
+  await withTempWorkspace('hook-spawned-ignore-plain', async () => {
+    dag.setCurrentAgentId('main');
+    const created = dag.createDAG('hook-spawned-ignore-plain', [{ id: 't1', name: 'Hook task' }]);
+    requesterSessions.upsertRequesterSessionScope({
+      requester_session_key: 'agent:main',
+      parent_agent_id: 'main',
+      dag_id: created.id,
+      task_ids: ['t1'],
+    });
+
+    hooks.handleSubagentSpawnedEvent({
+      childSessionKey: 'agent:worker:subagent:plain',
+      agentId: 'worker',
+      label: 'plain-worker',
+      runId: 'run-hook-plain',
+    }, { requesterSessionKey: 'agent:main', runId: 'run-hook-plain', childSessionKey: 'agent:worker:subagent:plain' }, console);
+
+    assert(bindings.getSessionRunByRunId('run-hook-plain', { agentId: 'main', dagId: created.id }) == null, 'Plain labels should not create task-dag session runs');
+    assert(bindings.listPendingEvents({ type: 'subagent_spawned' }, { agentId: 'main', dagId: created.id }).length === 0, 'Plain labels should not emit task-dag spawn events');
   });
 });
 
@@ -1160,22 +1207,31 @@ test('subagent_ended hook tolerates delayed completion after task already closed
   });
 });
 
-test('subagent_ended hook emits orphan event when bindings are missing', async () => {
+test('subagent_ended hook ignores runs without task-dag bindings', async () => {
   await withTempWorkspace('hook-orphaned', async () => {
     dag.setCurrentAgentId('main');
     const created = dag.createDAG('hook-orphaned', [{ id: 't1', name: 'Orphan check' }]);
+    const spawnLabel = `taskdag:v1:dag=${created.id}:task=t1`;
+    bindings.saveSpawnIntent({
+      dag_id: created.id,
+      task_id: 't1',
+      parent_agent_id: 'main',
+      requester_session_key: 'agent:main',
+      target_agent_id: 'worker',
+      label: spawnLabel,
+      status: 'prepared',
+    }, { agentId: 'main', dagId: created.id });
     requesterSessions.upsertRequesterSessionScope({
       requester_session_key: 'agent:main',
       parent_agent_id: 'main',
       dag_id: created.id,
-      run_id: 'run-hook-4',
       task_ids: ['t1'],
     });
 
     hooks.handleSubagentSpawnedEvent({
       childSessionKey: 'agent:worker:subagent:hook-4',
       agentId: 'worker',
-      label: 'task:t1',
+      label: spawnLabel,
       runId: 'run-hook-4',
     }, { requesterSessionKey: 'agent:main', runId: 'run-hook-4', childSessionKey: 'agent:worker:subagent:hook-4' }, console);
 
@@ -1191,8 +1247,8 @@ test('subagent_ended hook emits orphan event when bindings are missing', async (
     }, { requesterSessionKey: 'agent:main', runId: 'run-hook-4', childSessionKey: 'agent:worker:subagent:hook-4' }, console);
 
     const orphanEvents = bindings.listPendingEvents({ type: 'binding_orphaned' }, { agentId: 'main', dagId: created.id });
-    assert(result.task_ids.length === 0, 'Orphaned hook should not close any tasks');
-    assert(orphanEvents.length === 1, 'Orphaned hook should emit binding_orphaned event');
+    assert(result.task_ids.length === 0, 'Ended hook should not close any tasks when bindings are gone');
+    assert(orphanEvents.length === 0, 'Ended hook should ignore unbound runs without orphan events');
   });
 });
 
