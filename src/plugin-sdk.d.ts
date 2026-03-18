@@ -9,9 +9,11 @@ export interface OpenClawPluginApi {
     info: (message: string) => void;
     warn: (message: string) => void;
     error: (message: string) => void;
+    debug?: (message: string) => void;
   };
   registerTool: (tool: ToolDefinition, options?: ToolOptions) => void;
   registerHook: (event: string, handler: HookHandler, options?: HookOptions) => void;
+  on?: (hookName: string, handler: HookHandler, options?: { priority?: number }) => void;
   runtime: {
     sessions_spawn: (params: SpawnParams) => Promise<any>;
     sessions_send: (params: SendParams) => Promise<any>;

@@ -604,9 +604,21 @@ function collectResumeInstructionsForSession(sessionKey?: string): string | null
  */
 export function registerTaskDagHooks(api: OpenClawPluginApi): void {
   configureTaskDagRuntime(api.config || {});
+  const registerLifecycleHook = (
+    hookName: string,
+    handler: HookHandler,
+    opts?: { name?: string; description?: string; priority?: number }
+  ) => {
+    const typedRegistrar = (api as any).on;
+    if (typeof typedRegistrar === 'function') {
+      typedRegistrar.call(api, hookName, handler, opts?.priority != null ? { priority: opts.priority } : undefined);
+      return;
+    }
+    api.registerHook(hookName, handler, opts);
+  };
   // 注册 gateway:startup 钩子（可选）
-  api.registerHook(
-    'gateway:startup',
+  registerLifecycleHook(
+    'gateway_start',
     async () => {
       taskDagInfo(api.logger, 'Gateway started, hooks ready');
     },
@@ -617,7 +629,7 @@ export function registerTaskDagHooks(api: OpenClawPluginApi): void {
   );
   
   // 注册 subagent_spawned 钩子
-  api.registerHook('subagent_spawned', async (event: any, ctx?: HookContext) => {
+  registerLifecycleHook('subagent_spawned', async (event: any, ctx?: HookContext) => {
     try {
       handleSubagentSpawnedEvent(event, ctx, api.logger);
       taskDagInfo(api.logger, `Processed subagent_spawned child=${event.childSessionKey || '(none)'} run=${event.runId || event.run_id || ctx?.runId || '(none)'}`);
@@ -630,7 +642,7 @@ export function registerTaskDagHooks(api: OpenClawPluginApi): void {
   });
   
   // 注册 subagent_ended 钩子
-  api.registerHook('subagent_ended', async (event: any, ctx?: HookContext) => {
+  registerLifecycleHook('subagent_ended', async (event: any, ctx?: HookContext) => {
     try {
       const result = handleSubagentEndedEvent(event, ctx, api.logger);
       if (!result.managed_run) {
@@ -672,7 +684,7 @@ export function registerTaskDagHooks(api: OpenClawPluginApi): void {
     description: '子 agent 结束时自动更新任务状态'
   });
 
-  api.registerHook('before_prompt_build', async (_event: any, ctx?: { sessionKey?: string }) => {
+  registerLifecycleHook('before_prompt_build', async (_event: any, ctx?: { sessionKey?: string }) => {
     const prependContext = collectResumeInstructionsForSession(ctx?.sessionKey);
     if (!prependContext) {
       return;
@@ -698,3 +710,5 @@ export function getHookStatus(): {
     startupHook: true
   };
 }
+
+type HookHandler = (event: any, ctx?: any) => Promise<any> | any;

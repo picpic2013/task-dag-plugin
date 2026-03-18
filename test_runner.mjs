@@ -52,6 +52,7 @@ function createOpenClawSimulationHarness() {
     logger: { info() {}, warn() {}, error() {} },
     registerTool(tool) { registeredTools[tool.name] = tool; },
     registerHook(name, handler) { registeredHooks[name] = handler; },
+    on(name, handler) { registeredHooks[name] = handler; },
     runtime: {
       sessions_send: async (params) => {
         sentMessages.push(params);
@@ -2577,6 +2578,27 @@ test('subagent_ended hook does not guess run_id when one session key has multipl
 
     assert(result.task_ids.length === 0, 'Ended hook should not close tasks when session-only lookup is ambiguous');
   });
+});
+
+test('registerTaskDagHooks prefers typed lifecycle hooks via api.on', async () => {
+  const typedHooks = {};
+  const legacyHooks = {};
+
+  hooks.registerTaskDagHooks({
+    logger: { info() {}, warn() {}, error() {} },
+    registerHook(name, handler) { legacyHooks[name] = handler; },
+    on(name, handler) { typedHooks[name] = handler; },
+    runtime: {
+      sessions_send: async () => ({ success: true }),
+    },
+    config: {},
+  });
+
+  assert(typeof typedHooks.gateway_start === 'function', 'gateway_start should register through api.on');
+  assert(typeof typedHooks.subagent_spawned === 'function', 'subagent_spawned should register through api.on');
+  assert(typeof typedHooks.subagent_ended === 'function', 'subagent_ended should register through api.on');
+  assert(typeof typedHooks.before_prompt_build === 'function', 'before_prompt_build should register through api.on');
+  assert(Object.keys(legacyHooks).length === 0, 'Typed hooks should not fall back to registerHook when api.on exists');
 });
 
 console.log('\n=== OpenClaw Runtime Simulation ===\n');

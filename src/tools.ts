@@ -1612,7 +1612,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
 
   api.registerTool({
     name: "task_dag_spawn",
-    description: "Send a ready task to a new subagent. Do not call task_dag_claim first. Use the returned spawn_plan unchanged; its protocol label binds run_id back to this task.",
+    description: "Send a ready task to a new subagent. Do not call task_dag_claim first. Use the returned spawn_plan unchanged in sessions_spawn; OpenClaw expects spawn_plan.agentId and the protocol label binds run_id back to this task.",
     parameters: {
       type: "object",
       properties: {
@@ -1621,7 +1621,7 @@ export function registerTaskDagTools(api: OpenClawPluginApi) {
         dag_id: { type: "string", description: "DAG ID (optional)" },
         task: { type: "string", description: "Subagent task prompt" },
         prompt: { type: "string", description: "Alias of task prompt" },
-        agentId: { type: "string", description: "Target subagent agent ID (legacy alias)" },
+        agentId: { type: "string", description: "Target subagent agent ID (OpenClaw sessions_spawn field name; legacy alias here)" },
         target_agent_id: { type: "string", description: "Target subagent agent ID" },
         model: { type: "string", description: "Target model" },
         label: { type: "string", description: "Reserved. Do not pass a custom label; task-dag generates a protocol label automatically." },

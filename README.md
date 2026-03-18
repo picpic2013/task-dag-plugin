@@ -2,7 +2,7 @@
 
 Task DAG 是一个面向 OpenClaw 的任务编排插件，用来管理复杂任务的 DAG、子 agent 分工、事件收尾和父会话继续处理。
 
-当前实现已经切换到 agent-managed spawn 模型。核心运行模型不再是“插件直接 spawn 子 agent”，而是“agent 调原生 `sessions_spawn` / `sessions_send`，插件负责 intent、hook、binding、pending events 和 parent continuation”。
+当前实现已经切换到 agent-managed spawn 模型。核心运行模型不再是“插件直接 spawn 子 agent”，而是“agent 调原生 `sessions_spawn` / `sessions_send`，插件负责 intent、typed lifecycle hook、binding、pending events 和 parent continuation”。
 
 ## 两种执行模式
 
@@ -20,6 +20,7 @@ task_dag_spawn -> sessions_spawn(直接使用 spawn_plan) -> task_dag_continue
 
 不要先 `task_dag_claim` 再 `task_dag_spawn`。
 不要手写或覆盖 `spawn_plan.label`。
+OpenClaw `sessions_spawn` 必须使用 `spawn_plan.agentId`；不要把它改写成 `target_agent_id`。
 协议 `label` 由插件生成，为短 `task-dag:<10位base36>` token。`subagent_spawned` 用它命中唯一活跃 prepared intent 并绑定 `run_id`，`subagent_ended` 再按 `run_id` 收口 task。
 - 同一 task 的 binding 次数有安全上限，配置项 `maxBindingAttempts`，默认 `3`；超过上限会直接报错，避免脏状态反复重绑。
 
@@ -141,6 +142,7 @@ task_dag_spawn agent_id="main" requester_session_key="agent:main:feishu:group:xx
 
 # 直接使用上一步返回的 spawn_plan
 # 不要先 claim，不要手写或覆盖 label
+# OpenClaw sessions_spawn 读取的是 spawn_plan.agentId
 sessions_spawn
 
 # 父会话在被 runtime 新一轮唤醒后继续

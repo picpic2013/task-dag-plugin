@@ -44,6 +44,7 @@ task_dag_continue
 - `task_dag_spawn` 只接受 `ready` task
 - `requester_session_key` 必填
 - `sessions_spawn` 必须直接使用 `spawn_plan`
+- OpenClaw `sessions_spawn` 认的是 `agentId`，不是 `target_agent_id`
 - 不要手写或覆盖 `label`
 - 协议 `label` 由插件生成，为短 `task-dag:<10位base36>` token，用于在 hook 里把 `run_id` 绑定回 task
 - 同一 task 的 binding 次数有安全上限，配置项 `maxBindingAttempts`，默认 `3`；超过上限会直接报错，避免脏状态反复重绑。
@@ -55,7 +56,7 @@ task_dag_continue
 3. 子 agent 完成后的状态推进主要依赖 hook、requester session 注册表和 pending events。
 4. 非 `main` agent 必须显式传 `agent_id`。
 5. `task_dag_spawn` 若希望父会话恢复，`requester_session_key` 必填。
-6. `sessions_spawn` 的关键参数必须原样来自 `spawn_plan`，至少不要改 `label`。当前首轮 managed spawn 主要按协议 `label` 识别 task。
+6. `sessions_spawn` 的关键参数必须原样来自 `spawn_plan`，尤其是 `agentId` 和 `label`。不要自己改成 `target_agent_id`。当前首轮 managed spawn 主要按协议 `label` 识别 task。
 7. worker 多轮模式：先 `task_dag_assign`，再 `sessions_send`。
 8. `task_dag_continue` 必须显式带 scope：`run_id`、`session_key`、`task_id`、`task_ids` 之一。
 9. 父 agent 的模型是“返回后等触发”，不是“阻塞等待子 agent 完成”。
@@ -87,6 +88,7 @@ task_dag_continue agent_id="main" task_id="t1"
 - 必须传 `requester_session_key`
 - 不要先 `task_dag_claim`
 - `sessions_spawn` 直接使用 `spawn_plan`
+- OpenClaw `sessions_spawn` 必须吃 `spawn_plan.agentId`，不要改成 `target_agent_id`
 - 不要手写 `label`
 
 错误示例：
@@ -225,6 +227,7 @@ task_dag_continue agent_id="chexie" dag_id="dag-xxx" task_ids=["t1","t2"]
 3. 要交给子 agent：`spawn -> sessions_spawn -> continue`。
 4. 不要对同一个 task 同时走两条路。
 5. `spawn` 时必须传 `requester_session_key`，并且不要改 `spawn_plan`。
+6. `sessions_spawn` 必须原样使用 `spawn_plan.agentId`；OpenClaw 不认 `target_agent_id`。
 
 ## 反模式
 
